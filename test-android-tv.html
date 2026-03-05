@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=1920, height=1080, initial-scale=1.0">
+  <title>Vizora Display - Android TV Simulator</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      color: white;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    .tv-frame {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    }
+
+    .screen {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    /* Loading Screen */
+    #loading-screen {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    }
+
+    .loading-logo {
+      font-size: 4rem;
+      font-weight: bold;
+      color: #6366f1;
+      margin-bottom: 2rem;
+      letter-spacing: -0.05em;
+    }
+
+    .loading-spinner {
+      width: 60px;
+      height: 60px;
+      border: 5px solid rgba(99, 102, 241, 0.2);
+      border-top-color: #6366f1;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* Pairing Screen */
+    #pairing-screen {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      padding: 3rem;
+      text-align: center;
+    }
+
+    .pairing-logo {
+      font-size: 4rem;
+      font-weight: bold;
+      color: #6366f1;
+      margin-bottom: 1rem;
+    }
+
+    .pairing-subtitle {
+      font-size: 1.2rem;
+      color: #6366f1;
+      margin-bottom: 2rem;
+    }
+
+    .pairing-title {
+      font-size: 2.5rem;
+      color: #e0e0e0;
+      margin-bottom: 3rem;
+    }
+
+    .pairing-card {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 2rem;
+      padding: 3rem;
+      max-width: 700px;
+      width: 100%;
+    }
+
+    #qr-code {
+      background: white;
+      padding: 1.5rem;
+      border-radius: 1.5rem;
+      display: inline-block;
+      margin-bottom: 2rem;
+    }
+
+    #qr-code canvas,
+    #qr-code img {
+      display: block;
+      width: 250px;
+      height: 250px;
+    }
+
+    .qr-placeholder {
+      width: 250px;
+      height: 250px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #f0f0f0;
+      color: #666;
+      font-size: 0.9rem;
+    }
+
+    .pairing-divider {
+      display: flex;
+      align-items: center;
+      margin: 2rem 0;
+      color: #888;
+      font-size: 1.1rem;
+    }
+
+    .pairing-divider::before,
+    .pairing-divider::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: rgba(255, 255, 255, 0.2);
+    }
+
+    .pairing-divider span {
+      padding: 0 1.5rem;
+    }
+
+    .code-label {
+      color: #888;
+      font-size: 1.2rem;
+      margin-bottom: 1rem;
+    }
+
+    #pairing-code {
+      font-size: 5rem;
+      font-weight: bold;
+      letter-spacing: 0.4em;
+      color: #6366f1;
+      font-family: 'Monaco', 'Consolas', monospace;
+      background: rgba(99, 102, 241, 0.1);
+      padding: 1rem 2rem;
+      border-radius: 1rem;
+      display: inline-block;
+    }
+
+    .pairing-instructions {
+      margin-top: 2.5rem;
+      color: #888;
+      font-size: 1.1rem;
+      line-height: 1.8;
+    }
+
+    .pairing-instructions strong {
+      color: #a5b4fc;
+    }
+
+    /* Content Screen */
+    #content-screen {
+      background: black;
+    }
+
+    #content-container {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+
+    .content-item {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .content-item img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+    }
+
+    .content-item video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    .content-item iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+    }
+
+    /* Error Screen */
+    #error-screen {
+      background: linear-gradient(135deg, #2e1a1a 0%, #3e1616 100%);
+    }
+
+    .error-icon {
+      font-size: 6rem;
+      margin-bottom: 1.5rem;
+    }
+
+    #error-message {
+      font-size: 1.5rem;
+      color: #ff6b6b;
+      text-align: center;
+      padding: 0 3rem;
+    }
+
+    /* Status Bar */
+    .status-bar {
+      position: fixed;
+      top: 1.5rem;
+      right: 1.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      background: rgba(0, 0, 0, 0.6);
+      padding: 0.75rem 1.25rem;
+      border-radius: 2rem;
+      font-size: 1rem;
+      z-index: 1000;
+    }
+
+    .status-dot {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      background: #888;
+    }
+
+    .status-dot.online {
+      background: #10b981;
+      box-shadow: 0 0 10px #10b981;
+    }
+
+    .status-dot.offline {
+      background: #ef4444;
+    }
+
+    .status-dot.connecting {
+      background: #f59e0b;
+      animation: pulse 1s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    /* D-pad navigation indicator */
+    .dpad-hint {
+      position: fixed;
+      bottom: 1.5rem;
+      right: 1.5rem;
+      background: rgba(0, 0, 0, 0.6);
+      padding: 0.75rem 1.25rem;
+      border-radius: 1rem;
+      font-size: 0.9rem;
+      color: #64748b;
+    }
+
+    /* Console/Debug Panel */
+    .debug-panel {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: rgba(0, 0, 0, 0.9);
+      color: #10b981;
+      font-family: 'Monaco', 'Consolas', monospace;
+      font-size: 12px;
+      padding: 10px;
+      max-height: 150px;
+      overflow-y: auto;
+      z-index: 2000;
+    }
+
+    .debug-panel.hidden {
+      display: none;
+    }
+
+    .debug-line {
+      margin: 2px 0;
+    }
+
+    .debug-line.error {
+      color: #ef4444;
+    }
+
+    .debug-line.warn {
+      color: #f59e0b;
+    }
+
+    .debug-line.info {
+      color: #6366f1;
+    }
+  </style>
+</head>
+<body>
+  <div class="tv-frame">
+    <!-- Loading Screen -->
+    <div id="loading-screen" class="screen">
+      <div class="loading-logo">Vizora</div>
+      <div class="loading-spinner"></div>
+    </div>
+
+    <!-- Pairing Screen -->
+    <div id="pairing-screen" class="screen hidden">
+      <div class="pairing-logo">Vizora</div>
+      <div class="pairing-subtitle">Display</div>
+      <div class="pairing-title">Pair Your Display</div>
+
+      <div class="pairing-card">
+        <div id="qr-code">
+          <div class="qr-placeholder">Loading QR Code...</div>
+        </div>
+
+        <div class="pairing-divider">
+          <span>or enter code manually</span>
+        </div>
+
+        <div class="code-label">Pairing Code</div>
+        <div id="pairing-code">------</div>
+
+        <div class="pairing-instructions">
+          Open the <strong>Vizora Dashboard</strong> on your computer or phone<br>
+          Go to <strong>Devices</strong> and click <strong>Pair New Device</strong><br>
+          Scan the QR code or enter the code above
+        </div>
+      </div>
+    </div>
+
+    <!-- Content Screen -->
+    <div id="content-screen" class="screen hidden">
+      <div id="content-container">
+        <!-- Content will be displayed here -->
+      </div>
+    </div>
+
+    <!-- Error Screen -->
+    <div id="error-screen" class="screen hidden">
+      <div class="error-icon">⚠️</div>
+      <div id="error-message">An error occurred</div>
+    </div>
+
+    <!-- Status Bar -->
+    <div class="status-bar">
+      <div id="status-dot" class="status-dot connecting"></div>
+      <span id="status-text">Initializing...</span>
+    </div>
+
+    <!-- D-pad hint -->
+    <div class="dpad-hint">
+      Use Arrow Keys for D-pad navigation | Press D for debug console
+    </div>
+
+    <!-- Debug Panel -->
+    <div id="debug-panel" class="debug-panel hidden"></div>
+  </div>
+
+  <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
+  <script>
+    // Configuration
+    const CONFIG = {
+      apiUrl: 'http://localhost:3000',
+      realtimeUrl: 'http://localhost:3002',
+      dashboardUrl: 'http://localhost:3001'
+    };
+
+    // State
+    let socket = null;
+    let deviceId = null;
+    let deviceToken = null;
+    let pairingCode = null;
+    let pairingCheckInterval = null;
+    let currentPlaylist = null;
+    let currentIndex = 0;
+    let playbackTimer = null;
+    let debugMode = false;
+
+    // Debug logging
+    function log(message, type = 'log') {
+      const panel = document.getElementById('debug-panel');
+      const line = document.createElement('div');
+      line.className = 'debug-line ' + type;
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+      panel.appendChild(line);
+      panel.scrollTop = panel.scrollHeight;
+      console[type === 'error' ? 'error' : type === 'warn' ? 'warn' : 'log']('[Vizora]', message);
+    }
+
+    // UI Helpers
+    function showScreen(screen) {
+      ['loading-screen', 'pairing-screen', 'content-screen', 'error-screen'].forEach(id => {
+        document.getElementById(id).classList.toggle('hidden', id !== `${screen}-screen`);
+      });
+    }
+
+    function updateStatus(status, text) {
+      const dot = document.getElementById('status-dot');
+      const statusText = document.getElementById('status-text');
+      dot.className = 'status-dot ' + status;
+      statusText.textContent = text;
+    }
+
+    function showError(message) {
+      document.getElementById('error-message').textContent = message;
+      showScreen('error');
+    }
+
+    // Generate QR Code using an API
+    async function generateQRCode(code) {
+      const container = document.getElementById('qr-code');
+      const pairUrl = `${CONFIG.dashboardUrl}/dashboard/devices/pair?code=${code}`;
+
+      // Use QR Code API
+      const img = document.createElement('img');
+      img.src = `https://api.qrserver.com/v1/create-qr-code/?size=250x250&data=${encodeURIComponent(pairUrl)}`;
+      img.alt = 'QR Code';
+      img.style.width = '250px';
+      img.style.height = '250px';
+
+      container.innerHTML = '';
+      container.appendChild(img);
+
+      log(`QR Code generated for: ${pairUrl}`, 'info');
+    }
+
+    // Pairing Flow
+    async function startPairing() {
+      showScreen('pairing');
+      updateStatus('connecting', 'Requesting pairing code...');
+      log('Starting pairing flow...');
+
+      try {
+        const response = await fetch(`${CONFIG.apiUrl}/api/pairing/request`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            deviceInfo: {
+              platform: 'android_tv_simulator',
+              userAgent: navigator.userAgent,
+              screenWidth: 1920,
+              screenHeight: 1080,
+              timestamp: new Date().toISOString()
+            }
+          })
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        pairingCode = data.code;
+        deviceId = data.deviceId;
+
+        log(`Pairing code received: ${pairingCode}`, 'info');
+        document.getElementById('pairing-code').textContent = pairingCode;
+
+        await generateQRCode(pairingCode);
+        startPairingCheck();
+
+        updateStatus('connecting', 'Waiting for pairing...');
+      } catch (error) {
+        log(`Pairing request failed: ${error.message}`, 'error');
+        showError(`Failed to request pairing code: ${error.message}`);
+        setTimeout(startPairing, 5000);
+      }
+    }
+
+    function startPairingCheck() {
+      if (pairingCheckInterval) clearInterval(pairingCheckInterval);
+
+      pairingCheckInterval = setInterval(async () => {
+        if (!pairingCode) return;
+
+        try {
+          const response = await fetch(`${CONFIG.apiUrl}/api/pairing/status/${pairingCode}`);
+
+          if (!response.ok) {
+            if (response.status === 404) {
+              log('Pairing code expired, requesting new one...', 'warn');
+              startPairing();
+              return;
+            }
+            throw new Error('Failed to check status');
+          }
+
+          const data = await response.json();
+          log(`Pairing status: ${data.status}`);
+
+          if (data.status === 'paired' && data.deviceToken) {
+            log('Device paired successfully!', 'info');
+            clearInterval(pairingCheckInterval);
+
+            deviceToken = data.deviceToken;
+            localStorage.setItem('device_token', deviceToken);
+            localStorage.setItem('device_id', deviceId);
+
+            connectToRealtime();
+          }
+        } catch (error) {
+          log(`Pairing check error: ${error.message}`, 'warn');
+        }
+      }, 2000);
+    }
+
+    // Realtime Connection
+    function connectToRealtime() {
+      if (!deviceToken) {
+        log('No device token, starting pairing...', 'warn');
+        startPairing();
+        return;
+      }
+
+      updateStatus('connecting', 'Connecting to server...');
+      log('Connecting to realtime server...');
+
+      if (socket) socket.disconnect();
+
+      socket = io(CONFIG.realtimeUrl, {
+        auth: { token: deviceToken },
+        transports: ['websocket', 'polling'],
+        reconnection: true,
+        reconnectionAttempts: Infinity,
+        reconnectionDelay: 1000
+      });
+
+      socket.on('connect', () => {
+        log('Connected to realtime gateway', 'info');
+        updateStatus('online', 'Connected');
+        showScreen('content');
+      });
+
+      socket.on('disconnect', (reason) => {
+        log(`Disconnected: ${reason}`, 'warn');
+        updateStatus('offline', 'Disconnected');
+      });
+
+      socket.on('connect_error', (error) => {
+        log(`Connection error: ${error.message}`, 'error');
+        updateStatus('offline', 'Connection failed');
+
+        if (error.message.includes('unauthorized') || error.message.includes('invalid')) {
+          log('Token invalid, restarting pairing...', 'warn');
+          localStorage.removeItem('device_token');
+          localStorage.removeItem('device_id');
+          deviceToken = null;
+          deviceId = null;
+          setTimeout(startPairing, 2000);
+        }
+      });
+
+      socket.on('playlist:update', (data) => {
+        log(`Received playlist update: ${data.playlist?.name || 'unnamed'}`, 'info');
+        updatePlaylist(data.playlist);
+      });
+
+      socket.on('command', (command) => {
+        log(`Received command: ${command.type}`, 'info');
+        handleCommand(command);
+      });
+    }
+
+    // Playback
+    function updatePlaylist(playlist) {
+      currentPlaylist = playlist;
+      currentIndex = 0;
+
+      if (playbackTimer) {
+        clearTimeout(playbackTimer);
+        playbackTimer = null;
+      }
+
+      const container = document.getElementById('content-container');
+      container.innerHTML = '';
+
+      if (playlist?.items?.length > 0) {
+        showScreen('content');
+        playContent();
+      } else {
+        log('Playlist is empty');
+        container.innerHTML = '<div style="color: #64748b; font-size: 1.5rem;">Waiting for content...</div>';
+      }
+    }
+
+    function playContent() {
+      if (!currentPlaylist?.items?.length) return;
+
+      const items = currentPlaylist.items;
+      const currentItem = items[currentIndex];
+      const container = document.getElementById('content-container');
+
+      if (!currentItem?.content) {
+        nextContent();
+        return;
+      }
+
+      log(`Playing content ${currentIndex + 1}/${items.length}: ${currentItem.content.name}`);
+      container.innerHTML = '';
+
+      const contentDiv = document.createElement('div');
+      contentDiv.className = 'content-item';
+
+      const { url, type, name } = currentItem.content;
+
+      switch (type) {
+        case 'image':
+          const img = document.createElement('img');
+          img.src = url;
+          img.alt = name;
+          img.onerror = () => {
+            log(`Image load failed: ${url}`, 'error');
+            nextContent();
+          };
+          contentDiv.appendChild(img);
+          break;
+
+        case 'video':
+          const video = document.createElement('video');
+          video.src = url;
+          video.autoplay = true;
+          video.muted = false;
+          video.onerror = () => {
+            log(`Video load failed: ${url}`, 'error');
+            nextContent();
+          };
+          video.onended = () => nextContent();
+          contentDiv.appendChild(video);
+          break;
+
+        case 'webpage':
+        case 'url':
+          const iframe = document.createElement('iframe');
+          iframe.src = url;
+          iframe.allow = 'autoplay; fullscreen';
+          contentDiv.appendChild(iframe);
+          break;
+
+        default:
+          log(`Unknown content type: ${type}`, 'warn');
+          nextContent();
+          return;
+      }
+
+      container.appendChild(contentDiv);
+
+      if (type !== 'video') {
+        const duration = (currentItem.duration || 10) * 1000;
+        playbackTimer = setTimeout(() => nextContent(), duration);
+      }
+    }
+
+    function nextContent() {
+      if (!currentPlaylist?.items) return;
+
+      currentIndex++;
+      if (currentIndex >= currentPlaylist.items.length) {
+        currentIndex = 0;
+      }
+      playContent();
+    }
+
+    // Commands
+    function handleCommand(command) {
+      switch (command.type) {
+        case 'reload':
+          window.location.reload();
+          break;
+        case 'unpair':
+          localStorage.removeItem('device_token');
+          localStorage.removeItem('device_id');
+          window.location.reload();
+          break;
+        default:
+          log(`Unknown command: ${command.type}`, 'warn');
+      }
+    }
+
+    // D-pad navigation
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'd' || event.key === 'D') {
+        debugMode = !debugMode;
+        document.getElementById('debug-panel').classList.toggle('hidden', !debugMode);
+        log(`Debug mode: ${debugMode ? 'ON' : 'OFF'}`, 'info');
+      }
+    });
+
+    // Initialize
+    async function init() {
+      log('Initializing Android TV Display Client...', 'info');
+
+      // Check for stored credentials
+      const storedToken = localStorage.getItem('device_token');
+      const storedDeviceId = localStorage.getItem('device_id');
+
+      if (storedToken && storedDeviceId) {
+        log('Found stored credentials, connecting...', 'info');
+        deviceToken = storedToken;
+        deviceId = storedDeviceId;
+        connectToRealtime();
+      } else {
+        log('No credentials found, starting pairing...', 'info');
+        startPairing();
+      }
+    }
+
+    // Start
+    init();
+  </script>
+</body>
+</html>

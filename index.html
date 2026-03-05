@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="format-detection" content="telephone=no">
+  <meta name="msapplication-tap-highlight" content="no">
+  <meta name="theme-color" content="#1a1a2e">
+
+  <title>Vizora Display</title>
+
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #1a1a2e;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      color: white;
+      -webkit-user-select: none;
+      user-select: none;
+    }
+
+    .screen {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .hidden {
+      display: none !important;
+    }
+
+    /* Loading Screen */
+    #loading-screen {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    }
+
+    .loading-logo {
+      font-size: 3rem;
+      font-weight: bold;
+      color: #6366f1;
+      margin-bottom: 2rem;
+      letter-spacing: -0.05em;
+    }
+
+    .loading-spinner {
+      width: 50px;
+      height: 50px;
+      border: 4px solid rgba(99, 102, 241, 0.2);
+      border-top-color: #6366f1;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* Pairing Screen */
+    #pairing-screen {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      padding: 2rem;
+      text-align: center;
+    }
+
+    .pairing-logo {
+      font-size: 2.5rem;
+      font-weight: bold;
+      color: #6366f1;
+      margin-bottom: 1rem;
+    }
+
+    .pairing-title {
+      font-size: 1.5rem;
+      color: #e0e0e0;
+      margin-bottom: 2rem;
+    }
+
+    .pairing-card {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid rgba(255, 255, 255, 0.1);
+      border-radius: 1.5rem;
+      padding: 2rem;
+      max-width: 500px;
+      width: 100%;
+    }
+
+    #qr-code {
+      background: white;
+      padding: 1rem;
+      border-radius: 1rem;
+      display: inline-block;
+      margin-bottom: 1.5rem;
+    }
+
+    #qr-code img,
+    #qr-code canvas {
+      display: block;
+      width: 200px;
+      height: 200px;
+    }
+
+    .pairing-divider {
+      display: flex;
+      align-items: center;
+      margin: 1.5rem 0;
+      color: #888;
+    }
+
+    .pairing-divider::before,
+    .pairing-divider::after {
+      content: '';
+      flex: 1;
+      height: 1px;
+      background: rgba(255, 255, 255, 0.2);
+    }
+
+    .pairing-divider span {
+      padding: 0 1rem;
+    }
+
+    .code-label {
+      color: #888;
+      font-size: 0.9rem;
+      margin-bottom: 0.5rem;
+    }
+
+    #pairing-code {
+      font-size: 3rem;
+      font-weight: bold;
+      letter-spacing: 0.3em;
+      color: #6366f1;
+      font-family: 'Monaco', 'Consolas', monospace;
+    }
+
+    .pairing-instructions {
+      margin-top: 2rem;
+      color: #888;
+      font-size: 0.9rem;
+      line-height: 1.6;
+    }
+
+    /* Content Screen */
+    #content-screen {
+      background: black;
+    }
+
+    #content-container {
+      width: 100%;
+      height: 100%;
+      position: relative;
+    }
+
+    .content-item {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .content-item img {
+      max-width: 100%;
+      max-height: 100%;
+      object-fit: contain;
+    }
+
+    .content-item video {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    .content-item iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+    }
+
+    /* Error Screen */
+    #error-screen {
+      background: linear-gradient(135deg, #2e1a1a 0%, #3e1616 100%);
+    }
+
+    .error-icon {
+      font-size: 4rem;
+      margin-bottom: 1rem;
+    }
+
+    #error-message {
+      font-size: 1.2rem;
+      color: #ff6b6b;
+      text-align: center;
+      padding: 0 2rem;
+    }
+
+    /* Status Bar */
+    .status-bar {
+      position: fixed;
+      top: 1rem;
+      right: 1rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      background: rgba(0, 0, 0, 0.5);
+      padding: 0.5rem 1rem;
+      border-radius: 2rem;
+      font-size: 0.8rem;
+      z-index: 1000;
+      opacity: 0.7;
+      transition: opacity 0.3s;
+    }
+
+    .status-bar:hover {
+      opacity: 1;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #888;
+    }
+
+    .status-dot.online {
+      background: #10b981;
+      box-shadow: 0 0 8px #10b981;
+    }
+
+    .status-dot.offline {
+      background: #ef4444;
+    }
+
+    .status-dot.connecting {
+      background: #f59e0b;
+      animation: pulse 1s infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    /* TV-specific adjustments */
+    @media (min-width: 1920px) {
+      .pairing-logo {
+        font-size: 4rem;
+      }
+
+      .pairing-title {
+        font-size: 2rem;
+      }
+
+      #pairing-code {
+        font-size: 5rem;
+      }
+
+      #qr-code img,
+      #qr-code canvas {
+        width: 300px;
+        height: 300px;
+      }
+
+      .pairing-card {
+        max-width: 700px;
+        padding: 3rem;
+      }
+    }
+
+    /* D-pad navigation focus styles for Android TV */
+    .focusable:focus {
+      outline: 3px solid #6366f1;
+      outline-offset: 4px;
+    }
+
+    /* QR Code Overlay */
+    #qr-overlay {
+      position: fixed;
+      z-index: 100;
+      padding: 8px;
+      border-radius: 8px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      pointer-events: none;
+    }
+
+    #qr-overlay.top-left { top: 16px; left: 16px; }
+    #qr-overlay.top-right { top: 16px; right: 16px; }
+    #qr-overlay.bottom-left { bottom: 16px; left: 16px; }
+    #qr-overlay.bottom-right { bottom: 16px; right: 16px; }
+
+    #qr-overlay canvas,
+    #qr-overlay img {
+      display: block;
+    }
+
+    #qr-overlay .qr-label {
+      font-size: 10px;
+      color: #333;
+      text-align: center;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    /* Multi-Zone Layout */
+    .layout-grid {
+      width: 100%;
+      height: 100%;
+      display: grid;
+      overflow: hidden;
+    }
+
+    .layout-zone {
+      position: relative;
+      overflow: hidden;
+    }
+
+    .layout-zone .content-item {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      opacity: 1;
+    }
+
+    .layout-zone .content-item img,
+    .layout-zone .content-item video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .layout-zone .content-item iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+    }
+  </style>
+</head>
+<body>
+  <!-- Loading Screen -->
+  <div id="loading-screen" class="screen">
+    <div class="loading-logo">Vizora</div>
+    <div class="loading-spinner"></div>
+  </div>
+
+  <!-- Pairing Screen -->
+  <div id="pairing-screen" class="screen hidden">
+    <div class="pairing-logo">Vizora</div>
+    <div class="pairing-title">Pair Your Display</div>
+
+    <div class="pairing-card">
+      <div id="qr-code">
+        <!-- QR code will be inserted here -->
+        <div style="width: 200px; height: 200px; display: flex; align-items: center; justify-content: center; color: #888;">
+          Loading...
+        </div>
+      </div>
+
+      <div class="pairing-divider">
+        <span>or enter code manually</span>
+      </div>
+
+      <div class="code-label">Pairing Code</div>
+      <div id="pairing-code">------</div>
+
+      <div class="pairing-instructions">
+        Open the Vizora Dashboard on your computer or phone<br>
+        Go to <strong>Devices</strong> and click <strong>Add Display</strong><br>
+        Scan the QR code or enter the code above
+      </div>
+    </div>
+  </div>
+
+  <!-- Content Screen -->
+  <div id="content-screen" class="screen hidden">
+    <div id="content-container">
+      <!-- Content will be displayed here -->
+    </div>
+    <!-- QR Code Overlay -->
+    <div id="qr-overlay" class="hidden"></div>
+  </div>
+
+  <!-- Error Screen -->
+  <div id="error-screen" class="screen hidden">
+    <div class="error-icon">⚠️</div>
+    <div id="error-message">An error occurred</div>
+  </div>
+
+  <!-- Status Bar (always visible) -->
+  <div class="status-bar">
+    <div id="status-dot" class="status-dot connecting"></div>
+    <span id="status-text">Initializing...</span>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

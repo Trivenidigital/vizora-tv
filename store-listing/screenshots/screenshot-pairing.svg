@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1920" height="1080" viewBox="0 0 1920 1080" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- TV Screen Background -->
+  <defs>
+    <linearGradient id="screenBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1920" height="1080" fill="url(#screenBg)"/>
+
+  <!-- Decorative pattern -->
+  <pattern id="grid" width="60" height="60" patternUnits="userSpaceOnUse">
+    <circle cx="30" cy="30" r="1.5" fill="#6366f1" opacity="0.1"/>
+  </pattern>
+  <rect width="1920" height="1080" fill="url(#grid)"/>
+
+  <!-- Logo and Title -->
+  <g transform="translate(760, 100)">
+    <rect x="0" y="0" width="80" height="80" rx="18" fill="url(#accent)"/>
+    <text x="22" y="58" font-family="system-ui" font-size="48" font-weight="800" fill="white">V</text>
+    <text x="100" y="35" font-family="system-ui" font-size="42" font-weight="700" fill="white">Vizora</text>
+    <text x="100" y="70" font-family="system-ui" font-size="24" font-weight="500" fill="#6366f1">Display</text>
+  </g>
+
+  <!-- Pairing Card -->
+  <rect x="560" y="220" width="800" height="580" rx="24" fill="rgba(255,255,255,0.05)" stroke="rgba(255,255,255,0.1)" stroke-width="2"/>
+
+  <!-- Title -->
+  <text x="960" y="300" font-family="system-ui" font-size="36" font-weight="700" fill="white" text-anchor="middle">
+    Pair Your Display
+  </text>
+  <text x="960" y="340" font-family="system-ui" font-size="20" font-weight="400" fill="#94a3b8" text-anchor="middle">
+    Scan QR code or enter the code in your Vizora dashboard
+  </text>
+
+  <!-- QR Code placeholder -->
+  <rect x="760" y="380" width="200" height="200" rx="12" fill="white"/>
+  <!-- QR Pattern simulation -->
+  <g fill="#0f172a">
+    <rect x="780" y="400" width="40" height="40"/>
+    <rect x="900" y="400" width="40" height="40"/>
+    <rect x="780" y="520" width="40" height="40"/>
+    <rect x="830" y="450" width="20" height="20"/>
+    <rect x="860" y="420" width="20" height="20"/>
+    <rect x="860" y="480" width="20" height="20"/>
+    <rect x="900" y="460" width="20" height="20"/>
+    <rect x="830" y="500" width="20" height="20"/>
+    <rect x="870" y="520" width="20" height="20"/>
+    <rect x="910" y="500" width="20" height="20"/>
+  </g>
+  <rect x="792" y="412" width="16" height="16" fill="white"/>
+  <rect x="912" y="412" width="16" height="16" fill="white"/>
+  <rect x="792" y="532" width="16" height="16" fill="white"/>
+
+  <!-- Pairing Code -->
+  <text x="960" y="640" font-family="system-ui" font-size="18" font-weight="500" fill="#64748b" text-anchor="middle">
+    Or enter this code:
+  </text>
+
+  <g transform="translate(760, 660)">
+    <rect x="0" y="0" width="400" height="70" rx="12" fill="rgba(99,102,241,0.1)" stroke="rgba(99,102,241,0.3)" stroke-width="2"/>
+    <text x="200" y="48" font-family="monospace" font-size="36" font-weight="700" fill="#6366f1" text-anchor="middle" letter-spacing="8">
+      ABCD-1234
+    </text>
+  </g>
+
+  <!-- Instructions -->
+  <text x="960" y="780" font-family="system-ui" font-size="18" font-weight="400" fill="#64748b" text-anchor="middle">
+    Go to dashboard.vizora.io → Devices → Pair New Device
+  </text>
+
+  <!-- Navigation hint -->
+  <g transform="translate(1600, 950)">
+    <rect x="0" y="0" width="240" height="80" rx="12" fill="rgba(255,255,255,0.05)"/>
+    <text x="120" y="35" font-family="system-ui" font-size="14" font-weight="500" fill="#64748b" text-anchor="middle">
+      Navigate with
+    </text>
+    <text x="120" y="60" font-family="system-ui" font-size="18" font-weight="600" fill="white" text-anchor="middle">
+      D-pad Remote
+    </text>
+  </g>
+
+  <!-- Status indicator -->
+  <g transform="translate(80, 950)">
+    <circle cx="12" cy="30" r="8" fill="#10b981"/>
+    <text x="30" y="36" font-family="system-ui" font-size="16" font-weight="500" fill="#10b981">
+      Ready to pair
+    </text>
+  </g>
+</svg>

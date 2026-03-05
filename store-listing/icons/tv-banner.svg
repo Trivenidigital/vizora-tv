@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg width="1280" height="720" viewBox="0 0 1280 720" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <!-- Background gradient -->
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="50%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="accentGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#8b5cf6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1280" height="720" fill="url(#bgGrad)"/>
+
+  <!-- Decorative pattern -->
+  <pattern id="dots" width="40" height="40" patternUnits="userSpaceOnUse">
+    <circle cx="20" cy="20" r="2" fill="#6366f1" opacity="0.1"/>
+  </pattern>
+  <rect width="1280" height="720" fill="url(#dots)"/>
+
+  <!-- Glow effects -->
+  <ellipse cx="640" cy="360" rx="400" ry="300" fill="#6366f1" opacity="0.05"/>
+
+  <!-- Logo icon -->
+  <g transform="translate(100, 200)">
+    <rect width="200" height="200" rx="40" fill="url(#accentGrad)"/>
+    <rect x="40" y="50" width="120" height="75" rx="8" fill="#1e293b" stroke="white" stroke-width="4"/>
+    <circle cx="100" cy="87" r="15" fill="rgba(255,255,255,0.2)"/>
+    <polygon points="95,77 95,97 110,87" fill="white"/>
+    <rect x="80" y="130" width="40" height="6" rx="3" fill="white"/>
+    <rect x="65" y="142" width="70" height="8" rx="4" fill="white"/>
+    <!-- Signal -->
+    <path d="M145 60 Q160 75 145 90" stroke="white" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.8"/>
+    <path d="M155 50 Q175 75 155 100" stroke="white" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.5"/>
+  </g>
+
+  <!-- App name -->
+  <text x="340" y="290" font-family="system-ui, -apple-system, sans-serif" font-size="96" font-weight="800" fill="white">
+    Vizora
+  </text>
+  <text x="340" y="360" font-family="system-ui, -apple-system, sans-serif" font-size="48" font-weight="600" fill="#6366f1">
+    Display
+  </text>
+
+  <!-- Tagline -->
+  <text x="340" y="430" font-family="system-ui, -apple-system, sans-serif" font-size="32" font-weight="400" fill="#94a3b8">
+    Digital Signage Made Simple
+  </text>
+
+  <!-- Feature highlights -->
+  <g transform="translate(100, 520)">
+    <!-- Feature 1 -->
+    <rect x="0" y="0" width="320" height="80" rx="12" fill="rgba(99,102,241,0.1)" stroke="rgba(99,102,241,0.3)" stroke-width="2"/>
+    <text x="25" y="35" font-family="system-ui" font-size="28" fill="white">📺</text>
+    <text x="70" y="35" font-family="system-ui" font-size="20" font-weight="600" fill="white">Android TV Ready</text>
+    <text x="70" y="60" font-family="system-ui" font-size="16" fill="#94a3b8">D-pad navigation</text>
+
+    <!-- Feature 2 -->
+    <rect x="360" y="0" width="320" height="80" rx="12" fill="rgba(99,102,241,0.1)" stroke="rgba(99,102,241,0.3)" stroke-width="2"/>
+    <text x="385" y="35" font-family="system-ui" font-size="28" fill="white">⚡</text>
+    <text x="430" y="35" font-family="system-ui" font-size="20" font-weight="600" fill="white">Real-time Sync</text>
+    <text x="430" y="60" font-family="system-ui" font-size="16" fill="#94a3b8">Instant updates</text>
+
+    <!-- Feature 3 -->
+    <rect x="720" y="0" width="320" height="80" rx="12" fill="rgba(99,102,241,0.1)" stroke="rgba(99,102,241,0.3)" stroke-width="2"/>
+    <text x="745" y="35" font-family="system-ui" font-size="28" fill="white">🔒</text>
+    <text x="790" y="35" font-family="system-ui" font-size="20" font-weight="600" fill="white">Secure & Private</text>
+    <text x="790" y="60" font-family="system-ui" font-size="16" fill="#94a3b8">Encrypted connection</text>
+  </g>
+
+  <!-- Website -->
+  <text x="1100" y="680" font-family="system-ui" font-size="24" font-weight="500" fill="#64748b" text-anchor="end">
+    vizora.io
+  </text>
+</svg>
