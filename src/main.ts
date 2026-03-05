@@ -162,7 +162,10 @@ class VizoraAndroidTV {
   private zoneIndices: Map<string, number> = new Map();
 
   constructor() {
-    this.init();
+    this.init().catch(err => {
+      console.error('[Vizora] Fatal initialization error:', err);
+      this.showError('Failed to initialize. Please restart the app.');
+    });
   }
 
   private async init() {
@@ -399,6 +402,8 @@ class VizoraAndroidTV {
           deviceIdentifier,
           metadata: deviceInfo,
         },
+        connectTimeout: 10000,
+        readTimeout: 15000,
       });
 
       console.log('[Vizora] Pairing response status:', response.status);
@@ -498,6 +503,8 @@ class VizoraAndroidTV {
         // Use Capacitor's native HTTP for Android
         const response: HttpResponse = await CapacitorHttp.get({
           url: `${this.config.apiUrl}/api/v1/devices/pairing/status/${this.pairingCode}`,
+          connectTimeout: 10000,
+          readTimeout: 10000,
         });
 
         if (response.status < 200 || response.status >= 300) {

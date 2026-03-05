@@ -21,6 +21,9 @@ export class AndroidCacheManager {
   private maxCacheSizeMB: number;
   private downloadingSet: Set<string> = new Set();
   private initialized = false;
+  private manifestDirty = false;
+  private debounceSaveTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly DEBOUNCE_INTERVAL = 60000;
 
   constructor(maxCacheSizeMB = 500) {
     this.maxCacheSizeMB = maxCacheSizeMB;
@@ -57,6 +60,7 @@ export class AndroidCacheManager {
   }
 
   private async saveManifest(): Promise<void> {
+    this.manifestDirty = false;
     try {
       await Filesystem.writeFile({
         path: `${this.cacheDir}/manifest.json`,
@@ -66,6 +70,18 @@ export class AndroidCacheManager {
       });
     } catch (error) {
       console.error('[AndroidCache] Failed to save manifest:', error);
+    }
+  }
+
+  private debouncedSaveManifest(): void {
+    this.manifestDirty = true;
+    if (!this.debounceSaveTimer) {
+      this.debounceSaveTimer = setTimeout(() => {
+        this.debounceSaveTimer = null;
+        if (this.manifestDirty) {
+          this.saveManifest();
+        }
+      }, AndroidCacheManager.DEBOUNCE_INTERVAL);
     }
   }
 
@@ -149,7 +165,7 @@ export class AndroidCacheManager {
       });
 
       entry.lastAccessed = Date.now();
-      await this.saveManifest();
+      this.debouncedSaveManifest();
 
       const uriResult = await Filesystem.getUri({
         path: `${this.cacheDir}/${entry.fileName}`,
@@ -223,11 +239,15 @@ export class AndroidCacheManager {
     return Object.values(this.manifest.entries).reduce((sum, e) => sum + e.size, 0);
   }
 
+  private static readonly ALLOWED_EXTENSIONS = new Set([
+    'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'mp4', 'webm', 'ogg',
+  ]);
+
   private getExtension(url: string, mimeType: string): string {
     try {
       const urlPath = new URL(url).pathname;
-      const ext = urlPath.split('.').pop();
-      if (ext && ext.length <= 5) return ext;
+      const ext = urlPath.split('.').pop()?.toLowerCase();
+      if (ext && AndroidCacheManager.ALLOWED_EXTENSIONS.has(ext)) return ext;
     } catch {}
 
     const mimeMap: Record<string, string> = {
