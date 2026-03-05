@@ -44,10 +44,17 @@ function transformContentUrl(url: string, apiUrl: string, deviceToken?: string |
     result = url.replace(/http:\/\/localhost:\d+/g, apiUrl)
                 .replace(/http:\/\/127\.0\.0\.1:\d+/g, apiUrl);
   }
-  // Append device JWT token for authentication — img/video tags can't send headers
+  // Append device JWT token only for same-origin URLs (img/video tags can't send headers).
+  // Never leak token to third-party domains — it would appear in their server logs.
   if (deviceToken && (result.startsWith('http://') || result.startsWith('https://'))) {
-    const separator = result.includes('?') ? '&' : '?';
-    result += `${separator}token=${encodeURIComponent(deviceToken)}`;
+    try {
+      const resultOrigin = new URL(result).origin;
+      const apiOrigin = new URL(apiUrl).origin;
+      if (resultOrigin === apiOrigin) {
+        const separator = result.includes('?') ? '&' : '?';
+        result += `${separator}token=${encodeURIComponent(deviceToken)}`;
+      }
+    } catch { /* invalid URL, skip token */ }
   }
   return result;
 }
@@ -403,7 +410,15 @@ class VizoraAndroidTV {
       // Unwrap response envelope: { success, data: { code, qrCode, ... } }
       const responseBody = response.data;
       const data = responseBody?.data ?? responseBody;
-      console.log('[Vizora] Pairing data:', JSON.stringify(data));
+
+      if (typeof data?.code !== 'string' || !data.code) {
+        throw new Error('Invalid pairing response: missing code');
+      }
+      if (data.deviceId != null && typeof data.deviceId !== 'string') {
+        throw new Error('Invalid pairing response: invalid deviceId');
+      }
+
+      console.log('[Vizora] Pairing code received, length:', data.code.length);
       this.pairingCode = data.code;
       this.deviceId = data.deviceId;
 
@@ -498,13 +513,15 @@ class VizoraAndroidTV {
         const responseBody = response.data;
         const data = responseBody?.data ?? responseBody;
 
-        if (data.status === 'paired' && data.deviceToken) {
+        if (data.status === 'paired' && typeof data.deviceToken === 'string' && data.deviceToken) {
           console.log('[Vizora] Device paired successfully!');
           this.stopPairingCheck();
           this.pairingRetryCount = 0;
 
           this.deviceToken = data.deviceToken;
-          this.deviceId = data.deviceId || this.deviceId;
+          if (typeof data.deviceId === 'string') {
+            this.deviceId = data.deviceId;
+          }
 
           // Store credentials in encrypted storage
           await SecureStorage.set({ key: 'device_token', value: data.deviceToken });
@@ -839,7 +856,7 @@ class VizoraAndroidTV {
         // Use sandboxed iframe to safely render HTML content
         const htmlIframe = document.createElement('iframe');
         htmlIframe.sandbox.add('allow-scripts');
-        htmlIframe.srcdoc = this.sanitizeHtmlContent(contentUrl);
+        htmlIframe.srcdoc = this.injectContentSecurityPolicy(contentUrl);
         htmlIframe.style.width = '100%';
         htmlIframe.style.height = '100%';
         htmlIframe.style.border = 'none';
@@ -1128,7 +1145,7 @@ class VizoraAndroidTV {
         // Use sandboxed iframe to safely render HTML content
         const tempHtmlIframe = document.createElement('iframe');
         tempHtmlIframe.sandbox.add('allow-scripts');
-        tempHtmlIframe.srcdoc = this.sanitizeHtmlContent(contentUrl);
+        tempHtmlIframe.srcdoc = this.injectContentSecurityPolicy(contentUrl);
         tempHtmlIframe.style.width = '100%';
         tempHtmlIframe.style.height = '100%';
         tempHtmlIframe.style.border = 'none';
@@ -1324,7 +1341,7 @@ class VizoraAndroidTV {
       case 'template':
         const iframe = document.createElement('iframe');
         iframe.sandbox.add('allow-scripts');
-        iframe.srcdoc = this.sanitizeHtmlContent(content.url);
+        iframe.srcdoc = this.injectContentSecurityPolicy(content.url);
         iframe.style.cssText = 'width:100%;height:100%;border:none;';
         contentDiv.appendChild(iframe);
         break;
@@ -1346,9 +1363,15 @@ class VizoraAndroidTV {
     this.zoneIndices.clear();
   }
 
-  // ==================== HTML CONTENT SANITIZATION ====================
+  // ==================== HTML CONTENT SECURITY ====================
 
-  private sanitizeHtmlContent(html: string): string {
+  /**
+   * Injects a Content-Security-Policy meta tag into HTML content.
+   * Security model: iframe sandbox (allow-scripts only) + restrictive CSP.
+   * This does NOT sanitize HTML — it relies on CSP to block network access
+   * and sandbox to prevent parent DOM access.
+   */
+  private injectContentSecurityPolicy(html: string): string {
     const cspTag = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; script-src \'unsafe-inline\'; img-src data: blob:; font-src data:;">';
     // Inject CSP into <head> if present, otherwise prepend
     if (html.includes('<head>')) {
