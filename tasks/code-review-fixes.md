@@ -242,12 +242,25 @@ Estimated: 12 commits on `fix/code-review-issues` branch.
 ## Verification
 
 After all fixes:
-- [ ] `npm run build` passes
-- [ ] `npx cap sync android` passes
-- [ ] `npm test` passes (including new tests in L4)
+- [x] `npm run build` passes ✓
+- [ ] `npx cap sync android` passes (requires Android SDK)
+- [x] `npm test` passes — 19 tests across 2 suites ✓
 - [ ] Manual test: pairing flow works
 - [ ] Manual test: content playback works
 - [ ] Manual test: offline playlist restoration works
-- [ ] Grep for `token=` — only appears in same-origin context
-- [ ] Grep for `sanitizeHtml` — renamed to `injectContentSecurityPolicy`
+- [x] Grep for `token=` — only appears in same-origin context ✓
+- [x] Grep for `sanitizeHtml` — renamed to `injectContentSecurityPolicy` ✓
 - [ ] `./gradlew assembleDebug` succeeds in Android Studio
+
+## Completion Status
+
+All 16 issues fixed across 4 commits on `fix/code-review-issues`:
+
+| Commit | Issues | Description |
+|--------|--------|-------------|
+| `c3e9234` | C1, C2, C3 | Security: same-origin token, rename sanitize fn, validate responses |
+| `ea028a8` | H1, H2, H3, H4, L3 | Reliability: debounce cache, catch init errors, HTTP timeouts, ext whitelist |
+| `474b634` | M1, M2, M3, M4, M5 | Quality: shared renderer, clear_cache fix, stable crypto, network security |
+| `64ae84f` | L1, L2, L4 | Polish: parallel preload, retry cap, unit tests in utils.ts |
+
+L5 (pnpm-lock.yaml) deferred — npm works fine standalone, pnpm migration is optional.
