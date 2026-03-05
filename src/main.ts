@@ -307,6 +307,9 @@ class VizoraAndroidTV {
     });
   }
 
+  // Linear D-pad navigation — treats all focusable elements as a flat list.
+  // Sufficient for current single-column UI. If the UI gains grid layouts,
+  // switch to spatial navigation (nearest element by bounding rect in direction).
   private handleDpadNavigation(
     direction: string,
     elements: NodeListOf<Element>,
@@ -779,106 +782,22 @@ class VizoraAndroidTV {
     const contentDiv = document.createElement('div');
     contentDiv.className = 'content-item';
 
-    // Transform URL for Android emulator (localhost -> 10.0.2.2)
-    // Only transform actual URLs, not raw HTML content used by html/template types
     const contentType = currentItem.content.type;
-    let contentUrl = (contentType === 'html' || contentType === 'template')
-      ? currentItem.content.url
-      : transformContentUrl(currentItem.content.url, this.config.apiUrl, this.deviceToken);
 
-    // Check cache for media content, download if not cached
-    let resolvedUrl = contentUrl;
-    if (contentType === 'image' || contentType === 'video') {
-      try {
-        const cachedUri = await this.cacheManager.getCachedUri(currentItem.content.id);
-        if (cachedUri) {
-          resolvedUrl = cachedUri;
-          console.log('[Vizora] Using cached content:', cachedUri);
-        } else {
-          // Download and cache before rendering
-          const downloaded = await this.cacheManager.downloadContent(
-            currentItem.content.id,
-            contentUrl,
-            currentItem.content.mimeType || (contentType === 'video' ? 'video/mp4' : 'image/jpeg')
-          );
-          if (downloaded) {
-            resolvedUrl = downloaded;
-            console.log('[Vizora] Downloaded and cached playlist content:', downloaded);
-          } else {
-            console.warn('[Vizora] Cache download failed, using direct URL:', contentUrl);
-          }
-        }
-      } catch (err) {
-        console.warn('[Vizora] Cache check failed:', err);
-      }
+    // Layout is a special case — it manages its own container
+    if (contentType === 'layout') {
+      this.renderLayout(currentItem);
+      return;
     }
 
-    switch (contentType) {
-      case 'image':
-        const img = document.createElement('img');
-        img.src = resolvedUrl;
-        img.alt = currentItem.content.name;
-        img.onerror = () => {
-          console.error('[Vizora] Image load failed:', resolvedUrl);
-          this.showContentError(container, currentItem.content!.name);
-          // Delay before next to prevent tight loop when all items fail
-          setTimeout(() => this.nextContent(), 5000);
-        };
-        contentDiv.appendChild(img);
-        break;
-
-      case 'video':
-        const video = document.createElement('video');
-        video.src = resolvedUrl;
-        video.autoplay = true;
-        video.muted = false;
-        video.playsInline = true;
-        // Android TV specific attributes
-        video.setAttribute('x5-video-player-type', 'h5');
-        video.setAttribute('x5-video-player-fullscreen', 'true');
-        video.onerror = () => {
-          console.error('[Vizora] Video load failed:', resolvedUrl);
-          this.showContentError(container, currentItem.content!.name);
-          // Delay before next to prevent tight loop when all items fail
-          setTimeout(() => this.nextContent(), 5000);
-        };
-        video.onended = () => this.nextContent();
-        contentDiv.appendChild(video);
-        break;
-
-      case 'webpage':
-      case 'url':
-        const iframe = document.createElement('iframe');
-        iframe.src = contentUrl;
-        iframe.allow = 'autoplay; fullscreen';
-        iframe.onerror = () => {
-          console.error('[Vizora] Webpage load failed:', contentUrl);
-          this.nextContent();
-        };
-        contentDiv.appendChild(iframe);
-        break;
-
-      case 'html':
-      case 'template':
-        // Use sandboxed iframe to safely render HTML content
-        const htmlIframe = document.createElement('iframe');
-        htmlIframe.sandbox.add('allow-scripts');
-        htmlIframe.srcdoc = this.injectContentSecurityPolicy(contentUrl);
-        htmlIframe.style.width = '100%';
-        htmlIframe.style.height = '100%';
-        htmlIframe.style.border = 'none';
-        contentDiv.appendChild(htmlIframe);
-        break;
-
-      case 'layout':
-        this.renderLayout(currentItem);
-        return; // renderLayout handles its own container
-
-      default:
-        console.warn('[Vizora] Unknown content type:', contentType);
-        this.nextContent();
-        return;
-    }
+    await this.renderContentToDiv(currentItem.content, contentDiv, {
+      useCache: true,
+      onVideoEnd: () => this.nextContent(),
+      onError: (name) => {
+        this.showContentError(container, name);
+        setTimeout(() => this.nextContent(), 5000);
+      },
+    });
 
     container.appendChild(contentDiv);
 
@@ -968,10 +887,6 @@ class VizoraAndroidTV {
 
       case 'clear_cache':
         await this.cacheManager.clearCache();
-        // Only clear config preferences, NOT device credentials
-        await Preferences.remove({ key: 'config_api_url' });
-        await Preferences.remove({ key: 'config_realtime_url' });
-        await Preferences.remove({ key: 'config_dashboard_url' });
         window.location.reload();
         break;
 
@@ -1052,48 +967,11 @@ class VizoraAndroidTV {
     const container = document.getElementById('content-container');
     if (!container) return;
 
-    // Clear current content
     this.cleanupMediaElements(container);
     while (container.firstChild) container.removeChild(container.firstChild);
 
     const contentDiv = document.createElement('div');
     contentDiv.className = 'content-item';
-
-    // Transform URL for Android emulator
-    // Only transform actual URLs, not raw HTML content used by html/template types
-    const contentType = content.type;
-    const contentUrl = (contentType === 'html' || contentType === 'template')
-      ? content.url
-      : transformContentUrl(content.url, this.config.apiUrl, this.deviceToken);
-
-    // Resolve URL through cache for media content (download if needed)
-    let resolvedUrl = contentUrl;
-    if (contentType === 'image' || contentType === 'video') {
-      try {
-        const cachedUri = await this.cacheManager.getCachedUri(content.id);
-        if (cachedUri) {
-          resolvedUrl = cachedUri;
-          console.log('[Vizora] Using cached content for push:', cachedUri);
-        } else {
-          // Try to download and cache before rendering
-          const downloaded = await this.cacheManager.downloadContent(
-            content.id,
-            contentUrl,
-            content.mimeType || (contentType === 'video' ? 'video/mp4' : 'image/jpeg')
-          );
-          if (downloaded) {
-            resolvedUrl = downloaded;
-            console.log('[Vizora] Downloaded and cached push content:', downloaded);
-          } else {
-            console.warn('[Vizora] Cache download failed, using direct URL:', contentUrl);
-          }
-        }
-      } catch (err) {
-        console.warn('[Vizora] Push content cache check failed:', err);
-      }
-    }
-
-    console.log(`[Vizora] Rendering temporary content: ${contentType} - ${resolvedUrl}`);
 
     // Track current content for heartbeat reporting
     this.currentContentId = content.id;
@@ -1106,63 +984,13 @@ class VizoraAndroidTV {
       });
     }
 
-    switch (contentType) {
-      case 'image':
-        const img = document.createElement('img');
-        img.src = resolvedUrl;
-        img.alt = content.name;
-        img.onerror = () => {
-          console.error('[Vizora] Temporary image load failed:', resolvedUrl);
-          this.showContentError(container, content.name);
-        };
-        contentDiv.appendChild(img);
-        break;
-
-      case 'video':
-        const video = document.createElement('video');
-        video.src = resolvedUrl;
-        video.autoplay = true;
-        video.muted = false;
-        video.playsInline = true;
-        video.setAttribute('x5-video-player-type', 'h5');
-        video.setAttribute('x5-video-player-fullscreen', 'true');
-        video.onerror = () => {
-          console.error('[Vizora] Temporary video load failed:', resolvedUrl);
-          this.showContentError(container, content.name);
-        };
-        // For video, resume playlist when video ends OR when timer fires (whichever comes first)
-        video.onended = () => {
-          if (this.temporaryContent) {
-            this.resumePlaylist();
-          }
-        };
-        contentDiv.appendChild(video);
-        break;
-
-      case 'webpage':
-      case 'url':
-        const iframe = document.createElement('iframe');
-        iframe.src = contentUrl;
-        iframe.allow = 'autoplay; fullscreen';
-        contentDiv.appendChild(iframe);
-        break;
-
-      case 'html':
-      case 'template':
-        // Use sandboxed iframe to safely render HTML content
-        const tempHtmlIframe = document.createElement('iframe');
-        tempHtmlIframe.sandbox.add('allow-scripts');
-        tempHtmlIframe.srcdoc = this.injectContentSecurityPolicy(contentUrl);
-        tempHtmlIframe.style.width = '100%';
-        tempHtmlIframe.style.height = '100%';
-        tempHtmlIframe.style.border = 'none';
-        contentDiv.appendChild(tempHtmlIframe);
-        break;
-
-      default:
-        console.warn('[Vizora] Unknown temporary content type:', contentType);
-        return;
-    }
+    await this.renderContentToDiv(content, contentDiv, {
+      useCache: true,
+      onVideoEnd: () => {
+        if (this.temporaryContent) this.resumePlaylist();
+      },
+      onError: (name) => this.showContentError(container, name),
+    });
 
     container.appendChild(contentDiv);
     this.showScreen('content');
@@ -1320,46 +1148,16 @@ class VizoraAndroidTV {
 
   private renderZoneContent(content: NonNullable<PlaylistItem['content']>, container: HTMLElement) {
     this.cleanupMediaElements(container);
-    container.innerHTML = '';
+    while (container.firstChild) container.removeChild(container.firstChild);
     const contentDiv = document.createElement('div');
     contentDiv.className = 'content-item';
 
-    const contentType = content.type;
-    const contentUrl = (contentType === 'html' || contentType === 'template')
-      ? content.url
-      : transformContentUrl(content.url, this.config.apiUrl, this.deviceToken);
-
-    switch (contentType) {
-      case 'image':
-        const img = document.createElement('img');
-        img.src = contentUrl;
-        contentDiv.appendChild(img);
-        break;
-      case 'video':
-        const video = document.createElement('video');
-        video.src = contentUrl;
-        video.autoplay = true;
-        video.muted = true;
-        video.loop = true;
-        video.playsInline = true;
-        contentDiv.appendChild(video);
-        break;
-      case 'html':
-      case 'template':
-        const iframe = document.createElement('iframe');
-        iframe.sandbox.add('allow-scripts');
-        iframe.srcdoc = this.injectContentSecurityPolicy(content.url);
-        iframe.style.cssText = 'width:100%;height:100%;border:none;';
-        contentDiv.appendChild(iframe);
-        break;
-      case 'url':
-      case 'webpage':
-        const urlIframe = document.createElement('iframe');
-        urlIframe.src = contentUrl;
-        urlIframe.style.cssText = 'width:100%;height:100%;border:none;';
-        contentDiv.appendChild(urlIframe);
-        break;
-    }
+    // Zone content uses cache and plays video muted+looping
+    this.renderContentToDiv(content, contentDiv, {
+      useCache: true,
+      muteVideo: true,
+      loopVideo: true,
+    });
 
     container.appendChild(contentDiv);
   }
@@ -1387,6 +1185,104 @@ class VizoraAndroidTV {
       return html.replace('<html>', '<html><head>' + cspTag + '</head>');
     }
     return cspTag + html;
+  }
+
+  // ==================== SHARED CONTENT RENDERER ====================
+
+  /**
+   * Renders a content element into a container. Used by playlist playback,
+   * temporary push content, and multi-zone layout to avoid triplicated logic.
+   */
+  private async renderContentToDiv(
+    content: { id: string; name: string; type: string; url: string; mimeType?: string },
+    contentDiv: HTMLElement,
+    options?: {
+      useCache?: boolean;
+      onVideoEnd?: () => void;
+      onError?: (contentName: string) => void;
+      muteVideo?: boolean;
+      loopVideo?: boolean;
+    },
+  ): Promise<void> {
+    const contentType = content.type;
+    const useCache = options?.useCache ?? true;
+
+    // Transform URL (skip for HTML/template which contain raw markup)
+    const contentUrl = (contentType === 'html' || contentType === 'template')
+      ? content.url
+      : transformContentUrl(content.url, this.config.apiUrl, this.deviceToken);
+
+    // Resolve through cache for media content
+    let resolvedUrl = contentUrl;
+    if (useCache && (contentType === 'image' || contentType === 'video')) {
+      try {
+        const cachedUri = await this.cacheManager.getCachedUri(content.id);
+        if (cachedUri) {
+          resolvedUrl = cachedUri;
+        } else {
+          const downloaded = await this.cacheManager.downloadContent(
+            content.id,
+            contentUrl,
+            content.mimeType || (contentType === 'video' ? 'video/mp4' : 'image/jpeg'),
+          );
+          if (downloaded) {
+            resolvedUrl = downloaded;
+          }
+        }
+      } catch {
+        // Fall through to use direct URL
+      }
+    }
+
+    const handleError = () => {
+      if (options?.onError) options.onError(content.name);
+    };
+
+    switch (contentType) {
+      case 'image': {
+        const img = document.createElement('img');
+        img.src = resolvedUrl;
+        img.alt = content.name;
+        img.onerror = handleError;
+        contentDiv.appendChild(img);
+        break;
+      }
+      case 'video': {
+        const video = document.createElement('video');
+        video.src = resolvedUrl;
+        video.autoplay = true;
+        video.muted = options?.muteVideo ?? false;
+        video.playsInline = true;
+        if (options?.loopVideo) video.loop = true;
+        video.setAttribute('x5-video-player-type', 'h5');
+        video.setAttribute('x5-video-player-fullscreen', 'true');
+        video.onerror = handleError;
+        if (options?.onVideoEnd) video.onended = options.onVideoEnd;
+        contentDiv.appendChild(video);
+        break;
+      }
+      case 'webpage':
+      case 'url': {
+        const iframe = document.createElement('iframe');
+        iframe.src = contentUrl;
+        iframe.allow = 'autoplay; fullscreen';
+        iframe.style.cssText = 'width:100%;height:100%;border:none;';
+        iframe.onerror = handleError;
+        contentDiv.appendChild(iframe);
+        break;
+      }
+      case 'html':
+      case 'template': {
+        const iframe = document.createElement('iframe');
+        iframe.sandbox.add('allow-scripts');
+        iframe.srcdoc = this.injectContentSecurityPolicy(content.url);
+        iframe.style.cssText = 'width:100%;height:100%;border:none;';
+        contentDiv.appendChild(iframe);
+        break;
+      }
+      default:
+        console.warn('[Vizora] Unknown content type:', contentType);
+    }
   }
 
   // ==================== MEDIA CLEANUP ====================

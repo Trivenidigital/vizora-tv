@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- Default: no cleartext. Debug variant overrides to allow localhost/emulator. -->
+    <!-- Release builds: HTTPS only, no cleartext traffic -->
     <base-config cleartextTrafficPermitted="false" />
 </network-security-config>
