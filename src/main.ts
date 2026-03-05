@@ -19,6 +19,7 @@ import { CapacitorHttp, HttpResponse } from '@capacitor/core';
 import { io, Socket } from 'socket.io-client';
 import { AndroidCacheManager } from './cache-manager';
 import { SecureStorage } from './secure-storage';
+import { transformContentUrl, injectContentSecurityPolicy } from './utils';
 
 // Configuration - can be overridden via URL params or stored preferences
 const DEFAULT_CONFIG = {
@@ -26,38 +27,6 @@ const DEFAULT_CONFIG = {
   realtimeUrl: import.meta.env.VITE_REALTIME_URL || 'http://localhost:3002',
   dashboardUrl: import.meta.env.VITE_DASHBOARD_URL || 'http://localhost:3001',
 };
-
-// Transform URLs from localhost to emulator-accessible addresses (needed for Android emulator)
-// When apiUrl points to localhost/127.0.0.1, rewrite to 10.0.2.2 for emulator access.
-// When apiUrl is a real hostname, rewrite localhost references to use that hostname instead.
-function transformContentUrl(url: string, apiUrl: string, deviceToken?: string | null): string {
-  if (!url) return url;
-  let result: string;
-
-  // Handle relative URLs (e.g. /api/v1/...) by prepending apiUrl
-  if (url.startsWith('/') && apiUrl) {
-    result = apiUrl.replace(/\/$/, '') + url;
-  } else if (apiUrl.includes('localhost') || apiUrl.includes('127.0.0.1')) {
-    result = url.replace(/http:\/\/localhost/g, 'http://10.0.2.2')
-                .replace(/http:\/\/127\.0\.0\.1/g, 'http://10.0.2.2');
-  } else {
-    result = url.replace(/http:\/\/localhost:\d+/g, apiUrl)
-                .replace(/http:\/\/127\.0\.0\.1:\d+/g, apiUrl);
-  }
-  // Append device JWT token only for same-origin URLs (img/video tags can't send headers).
-  // Never leak token to third-party domains — it would appear in their server logs.
-  if (deviceToken && (result.startsWith('http://') || result.startsWith('https://'))) {
-    try {
-      const resultOrigin = new URL(result).origin;
-      const apiOrigin = new URL(apiUrl).origin;
-      if (resultOrigin === apiOrigin) {
-        const separator = result.includes('?') ? '&' : '?';
-        result += `${separator}token=${encodeURIComponent(deviceToken)}`;
-      }
-    } catch { /* invalid URL, skip token */ }
-  }
-  return result;
-}
 
 interface Config {
   apiUrl: string;
@@ -381,7 +350,7 @@ class VizoraAndroidTV {
     if (!this.isOnline) {
       this.showError('No network connection. Please check your network settings.');
       const delay = this.getPairingRetryDelay();
-      this.pairingRetryCount++;
+      this.pairingRetryCount = Math.min(this.pairingRetryCount + 1, 6);
       console.log(`[Vizora] Pairing retry in ${delay}ms (attempt ${this.pairingRetryCount})`);
       setTimeout(() => this.startPairing(), delay);
       return;
@@ -448,7 +417,7 @@ class VizoraAndroidTV {
       console.error('[Vizora] Pairing request failed:', error);
       this.showError('Failed to request pairing code. Retrying...');
       const delay = this.getPairingRetryDelay();
-      this.pairingRetryCount++;
+      this.pairingRetryCount = Math.min(this.pairingRetryCount + 1, 6);
       console.log(`[Vizora] Pairing retry in ${delay}ms (attempt ${this.pairingRetryCount})`);
       setTimeout(() => this.startPairing(), delay);
     }
@@ -856,25 +825,21 @@ class VizoraAndroidTV {
   }
 
   private async preloadContent(items: PlaylistItem[]) {
-    for (const item of items) {
-      if (!item.content) continue;
-      const type = item.content.type;
-      if (type !== 'image' && type !== 'video') continue;
-
-      const contentUrl = transformContentUrl(item.content.url, this.config.apiUrl, this.deviceToken);
-      try {
-        const cached = await this.cacheManager.getCachedUri(item.content.id);
+    const tasks = items
+      .filter(item => item.content && (item.content.type === 'image' || item.content.type === 'video'))
+      .map(async (item) => {
+        const content = item.content!;
+        const contentUrl = transformContentUrl(content.url, this.config.apiUrl, this.deviceToken);
+        const cached = await this.cacheManager.getCachedUri(content.id);
         if (!cached) {
           await this.cacheManager.downloadContent(
-            item.content.id,
+            content.id,
             contentUrl,
-            item.content.mimeType || (type === 'video' ? 'video/mp4' : 'image/jpeg')
+            content.mimeType || (content.type === 'video' ? 'video/mp4' : 'image/jpeg'),
           );
         }
-      } catch (err) {
-        console.warn('[Vizora] Preload failed:', item.content.id, err);
-      }
-    }
+      });
+    await Promise.allSettled(tasks);
   }
 
   // ==================== COMMANDS ====================
@@ -1177,14 +1142,7 @@ class VizoraAndroidTV {
    * and sandbox to prevent parent DOM access.
    */
   private injectContentSecurityPolicy(html: string): string {
-    const cspTag = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; script-src \'unsafe-inline\'; img-src data: blob:; font-src data:;">';
-    // Inject CSP into <head> if present, otherwise prepend
-    if (html.includes('<head>')) {
-      return html.replace('<head>', '<head>' + cspTag);
-    } else if (html.includes('<html>')) {
-      return html.replace('<html>', '<html><head>' + cspTag + '</head>');
-    }
-    return cspTag + html;
+    return injectContentSecurityPolicy(html);
   }
 
   // ==================== SHARED CONTENT RENDERER ====================
