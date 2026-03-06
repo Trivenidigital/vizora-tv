@@ -42,10 +42,12 @@ export function transformContentUrl(url: string, apiUrl: string, deviceToken?: s
 
   // Append device JWT token only for same-origin URLs (img/video tags can't send headers).
   // Never leak token to third-party domains — it would appear in their server logs.
+  // Normalize www/non-www to handle API_BASE_URL mismatches (e.g. vizora.cloud vs www.vizora.cloud).
   if (deviceToken && (result.startsWith('http://') || result.startsWith('https://'))) {
     try {
-      const resultOrigin = new URL(result).origin;
-      const apiOrigin = new URL(apiUrl).origin;
+      const normalize = (o: string) => o.replace('://www.', '://');
+      const resultOrigin = normalize(new URL(result).origin);
+      const apiOrigin = normalize(new URL(apiUrl).origin);
       if (resultOrigin === apiOrigin) {
         const separator = result.includes('?') ? '&' : '?';
         result += `${separator}token=${encodeURIComponent(deviceToken)}`;

@@ -78,6 +78,24 @@ describe('transformContentUrl', () => {
     const result = transformContentUrl('/file?w=100', API, 'tok');
     expect(result).toBe('https://api.vizora.io/file?w=100&token=tok');
   });
+
+  it('appends token when content URL has www but apiUrl does not', () => {
+    const result = transformContentUrl(
+      'https://www.api.vizora.io/api/v1/device-content/123/file',
+      API,
+      'my-token',
+    );
+    expect(result).toContain('token=my-token');
+  });
+
+  it('appends token when apiUrl has www but content URL does not', () => {
+    const result = transformContentUrl(
+      '/api/v1/device-content/123/file',
+      'https://www.api.vizora.io',
+      'my-token',
+    );
+    expect(result).toContain('token=my-token');
+  });
 });
 
 describe('injectContentSecurityPolicy', () => {
