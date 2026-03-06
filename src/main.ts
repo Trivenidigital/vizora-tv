@@ -134,6 +134,7 @@ class VizoraAndroidTV {
 
   private zoneTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private zoneIndices: Map<string, number> = new Map();
+  private dpadHandler: ((event: KeyboardEvent) => void) | null = null;
 
   constructor() {
     this.init().catch(err => {
@@ -162,9 +163,6 @@ class VizoraAndroidTV {
     if (this.deviceToken && this.deviceId) {
       console.log('[Vizora] Found existing device credentials, connecting...');
 
-      // Show content screen immediately to avoid showing pairing screen on restart
-      this.showScreen('content');
-
       // Restore last playlist for offline resilience
       try {
         const lastPlaylist = await Preferences.get({ key: 'last_playlist' });
@@ -175,6 +173,10 @@ class VizoraAndroidTV {
       } catch (err) {
         console.warn('[Vizora] Failed to restore last playlist:', err);
       }
+
+      // Show content screen after playlist restore to avoid blank flash
+      // (also prevents showing pairing screen on restart — BUG #7)
+      this.showScreen('content');
 
       this.connectToRealtime();
     } else {
@@ -233,6 +235,10 @@ class VizoraAndroidTV {
       if (isActive && this.deviceToken && !this.socket?.connected) {
         this.connectToRealtime();
       }
+      if (!isActive && this.offlineTimeout) {
+        clearTimeout(this.offlineTimeout);
+        this.offlineTimeout = null;
+      }
     });
 
     // Handle back button (Android TV)
@@ -254,7 +260,12 @@ class VizoraAndroidTV {
     const KEY_ENTER = 'Enter';
     const KEY_BACK = 'Escape';
 
-    document.addEventListener('keydown', (event) => {
+    // Remove previous handler if re-initialized
+    if (this.dpadHandler) {
+      document.removeEventListener('keydown', this.dpadHandler);
+    }
+
+    this.dpadHandler = (event: KeyboardEvent) => {
       const focusableElements = document.querySelectorAll('.focusable');
       const currentFocus = document.activeElement;
 
@@ -281,7 +292,9 @@ class VizoraAndroidTV {
           event.preventDefault();
           break;
       }
-    });
+    };
+
+    document.addEventListener('keydown', this.dpadHandler);
   }
 
   // Linear D-pad navigation — treats all focusable elements as a flat list.
@@ -1304,7 +1317,9 @@ class VizoraAndroidTV {
         iframe.sandbox.add('allow-scripts');
         iframe.srcdoc = this.injectContentSecurityPolicy(content.url);
         iframe.style.cssText = 'width:100%;height:100%;border:none;';
-        iframe.onerror = handleError;
+        // onerror doesn't fire for srcdoc iframes; use load timeout as fallback
+        const loadTimer = setTimeout(() => handleError(), 10_000);
+        iframe.onload = () => clearTimeout(loadTimer);
         contentDiv.appendChild(iframe);
         break;
       }

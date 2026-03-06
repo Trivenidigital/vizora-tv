@@ -2,6 +2,7 @@
  * Unit tests for pure utility functions in utils.ts
  */
 
+import { describe, it, expect } from 'vitest';
 import { transformContentUrl, injectContentSecurityPolicy } from './utils';
 
 describe('transformContentUrl', () => {
