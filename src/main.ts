@@ -21,6 +21,8 @@ import { AndroidCacheManager } from './cache-manager';
 import { SecureStorage } from './secure-storage';
 import { transformContentUrl, injectContentSecurityPolicy } from './utils';
 
+declare const __APP_VERSION__: string;
+
 // Configuration - can be overridden via URL params or stored preferences
 const DEFAULT_CONFIG = {
   apiUrl: import.meta.env.VITE_API_URL || 'http://localhost:3000',
@@ -110,6 +112,7 @@ class VizoraAndroidTV {
   private pairingExpiresAt: number = 0;
   private pairingCheckInterval: ReturnType<typeof setInterval> | null = null;
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  private offlineTimeout: ReturnType<typeof setTimeout> | null = null;
   private config: Config = DEFAULT_CONFIG;
   private startTime: number = Date.now();
   private currentContentId: string | null = null;
@@ -131,6 +134,7 @@ class VizoraAndroidTV {
 
   private zoneTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private zoneIndices: Map<string, number> = new Map();
+  private dpadHandler: ((event: KeyboardEvent) => void) | null = null;
 
   constructor() {
     this.init().catch(err => {
@@ -169,6 +173,10 @@ class VizoraAndroidTV {
       } catch (err) {
         console.warn('[Vizora] Failed to restore last playlist:', err);
       }
+
+      // Show content screen after playlist restore to avoid blank flash
+      // (also prevents showing pairing screen on restart — BUG #7)
+      this.showScreen('content');
 
       this.connectToRealtime();
     } else {
@@ -227,6 +235,10 @@ class VizoraAndroidTV {
       if (isActive && this.deviceToken && !this.socket?.connected) {
         this.connectToRealtime();
       }
+      if (!isActive && this.offlineTimeout) {
+        clearTimeout(this.offlineTimeout);
+        this.offlineTimeout = null;
+      }
     });
 
     // Handle back button (Android TV)
@@ -248,7 +260,12 @@ class VizoraAndroidTV {
     const KEY_ENTER = 'Enter';
     const KEY_BACK = 'Escape';
 
-    document.addEventListener('keydown', (event) => {
+    // Remove previous handler if re-initialized
+    if (this.dpadHandler) {
+      document.removeEventListener('keydown', this.dpadHandler);
+    }
+
+    this.dpadHandler = (event: KeyboardEvent) => {
       const focusableElements = document.querySelectorAll('.focusable');
       const currentFocus = document.activeElement;
 
@@ -275,7 +292,9 @@ class VizoraAndroidTV {
           event.preventDefault();
           break;
       }
-    });
+    };
+
+    document.addEventListener('keydown', this.dpadHandler);
   }
 
   // Linear D-pad navigation — treats all focusable elements as a flat list.
@@ -603,14 +622,15 @@ class VizoraAndroidTV {
       }
 
       const heartbeatData = {
-        timestamp: new Date().toISOString(),
+        uptime: uptimeSeconds,
+        appVersion: typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.0',
         metrics: {
           cpuUsage: 0, // not available in browser/WebView context
           memoryUsage,
-          uptime: uptimeSeconds,
         },
-        currentContent: this.currentContentId || null,
-        status: 'online',
+        currentContent: this.currentContentId
+          ? { contentId: this.currentContentId }
+          : undefined,
       };
 
       this.socket.emit('heartbeat', heartbeatData, (response: HeartbeatResponse) => {
@@ -649,6 +669,11 @@ class VizoraAndroidTV {
     // Close existing socket if any
     if (this.socket) {
       this.stopHeartbeat();
+      if (this.offlineTimeout) {
+        clearTimeout(this.offlineTimeout);
+        this.offlineTimeout = null;
+      }
+      this.socket.removeAllListeners();
       this.socket.disconnect();
     }
 
@@ -667,6 +692,11 @@ class VizoraAndroidTV {
     this.socket.on('connect', () => {
       console.log('[Vizora] Connected to realtime gateway');
       this.updateStatus('online', 'Connected');
+      if (this.offlineTimeout) {
+        clearTimeout(this.offlineTimeout);
+        this.offlineTimeout = null;
+      }
+      this.hideOfflineOverlay();
       this.showScreen('content');
       this.startHeartbeat();
 
@@ -681,7 +711,15 @@ class VizoraAndroidTV {
       console.log('[Vizora] Disconnected:', reason);
       this.updateStatus('offline', 'Disconnected');
       this.stopHeartbeat();
-      // Continue playing current playlist if available (content stays in DOM)
+      // Show offline overlay after 60s of sustained disconnect
+      if (this.offlineTimeout) {
+        clearTimeout(this.offlineTimeout);
+      }
+      this.offlineTimeout = setTimeout(() => {
+        if (!this.socket?.connected) {
+          this.showOfflineOverlay();
+        }
+      }, 60_000);
     });
 
     this.socket.on('connect_error', async (error) => {
@@ -1134,6 +1172,9 @@ class VizoraAndroidTV {
     this.zoneIndices.set(zoneId, 0);
 
     const playZoneItem = () => {
+      // Guard: stop if zone was cleaned up during timer wait
+      if (!this.zoneIndices.has(zoneId)) return;
+
       const index = this.zoneIndices.get(zoneId) || 0;
       const items = playlist.items;
       if (!items || items.length === 0) return;
@@ -1276,6 +1317,9 @@ class VizoraAndroidTV {
         iframe.sandbox.add('allow-scripts');
         iframe.srcdoc = this.injectContentSecurityPolicy(content.url);
         iframe.style.cssText = 'width:100%;height:100%;border:none;';
+        // onerror doesn't fire for srcdoc iframes; use load timeout as fallback
+        const loadTimer = setTimeout(() => handleError(), 10_000);
+        iframe.onload = () => clearTimeout(loadTimer);
         contentDiv.appendChild(iframe);
         break;
       }
@@ -1313,6 +1357,21 @@ class VizoraAndroidTV {
       errorMessage.textContent = message;
     }
     this.showScreen('error');
+  }
+
+  private showOfflineOverlay() {
+    const existing = document.getElementById('offline-overlay');
+    if (existing) return;
+    const overlay = document.createElement('div');
+    overlay.id = 'offline-overlay';
+    overlay.style.cssText = 'position:fixed;bottom:0;left:0;right:0;background:rgba(0,0,0,0.8);color:#fff;text-align:center;padding:16px;z-index:9999;font-size:18px;';
+    overlay.textContent = 'Device is offline — reconnecting...';
+    document.body.appendChild(overlay);
+  }
+
+  private hideOfflineOverlay() {
+    const overlay = document.getElementById('offline-overlay');
+    if (overlay) overlay.remove();
   }
 
   private updateStatus(status: 'online' | 'offline' | 'connecting', text: string) {

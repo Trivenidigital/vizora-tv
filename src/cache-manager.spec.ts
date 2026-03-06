@@ -5,15 +5,17 @@
  * Full display testing requires Android emulator/hardware QA.
  */
 
+import { vi, describe, it, expect, beforeEach } from 'vitest';
+
 // Mock Capacitor plugins
-jest.mock('@capacitor/filesystem', () => ({
+vi.mock('@capacitor/filesystem', () => ({
   Filesystem: {
-    readFile: jest.fn(),
-    writeFile: jest.fn(),
-    deleteFile: jest.fn(),
-    readdir: jest.fn(),
-    mkdir: jest.fn(),
-    stat: jest.fn(),
+    readFile: vi.fn(),
+    writeFile: vi.fn(),
+    deleteFile: vi.fn(),
+    readdir: vi.fn(),
+    mkdir: vi.fn(),
+    stat: vi.fn(),
   },
   Directory: {
     Data: 'DATA',
@@ -24,10 +26,10 @@ jest.mock('@capacitor/filesystem', () => ({
   },
 }));
 
-jest.mock('@capacitor/core', () => ({
+vi.mock('@capacitor/core', () => ({
   CapacitorHttp: {
-    get: jest.fn(),
-    request: jest.fn(),
+    get: vi.fn(),
+    request: vi.fn(),
   },
 }));
 
@@ -37,7 +39,7 @@ describe('AndroidCacheManager', () => {
   let cacheManager: AndroidCacheManager;
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     cacheManager = new AndroidCacheManager(500);
   });
 
