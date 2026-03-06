@@ -106,6 +106,8 @@ class VizoraAndroidTV {
   private deviceId: string | null = null;
   private deviceToken: string | null = null;
   private pairingCode: string | null = null;
+  private pairingCountdownInterval: ReturnType<typeof setInterval> | null = null;
+  private pairingExpiresAt: number = 0;
   private pairingCheckInterval: ReturnType<typeof setInterval> | null = null;
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
   private config: Config = DEFAULT_CONFIG;
@@ -345,6 +347,7 @@ class VizoraAndroidTV {
 
   private async startPairing() {
     this.showScreen('pairing');
+    this.stopPairingCountdown();
     this.updateStatus('connecting', 'Requesting pairing code...');
 
     if (!this.isOnline) {
@@ -399,8 +402,13 @@ class VizoraAndroidTV {
       this.pairingCode = data.code;
       this.deviceId = data.deviceId;
 
-      // Display the code
+      // Track expiry for countdown timer (default 5 minutes if not provided)
+      const expiresInSeconds = data.expiresInSeconds || 300;
+      this.pairingExpiresAt = Date.now() + expiresInSeconds * 1000;
+
+      // Display the code with countdown
       this.displayPairingCode(data.code);
+      this.startPairingCountdown();
 
       // Generate/display QR code
       if (data.qrCode) {
@@ -427,6 +435,38 @@ class VizoraAndroidTV {
     const codeElement = document.getElementById('pairing-code');
     if (codeElement) {
       codeElement.textContent = code;
+    }
+  }
+
+  private startPairingCountdown() {
+    if (this.pairingCountdownInterval) {
+      clearInterval(this.pairingCountdownInterval);
+    }
+
+    const countdownEl = document.getElementById('pairing-countdown');
+    if (!countdownEl) return;
+
+    const updateCountdown = () => {
+      const remaining = Math.max(0, this.pairingExpiresAt - Date.now());
+      const seconds = Math.ceil(remaining / 1000);
+      const min = Math.floor(seconds / 60);
+      const sec = seconds % 60;
+      countdownEl.textContent = `Code expires in ${min}:${sec.toString().padStart(2, '0')}`;
+
+      if (remaining <= 0) {
+        countdownEl.textContent = 'Code expired — requesting new code...';
+        this.stopPairingCountdown();
+      }
+    };
+
+    updateCountdown();
+    this.pairingCountdownInterval = setInterval(updateCountdown, 1000);
+  }
+
+  private stopPairingCountdown() {
+    if (this.pairingCountdownInterval) {
+      clearInterval(this.pairingCountdownInterval);
+      this.pairingCountdownInterval = null;
     }
   }
 
@@ -495,6 +535,7 @@ class VizoraAndroidTV {
         if (data.status === 'paired' && typeof data.deviceToken === 'string' && data.deviceToken) {
           console.log('[Vizora] Device paired successfully!');
           this.stopPairingCheck();
+          this.stopPairingCountdown();
           this.pairingRetryCount = 0;
 
           this.deviceToken = data.deviceToken;
