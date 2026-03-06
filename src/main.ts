@@ -21,6 +21,8 @@ import { AndroidCacheManager } from './cache-manager';
 import { SecureStorage } from './secure-storage';
 import { transformContentUrl, injectContentSecurityPolicy } from './utils';
 
+declare const __APP_VERSION__: string;
+
 // Configuration - can be overridden via URL params or stored preferences
 const DEFAULT_CONFIG = {
   apiUrl: import.meta.env.VITE_API_URL || 'http://localhost:3000',
@@ -608,7 +610,7 @@ class VizoraAndroidTV {
 
       const heartbeatData = {
         uptime: uptimeSeconds,
-        appVersion: '1.0.0',
+        appVersion: typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.0',
         metrics: {
           cpuUsage: 0, // not available in browser/WebView context
           memoryUsage,
@@ -654,6 +656,10 @@ class VizoraAndroidTV {
     // Close existing socket if any
     if (this.socket) {
       this.stopHeartbeat();
+      if (this.offlineTimeout) {
+        clearTimeout(this.offlineTimeout);
+        this.offlineTimeout = null;
+      }
       this.socket.removeAllListeners();
       this.socket.disconnect();
     }
@@ -693,6 +699,9 @@ class VizoraAndroidTV {
       this.updateStatus('offline', 'Disconnected');
       this.stopHeartbeat();
       // Show offline overlay after 60s of sustained disconnect
+      if (this.offlineTimeout) {
+        clearTimeout(this.offlineTimeout);
+      }
       this.offlineTimeout = setTimeout(() => {
         if (!this.socket?.connected) {
           this.showOfflineOverlay();
