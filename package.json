@@ -18,6 +18,8 @@
     "android:build": "npm run build && cap sync android",
     "android:run": "npm run build && cap sync android && cap run android",
     "android:run:device": "npm run build && cap sync android && cap run android --target",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "postinstall": "echo Run: npm run cap:init then npm run cap:add:android"
   },
   "dependencies": {
@@ -34,10 +36,8 @@
   },
   "devDependencies": {
     "@capacitor/cli": "^6.0.0",
-    "@types/jest": "^30.0.0",
-    "jest": "^30.2.0",
     "terser": "^5.46.0",
-    "ts-jest": "^29.4.6",
+    "vitest": "^3.2.1",
     "typescript": "^5.3.3",
     "vite": "^5.0.0"
   }

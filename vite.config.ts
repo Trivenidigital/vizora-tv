@@ -6,6 +6,11 @@ export default defineConfig(({ mode }) => {
 
   return {
     root: '.',
+    test: {
+      globals: true,
+      environment: 'node',
+      include: ['src/**/*.spec.ts'],
+    },
     build: {
       outDir: 'dist',
       assetsDir: 'assets',
