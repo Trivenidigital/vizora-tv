@@ -556,13 +556,19 @@ describe('AndroidCacheManager', () => {
       expect(manifestWriteCount()).toBeGreaterThanOrEqual(1);
     });
 
-    it('handles rmdir failure gracefully', async () => {
+    it('handles rmdir failure gracefully and logs error', async () => {
       (fs.rmdir as Mock).mockRejectedValueOnce(new Error('Permission denied'));
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
       const cm = new AndroidCacheManager();
       await cm.init();
 
       await expect(cm.clearCache()).resolves.toBeUndefined();
+      expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining('Failed to clear cache'),
+        expect.any(Error),
+      );
+      errorSpy.mockRestore();
     });
   });
 
