@@ -178,6 +178,13 @@ class VizoraAndroidTV {
       // (also prevents showing pairing screen on restart — BUG #7)
       this.showScreen('content');
 
+      // Start playback immediately from restored playlist (don't wait for WebSocket).
+      // The connect handler also calls playContent() as a fallback, but starting here
+      // ensures content is visible even if the WebSocket connection is slow or offline.
+      if (this.currentPlaylist && this.currentPlaylist.items?.length > 0) {
+        this.playContent();
+      }
+
       this.connectToRealtime();
     } else {
       console.log('[Vizora] No credentials found, starting pairing flow...');
