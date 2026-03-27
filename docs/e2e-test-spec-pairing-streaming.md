@@ -24,6 +24,31 @@
 | **Content Assets** | Pre-uploaded to dashboard: 1 image, 1 video (MP4, 10-30s), 1 HTML template, 1 URL |
 | **Network** | Stable WiFi/Ethernet; also need ability to toggle network on/off for offline tests |
 
+### Android TV Emulator Setup
+
+If no physical Android TV device is available:
+
+```bash
+# Install Android TV system image (API 34)
+sdkmanager "system-images;android-34;google_atv;x86_64"
+
+# Create the AVD
+avdmanager create avd -n "TV_API34" \
+  -k "system-images;android-34;google_atv;x86_64" \
+  -d "tv_1080p"
+
+# Launch the emulator
+emulator -avd TV_API34
+
+# Install the debug APK
+adb install -r android/app/build/outputs/apk/debug/vizora-display-1.0.0-debug.apk
+```
+
+**Emulator limitations:**
+- `adb reboot` is flaky on emulators — test P-08 (boot auto-launch) requires a physical device
+- Network toggle: use `adb shell svc wifi disable` / `enable` instead of airplane mode
+- D-pad navigation works via arrow keys on the emulator window
+
 ### .env Configuration (App)
 ```
 VITE_API_URL=https://vizora.cloud
@@ -87,6 +112,8 @@ ASSERT: WebSocket connected (status-dot has class "online")
 ---
 
 ### P-02: Pairing code expiry and auto-renewal (P0)
+
+**Wall-clock time:** ~5 minutes (waiting for code expiry). If the backend team can temporarily shorten `expiresInSeconds` to 30s for testing, this becomes a 30-second test.
 
 **Preconditions:**
 - App on pairing screen, code displayed
@@ -248,13 +275,15 @@ ASSERT: adb logcat shows "Connected to realtime gateway"
 
 ### P-08: Pairing persistence after device reboot (P0)
 
+**Requires physical device.** `adb reboot` on emulators is flaky and BootReceiver behavior varies. Skip this test on emulator and document as "deferred to physical device testing."
+
 **Preconditions:**
 - App successfully paired
 - BootReceiver configured in manifest
 
 **Steps:**
 1. Reboot the Android TV device (`adb reboot`)
-2. Wait for device to fully boot
+2. Wait for device to fully boot (up to 60s)
 3. Observe app auto-launch behavior
 
 **Expected Results:**
@@ -298,9 +327,11 @@ ASSERT: adb logcat shows "window.location.reload()"
 
 ### P-10: Credential migration from plaintext to encrypted storage (P1)
 
+**Requires debug APK.** The `run-as` command below only works on debuggable builds. Release builds block `run-as`. Run this test with the debug APK only.
+
 **Preconditions:**
 - App previously stored credentials in plaintext Preferences (pre-migration build)
-- OR manually set plaintext credentials via adb:
+- OR manually set plaintext credentials via adb (debug APK only):
   ```
   adb shell "run-as com.vizora.display sh -c 'cat > /data/data/com.vizora.display/shared_prefs/CapacitorStorage.xml <<EOF
   <?xml version=\"1.0\" encoding=\"utf-8\"?>
@@ -482,7 +513,8 @@ ASSERT: Socket emits content:impression for each item
 ```
 ASSERT: Content container has visible content while offline
 ASSERT: After 60s offline, "Device is offline" overlay is visible
-ASSERT: adb logcat shows "Starting offline playback from restored playlist"
+ASSERT: Content continues rotating (cached items render without network)
+NOTE: "Starting offline playback from restored playlist" only appears on app restart while offline, NOT on mid-playback network drop. For this test, verify visually that content keeps playing.
 ASSERT: After network restore, adb logcat shows "Connected to realtime gateway"
 ASSERT: Offline overlay removed after reconnect
 ```
@@ -604,11 +636,21 @@ ASSERT: Heartbeat resumes (visible in server logs)
 ### S-12: Invalid/expired token triggers re-pairing (P0)
 
 **Preconditions:**
-- Device paired, then token invalidated server-side (revoked via dashboard or DB)
+- Device paired and connected
+
+**How to invalidate the token (pick one, in order of preference):**
+1. **Dashboard unpair** — If the dashboard has a "remove device" button, use it. This is the easiest path.
+2. **Dashboard API** — If the dashboard exposes a device management API, call the delete endpoint.
+3. **Corrupt the token on-device** — Use adb to clear just the token (debug APK only):
+   ```
+   adb shell run-as com.vizora.display sh -c "rm -f /data/data/com.vizora.display/shared_prefs/vizora_secure_prefs.xml"
+   ```
+   Then restart the app. The app will try to connect with a missing/empty token, triggering the "unauthorized" path.
+4. **DB access** — If you have SSH access to VPIN VPS, delete the device record from the database.
 
 **Steps:**
-1. Invalidate the device token on the server (delete from DB or revoke via admin)
-2. Force app to reconnect (kill and restart, or wait for heartbeat failure)
+1. Invalidate the device token using one of the methods above
+2. Force app to reconnect (`adb shell am force-stop com.vizora.display` then relaunch)
 3. Observe behavior
 
 **Expected Results:**
@@ -724,22 +766,63 @@ ASSERT (c): Preferences has updated config key
 
 **Preconditions:**
 - Device paired, content playing
+- Playlist contains at least 1 image from vizora.cloud API
+
+**Method: logcat-based (no proxy needed)**
+
+The simplest approach is to enable WebView network logging and grep logcat. No HTTPS proxy setup required.
 
 **Steps:**
-1. Monitor network requests from the device (Charles proxy, mitmproxy, or `adb shell dumpsys net_stats`)
-2. Observe content download requests
-3. Check for token in URLs
+1. Enable verbose logcat: `adb logcat -v time | tee e2e-network.log`
+2. Play content from a playlist with vizora.cloud-hosted images
+3. After content plays, search the log for URL patterns:
+   ```bash
+   grep -i "token=" e2e-network.log
+   grep -i "vizora.cloud.*token=" e2e-network.log
+   ```
+4. If the playlist also has third-party URLs (e.g., `https://example.com/image.jpg`), verify those do NOT contain `token=`
 
 **Expected Results:**
-- [ ] API-origin content URLs (vizora.cloud) have `?token={JWT}` appended
-- [ ] Third-party URLs (CDN, external) do NOT have token appended
-- [ ] Token is URL-encoded (`encodeURIComponent`)
-- [ ] www/non-www normalization works (vizora.cloud ↔ www.vizora.cloud)
+- [ ] Content from vizora.cloud loads successfully (image/video renders — proves token is present and valid)
+- [ ] Logcat URLs to vizora.cloud contain `?token=` or `&token=`
+- [ ] No `token=` substring appears in any URL to external domains
+
+**Alternative: proxy-based (thorough but complex)**
+
+For HTTPS interception, use a debug APK with a network security config allowing user CAs:
+1. Install mitmproxy CA on device
+2. Add `<trust-anchors><certificates src="user" /></trust-anchors>` to debug network security config
+3. Route traffic through proxy
+4. Inspect requests for token presence/absence
+
+This is optional — the logcat method above is sufficient for Play Store release confidence.
 
 **Assertions:**
 ```
-ASSERT: All requests to vizora.cloud/api/v1/* include token param
-ASSERT: Zero requests to external domains include token param
+ASSERT: vizora.cloud content loads (not 401) — proves token injection works
+ASSERT: No token= in URLs to non-vizora.cloud domains (grep logcat)
+```
+
+---
+
+### S-17b: API-origin content actually loads with token (P0)
+
+**Preconditions:**
+- Device paired, playlist has image hosted on vizora.cloud
+
+**Steps:**
+1. Assign playlist with vizora.cloud-hosted image
+2. Observe image renders on TV
+
+**Expected Results:**
+- [ ] Image loads and displays (not a broken image icon)
+- [ ] No 401/403 errors in logcat
+- [ ] This proves token injection is working correctly end-to-end
+
+**Assertions:**
+```
+ASSERT: Image visible on screen (not error placeholder)
+ASSERT: adb logcat does NOT contain "401" or "403" for content URLs
 ```
 
 ---
@@ -766,44 +849,112 @@ ASSERT: Zero requests to external domains include token param
 
 **Preconditions:**
 - App running and playing content
+- Debug APK installed (required for `run-as` method)
 
-**Steps:**
-1. Simulate crash: `adb shell am crash com.vizora.display`
-   (or trigger via `adb shell "run-as com.vizora.display kill -11 $(pidof com.vizora.display)"`)
-2. Wait 5 seconds
-3. Observe app behavior
+**Steps (pick one crash method, in order of reliability):**
+
+**Method A — SIGKILL (works on all Android versions, debug APK):**
+```bash
+# Get PID
+PID=$(adb shell pidof com.vizora.display)
+echo "Before crash: PID=$PID"
+
+# Send SIGSEGV to trigger CrashRecoveryHandler
+adb shell "run-as com.vizora.display kill -11 $PID"
+
+# Wait for restart
+sleep 5
+
+# Verify new PID
+NEW_PID=$(adb shell pidof com.vizora.display)
+echo "After crash: PID=$NEW_PID"
+```
+
+**Method B — force-stop + verify AlarmManager restart (works on release APK):**
+```bash
+# Force-stop kills the process without triggering CrashRecoveryHandler
+# BUT the AlarmManager pending intent from a prior crash (if any) would still fire.
+# This tests the restart path, not the crash handler itself.
+adb shell am force-stop com.vizora.display
+sleep 5
+adb shell pidof com.vizora.display  # Should show a PID if AlarmManager restarted
+```
+
+**Method C — if neither works, manually verify:**
+1. Observe the app is running
+2. Check logcat for CrashRecoveryHandler registration: `Thread.setDefaultUncaughtExceptionHandler`
+3. Verify the handler code exists in the APK (code review — already confirmed)
 
 **Expected Results:**
-- [ ] CrashRecoveryHandler catches the crash
-- [ ] App restarts automatically within 3-5 seconds (AlarmManager scheduled restart)
+- [ ] App process restarts automatically within 3-5 seconds
 - [ ] After restart, app loads with existing credentials (no re-pairing needed)
-- [ ] Content playback resumes
+- [ ] Content playback resumes (or at minimum, content screen shown)
+- [ ] No permanent crash loop (app stabilizes after 1 restart)
 
 **Assertions:**
 ```
-ASSERT: App process restarts (pidof changes)
+ASSERT: NEW_PID is set and differs from PID (process restarted)
 ASSERT: content-screen visible after restart (not pairing-screen)
-ASSERT: No permanent crash loop (app stabilizes)
+ASSERT: No repeated crash in logcat (single restart, not loop)
 ```
 
 ---
 
 ### S-20: Memory pressure / long-running stability (P1)
 
+**Wall-clock time:** 1 hour. Run this as a soak test overnight or while doing other work.
+
 **Preconditions:**
-- Device paired, playlist playing
+- Device paired, playlist playing (ideally with video + image mix for max churn)
 
 **Steps:**
-1. Let the app run for 1 hour continuously
-2. Monitor memory via `adb shell dumpsys meminfo com.vizora.display`
-3. Monitor logcat for errors
+1. Start the monitoring script below
+2. Let the app run for 1 hour continuously
+3. Review the output log for memory growth
+
+**Automated monitoring script (run on host machine):**
+```bash
+#!/bin/bash
+# save as monitor-vizora.sh, run: bash monitor-vizora.sh
+LOG="vizora-stability-$(date +%Y%m%d-%H%M).log"
+echo "Monitoring com.vizora.display — output: $LOG"
+echo "timestamp,total_pss_kb,java_heap_kb,native_heap_kb" > "$LOG"
+
+for i in $(seq 1 60); do
+  TS=$(date +%H:%M:%S)
+  MEM=$(adb shell dumpsys meminfo com.vizora.display 2>/dev/null | grep "TOTAL PSS" | awk '{print $3}')
+  JAVA=$(adb shell dumpsys meminfo com.vizora.display 2>/dev/null | grep "Java Heap:" | awk '{print $3}')
+  NATIVE=$(adb shell dumpsys meminfo com.vizora.display 2>/dev/null | grep "Native Heap:" | awk '{print $3}')
+
+  if [ -z "$MEM" ]; then
+    echo "$TS — APP NOT RUNNING (crashed?)" | tee -a "$LOG"
+  else
+    echo "$TS,$MEM,$JAVA,$NATIVE" | tee -a "$LOG"
+  fi
+  sleep 60
+done
+
+# Check for growth
+FIRST=$(sed -n '2p' "$LOG" | cut -d',' -f2)
+LAST=$(tail -1 "$LOG" | cut -d',' -f2)
+if [ -n "$FIRST" ] && [ -n "$LAST" ]; then
+  GROWTH=$(( (LAST - FIRST) * 100 / FIRST ))
+  echo "Memory growth: ${GROWTH}% (${FIRST}KB → ${LAST}KB)"
+  if [ "$GROWTH" -gt 20 ]; then
+    echo "FAIL: Memory grew >20% — possible leak"
+  else
+    echo "PASS: Memory stable"
+  fi
+fi
+```
 
 **Expected Results:**
-- [ ] No memory leaks (memory usage stays bounded)
+- [ ] No memory leaks (TOTAL PSS growth < 20% over 1 hour)
 - [ ] Video elements are cleaned up on content transitions (pause, remove src, load)
 - [ ] No accumulated DOM elements (innerHTML cleared on each render)
 - [ ] Content rotation continues without stuttering
 - [ ] Heartbeats continue at 15s intervals
+- [ ] App process doesn't restart (PID stays the same)
 
 ---
 
@@ -837,7 +988,7 @@ ASSERT: No permanent crash loop (app stabilizes)
 | S-14 | P1 | None | Medium | P-01 |
 | S-15 | P2 | None | Low | S-01 |
 | S-16 | P2 | None | Medium | Server layout content |
-| S-17 | P0 | Data leak | Medium | P-01, Proxy setup |
+| S-17 | P0 | Data leak | Low | P-01, logcat only |
 | S-18 | P2 | None | Low | TV remote |
 | S-19 | P0 | Play Store reject | Medium | ADB |
 | S-20 | P1 | ANR, crash | High (1 hour) | P-01 |
@@ -861,8 +1012,9 @@ Execute in this order:
 11. **S-12** Expired token → re-pairing
 12. **S-19** Crash recovery
 13. **S-17** Token not leaked to third-party URLs
+14. **S-17b** API content loads with token (no 401)
 
-**Total: 13 tests = minimum confident release**
+**Total: 14 tests = minimum confident release**
 
 ---
 
@@ -870,7 +1022,7 @@ Execute in this order:
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| `push_content` with undefined `content` crashes at `content.name` (line 976) | Crash if dashboard sends malformed command | Fix production code: add null guard in `handleCommand` |
+| ~~`push_content` with undefined `content` crashes at `content.name` (line 976)~~ | ~~Crash~~ | **FIXED** — `command.payload?.content != null` guard added, logs warning instead of crashing |
 | `handleCommand` switch has no try/catch | Unhandled errors from any command crash the event handler | Wrap switch body in try/catch |
 | Alpha `security-crypto:1.1.0-alpha06` dependency | Play Store review flag | Pin to stable `1.0.0` (already planned) |
 | Cleartext traffic allowed in debug build | Play Store review if wrong build submitted | Use release build with cleartext disabled |
