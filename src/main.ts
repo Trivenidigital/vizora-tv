@@ -954,10 +954,12 @@ class VizoraAndroidTV {
         break;
 
       case 'push_content':
-        if (command.payload) {
+        if (command.payload?.content != null) {
           const content = command.payload.content as PushContent;
           const duration = (command.payload.duration as number) || 5;
           this.handleContentPush(content, duration);
+        } else {
+          console.warn('[Vizora] push_content command missing content payload');
         }
         break;
 
