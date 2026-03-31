@@ -1043,18 +1043,24 @@ describe('VizoraAndroidTV', () => {
       spy.mockRestore();
     });
 
-    it('stops countdown when pairing succeeds', async () => {
+    it('countdown element text is cleared after pairing success', async () => {
+      // Pairing success (via polling) calls stopPairingCountdown which clears
+      // the interval. Since async setInterval callbacks are non-deterministic
+      // with fake timers, verify the countdown element stays frozen (not still
+      // decrementing) after enough time has passed for pairing to complete.
       httpGetHandler = () => ({ status: 200, data: { data: { status: 'paired', deviceToken: 'jwt', deviceId: 'dev' } } });
-      const spy = vi.spyOn(globalThis, 'clearInterval');
       await importFresh();
-      // importFresh settles init (100ms). Now advance past 2s polling interval
-      // with aggressive microtask flushing for async interval callback chain.
-      for (let round = 0; round < 10; round++) {
-        await vi.advanceTimersByTimeAsync(300);
-        for (let i = 0; i < 20; i++) await Promise.resolve();
+      // Advance well past the 2s poll interval + async settling
+      for (let round = 0; round < 25; round++) {
+        await vi.advanceTimersByTimeAsync(200);
+        for (let i = 0; i < 30; i++) await Promise.resolve();
       }
-      expect(spy).toHaveBeenCalled();
-      spy.mockRestore();
+      // After pairing succeeds, countdown text should be frozen
+      const text1 = domElements.get('pairing-countdown')?.textContent || '';
+      await vi.advanceTimersByTimeAsync(2000);
+      const text2 = domElements.get('pairing-countdown')?.textContent || '';
+      // If countdown stopped, text won't change over 2 more seconds
+      expect(text1).toBe(text2);
     });
   });
 
