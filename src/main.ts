@@ -56,6 +56,7 @@ interface PlaylistItem {
     thumbnail?: string;
     mimeType?: string;
     duration?: number;
+    metadata?: { renderedHtml?: string; [key: string]: unknown };
   } | null;
 }
 
@@ -1244,7 +1245,7 @@ class VizoraAndroidTV {
    * temporary push content, and multi-zone layout to avoid triplicated logic.
    */
   private async renderContentToDiv(
-    content: { id: string; name: string; type: string; url: string; mimeType?: string },
+    content: { id: string; name: string; type: string; url: string; mimeType?: string; metadata?: { renderedHtml?: string; [key: string]: unknown } },
     contentDiv: HTMLElement,
     options?: {
       useCache?: boolean;
@@ -1325,9 +1326,7 @@ class VizoraAndroidTV {
       case 'template': {
         const iframe = document.createElement('iframe');
         iframe.sandbox.add('allow-scripts');
-        const rawContent = content as unknown as Record<string, unknown>;
-        const meta = rawContent.metadata as Record<string, unknown> | undefined;
-        const htmlSource = (meta?.renderedHtml as string) || content.url;
+        const htmlSource = content.metadata?.renderedHtml || content.url;
         iframe.srcdoc = this.injectContentSecurityPolicy(htmlSource);
         iframe.style.cssText = 'width:100%;height:100%;border:none;';
         // onerror doesn't fire for srcdoc iframes; use load timeout as fallback

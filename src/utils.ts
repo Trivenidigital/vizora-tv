@@ -11,10 +11,10 @@
  */
 export function injectContentSecurityPolicy(html: string): string {
   const cspTag = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\' https://fonts.googleapis.com; script-src \'unsafe-inline\'; img-src data: blob: https:; font-src data: https://fonts.gstatic.com;">';
-  if (html.includes('<head>')) {
-    return html.replace('<head>', '<head>' + cspTag);
-  } else if (html.includes('<html>')) {
-    return html.replace('<html>', '<html><head>' + cspTag + '</head>');
+  if (/<head\b/i.test(html)) {
+    return html.replace(/<head\b[^>]*>/i, '$&' + cspTag);
+  } else if (/<html\b/i.test(html)) {
+    return html.replace(/<html\b[^>]*>/i, '$&<head>' + cspTag + '</head>');
   }
   return cspTag + html;
 }
