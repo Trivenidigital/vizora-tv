@@ -10,7 +10,7 @@
  * and sandbox to prevent parent DOM access.
  */
 export function injectContentSecurityPolicy(html: string): string {
-  const cspTag = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\'; script-src \'unsafe-inline\'; img-src data: blob:; font-src data:;">';
+  const cspTag = '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; style-src \'unsafe-inline\' https://fonts.googleapis.com; script-src \'unsafe-inline\'; img-src data: blob: https:; font-src data: https://fonts.gstatic.com;">';
   if (html.includes('<head>')) {
     return html.replace('<head>', '<head>' + cspTag);
   } else if (html.includes('<html>')) {

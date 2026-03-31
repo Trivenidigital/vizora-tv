@@ -1325,7 +1325,10 @@ class VizoraAndroidTV {
       case 'template': {
         const iframe = document.createElement('iframe');
         iframe.sandbox.add('allow-scripts');
-        iframe.srcdoc = this.injectContentSecurityPolicy(content.url);
+        const rawContent = content as unknown as Record<string, unknown>;
+        const meta = rawContent.metadata as Record<string, unknown> | undefined;
+        const htmlSource = (meta?.renderedHtml as string) || content.url;
+        iframe.srcdoc = this.injectContentSecurityPolicy(htmlSource);
         iframe.style.cssText = 'width:100%;height:100%;border:none;';
         // onerror doesn't fire for srcdoc iframes; use load timeout as fallback
         const loadTimer = setTimeout(() => handleError(), 10_000);
