@@ -1044,10 +1044,15 @@ describe('VizoraAndroidTV', () => {
     });
 
     it('stops countdown when pairing succeeds', async () => {
-      await importFresh();
       httpGetHandler = () => ({ status: 200, data: { data: { status: 'paired', deviceToken: 'jwt', deviceId: 'dev' } } });
       const spy = vi.spyOn(globalThis, 'clearInterval');
-      await vi.advanceTimersByTimeAsync(2100);
+      await importFresh();
+      // importFresh settles init (100ms). Now advance past 2s polling interval
+      // with aggressive microtask flushing for async interval callback chain.
+      for (let round = 0; round < 10; round++) {
+        await vi.advanceTimersByTimeAsync(300);
+        for (let i = 0; i < 20; i++) await Promise.resolve();
+      }
       expect(spy).toHaveBeenCalled();
       spy.mockRestore();
     });
