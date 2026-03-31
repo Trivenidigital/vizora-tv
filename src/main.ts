@@ -1151,7 +1151,7 @@ class VizoraAndroidTV {
     this.cleanupLayout();
 
     const grid = document.createElement('div');
-    grid.style.cssText = 'width:100%;height:100%;display:grid;overflow:hidden;';
+    grid.className = 'layout-grid';
     if (metadata.gridTemplate) {
       grid.style.gridTemplateColumns = metadata.gridTemplate.columns || '1fr';
       grid.style.gridTemplateRows = metadata.gridTemplate.rows || '1fr';
@@ -1161,7 +1161,8 @@ class VizoraAndroidTV {
 
     for (const zone of metadata.zones) {
       const zoneDiv = document.createElement('div');
-      zoneDiv.style.cssText = 'position:relative;overflow:hidden;grid-area:' + zone.gridArea + ';';
+      zoneDiv.className = 'layout-zone';
+      zoneDiv.style.gridArea = zone.gridArea;
 
       if (zone.resolvedPlaylist?.items && zone.resolvedPlaylist.items.length > 0) {
         this.createZonePlayer(zone.id, zone.resolvedPlaylist, zoneDiv);

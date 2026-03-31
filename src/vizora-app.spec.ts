@@ -2178,7 +2178,7 @@ describe('VizoraAndroidTV', () => {
         ],
       });
       const zoneDivs = (document.createElement as Mock).mock.results.filter(
-        (r: { value: ElementStub }) => r.value.style.cssText?.includes('grid-area:')
+        (r: { value: ElementStub }) => r.value.style.gridArea
       );
       expect(zoneDivs.length).toBeGreaterThanOrEqual(2);
     });
@@ -2249,6 +2249,33 @@ describe('VizoraAndroidTV', () => {
       // Grid div was created and appended to container
       const container = domElements.get('content-container')!;
       expect(container.children.length).toBeGreaterThan(0);
+    });
+
+    it('grid element has layout-grid class', async () => {
+      await triggerLayout({
+        gridTemplate: { columns: '1fr', rows: '1fr' },
+        zones: [{ id: 'z1', gridArea: '1/1' }],
+      });
+      const container = domElements.get('content-container')!;
+      const grid = container.children[0] as unknown as ElementStub;
+      expect(grid.className).toContain('layout-grid');
+    });
+
+    it('zone elements have layout-zone class', async () => {
+      await triggerLayout({
+        gridTemplate: { columns: '1fr 1fr', rows: '1fr' },
+        zones: [
+          { id: 'z1', gridArea: '1/1', resolvedContent: { id: 'c1', name: 'I', type: 'image', url: '/i.jpg' } },
+          { id: 'z2', gridArea: '1/2', resolvedContent: { id: 'c2', name: 'I2', type: 'image', url: '/i2.jpg' } },
+        ],
+      });
+      const container = domElements.get('content-container')!;
+      const grid = container.children[0] as unknown as ElementStub;
+      const zones = (grid.children || []) as unknown as ElementStub[];
+      expect(zones.length).toBeGreaterThanOrEqual(2);
+      for (const zone of zones) {
+        expect(zone.className).toContain('layout-zone');
+      }
     });
   });
 
