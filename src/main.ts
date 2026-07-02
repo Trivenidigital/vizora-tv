@@ -20,6 +20,7 @@ import { io, Socket } from 'socket.io-client';
 import { AndroidCacheManager } from './cache-manager';
 import { SecureStorage } from './secure-storage';
 import { transformContentUrl, injectContentSecurityPolicy } from './utils';
+import { ScreenStateMachine } from './screen-state';
 
 declare const __APP_VERSION__: string;
 
@@ -124,6 +125,20 @@ class VizoraAndroidTV {
   private isOnline = true;
   private cacheManager = new AndroidCacheManager();
 
+  // Screen ownership state machine (P0-1) — the only screen-visibility authority
+  private machine: ScreenStateMachine;
+  // Playback engine state. `playbackGeneration` invalidates in-flight prepares
+  // when the playlist changes; `advanceInFlight`/`pendingRestart` serialize the
+  // advance loop so it can never run concurrently or recurse.
+  private playbackGeneration = 0;
+  private advanceInFlight = false;
+  private pendingRestart = false;
+  private currentItemCleanup: (() => void) | null = null;
+  private holdingRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private playbackSource: 'live' | 'cached' | 'hold-last' = 'cached';
+  private initRetryCount = 0;
+  private capacitorSetupDone = false;
+
   // Temporary content push state
   private temporaryContent: PushContent | null = null;
   private temporaryContentTimer: ReturnType<typeof setTimeout> | null = null;
@@ -132,14 +147,43 @@ class VizoraAndroidTV {
   // Pairing retry state
   private pairingRetryCount = 0;
 
-  private zoneTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
-  private zoneIndices: Map<string, number> = new Map();
   private dpadHandler: ((event: KeyboardEvent) => void) | null = null;
 
   constructor() {
+    this.machine = new ScreenStateMachine(
+      {
+        // Usable credentials = token AND deviceId (init connects only with
+        // both). A dangling token without an id must still be able to pair.
+        canPair: () => !(this.deviceToken && this.deviceId),
+        canPlay: () =>
+          !!(this.currentPlaylist?.items?.length) || this.temporaryContent != null,
+      },
+      (rec) => {
+        // Leaving PLAYING: heartbeat must stop claiming content is on glass.
+        if (rec.from === 'playing' && rec.to !== 'playing') {
+          this.currentContentId = null;
+        }
+        if (rec.from === 'holding' && this.holdingRetryTimer) {
+          clearTimeout(this.holdingRetryTimer);
+          this.holdingRetryTimer = null;
+        }
+      },
+    );
+    this.startInit();
+  }
+
+  /**
+   * Init with retry — a transient failure at boot must never dead-end on an
+   * error screen (F19). Backoff 5s -> 5min cap.
+   */
+  private startInit() {
     this.init().catch(err => {
-      console.error('[Vizora] Fatal initialization error:', err);
-      this.showError('Failed to initialize. Please restart the app.');
+      console.error('[Vizora] Initialization error, will retry:', err);
+      this.machine.transition('recovering', 'init_failure');
+      this.setHoldingMessage('Starting up — retrying…');
+      const delay = Math.min(5000 * Math.pow(2, this.initRetryCount), 300000);
+      this.initRetryCount = Math.min(this.initRetryCount + 1, 6);
+      setTimeout(() => this.startInit(), delay);
     });
   }
 
@@ -168,21 +212,22 @@ class VizoraAndroidTV {
         const lastPlaylist = await Preferences.get({ key: 'last_playlist' });
         if (lastPlaylist.value) {
           this.currentPlaylist = JSON.parse(lastPlaylist.value);
+          this.playbackSource = 'cached';
           console.log('[Vizora] Restored last playlist from storage');
         }
       } catch (err) {
         console.warn('[Vizora] Failed to restore last playlist:', err);
       }
 
-      // Show content screen after playlist restore to avoid blank flash
-      // (also prevents showing pairing screen on restart — BUG #7)
-      this.showScreen('content');
-
-      // Start playback immediately from restored playlist (don't wait for WebSocket).
-      // The connect handler also calls playContent() as a fallback, but starting here
-      // ensures content is visible even if the WebSocket connection is slow or offline.
+      // Start playback immediately from the restored playlist (don't wait for
+      // the WebSocket — BUG #7). The loading screen stays up until the first
+      // frame commits; the machine enters PLAYING at commit time, so there is
+      // no window where the content screen shows an empty container.
       if (this.currentPlaylist && this.currentPlaylist.items?.length > 0) {
-        this.playContent();
+        void this.advance();
+      } else {
+        this.machine.transition('holding', 'boot_no_cached_playlist');
+        this.setHoldingMessage('Connecting…');
       }
 
       this.connectToRealtime();
@@ -193,6 +238,7 @@ class VizoraAndroidTV {
 
     // Hide splash screen
     await SplashScreen.hide();
+    this.initRetryCount = 0;
   }
 
   private async loadConfig() {
@@ -220,6 +266,9 @@ class VizoraAndroidTV {
   }
 
   private async setupCapacitor() {
+    // Init retries must not double-register listeners (F19 retry path)
+    if (this.capacitorSetupDone) return;
+
     // Setup network status monitoring
     Network.addListener('networkStatusChange', (status) => {
       console.log('[Vizora] Network status changed:', status);
@@ -253,6 +302,8 @@ class VizoraAndroidTV {
       // Don't exit the app on back button
       console.log('[Vizora] Back button pressed, ignoring...');
     });
+
+    this.capacitorSetupDone = true;
 
     // Setup D-pad navigation
     this.setupDpadNavigation();
@@ -372,12 +423,18 @@ class VizoraAndroidTV {
   }
 
   private async startPairing() {
-    this.showScreen('pairing');
+    // Guarded: a credentialed device can never land on the pairing screen.
+    if (!this.machine.transition('pairing', 'pairing_requested')) {
+      return;
+    }
     this.stopPairingCountdown();
     this.updateStatus('connecting', 'Requesting pairing code...');
 
     if (!this.isOnline) {
-      this.showError('No network connection. Please check your network settings.');
+      // Stay on the pairing screen (deliberate branded surface) — no error screen.
+      this.updateStatus('offline', 'No network connection — retrying…');
+      const countdownEl = document.getElementById('pairing-countdown');
+      if (countdownEl) countdownEl.textContent = 'Waiting for network…';
       const delay = this.getPairingRetryDelay();
       this.pairingRetryCount = Math.min(this.pairingRetryCount + 1, 6);
       console.log(`[Vizora] Pairing retry in ${delay}ms (attempt ${this.pairingRetryCount})`);
@@ -449,7 +506,10 @@ class VizoraAndroidTV {
       this.updateStatus('connecting', 'Waiting for pairing...');
     } catch (error) {
       console.error('[Vizora] Pairing request failed:', error);
-      this.showError('Failed to request pairing code. Retrying...');
+      // Stay on the pairing screen — status line reports the retry.
+      this.updateStatus('offline', 'Pairing request failed — retrying…');
+      const countdownEl = document.getElementById('pairing-countdown');
+      if (countdownEl) countdownEl.textContent = 'Retrying…';
       const delay = this.getPairingRetryDelay();
       this.pairingRetryCount = Math.min(this.pairingRetryCount + 1, 6);
       console.log(`[Vizora] Pairing retry in ${delay}ms (attempt ${this.pairingRetryCount})`);
@@ -635,6 +695,12 @@ class VizoraAndroidTV {
           cpuUsage: 0, // not available in browser/WebView context
           memoryUsage,
         },
+        // Screen truth for the backend: which state owns the glass and where
+        // the playing content came from. currentContent is cleared whenever
+        // the machine leaves PLAYING, so a dark engine can no longer report
+        // stale "now playing" data (F13 partial; full enrichment is P1-1).
+        screenState: this.machine.state,
+        playbackSource: this.playbackSource,
         currentContent: this.currentContentId
           ? { contentId: this.currentContentId }
           : undefined,
@@ -663,10 +729,9 @@ class VizoraAndroidTV {
       console.log('[Vizora] Offline, will retry when network is available');
       this.updateStatus('offline', 'No network connection');
       // Start playback from restored playlist if available
-      if (this.currentPlaylist && this.currentPlaylist.items?.length > 0 && !this.playbackTimer) {
+      if (this.currentPlaylist && this.currentPlaylist.items?.length > 0) {
         console.log('[Vizora] Starting offline playback from restored playlist');
-        this.showScreen('content');
-        this.playContent();
+        this.ensurePlaying();
       }
       return;
     }
@@ -704,13 +769,16 @@ class VizoraAndroidTV {
         this.offlineTimeout = null;
       }
       this.hideOfflineOverlay();
-      this.showScreen('content');
       this.startHeartbeat();
 
-      // If we have a restored playlist from offline, start playback while waiting for server update
-      if (this.currentPlaylist && this.currentPlaylist.items?.length > 0 && !this.playbackTimer) {
-        console.log('[Vizora] Starting playback from restored playlist');
-        this.playContent();
+      if (this.currentPlaylist && this.currentPlaylist.items?.length > 0) {
+        // Restored/ongoing playlist — keep or start playing while waiting for
+        // a server update. The machine enters PLAYING when a frame commits.
+        this.ensurePlaying();
+      } else if (!this.temporaryContent) {
+        // Paired but nothing assigned: branded holding, never a bare black
+        // content screen (F11).
+        this.enterHolding('paired_no_playlist');
       }
     });
 
@@ -752,7 +820,13 @@ class VizoraAndroidTV {
 
     this.socket.on('playlist:update', (data) => {
       console.log('[Vizora] Received playlist update:', data);
-      this.updatePlaylist(data.playlist);
+      const playlist = this.validatePlaylist(data?.playlist);
+      if (!playlist) {
+        // A malformed push must be inert — current playback continues (F6).
+        console.warn('[Vizora] Ignoring malformed playlist:update payload');
+        return;
+      }
+      this.updatePlaylist(playlist);
     });
 
     this.socket.on('command', (command) => {
@@ -766,11 +840,35 @@ class VizoraAndroidTV {
     });
   }
 
-  // ==================== PLAYBACK ====================
+  // ==================== PLAYBACK ENGINE ====================
+  //
+  // Structure (docs/design/playback-state-machine.md):
+  //  - advance(): bounded scan for the next renderable item — recursion-free.
+  //  - prepare(): builds the item's DOM off-screen; the previous frame stays
+  //    visible for the whole cache/download/decode wait.
+  //  - commitItem(): the ONLY place content leaves the container — appends the
+  //    ready replacement first, then removes the old frame.
+  //  - completeItem(): duration/onended handler, schedules the next advance.
+  // A full scan with nothing renderable lands in branded HOLDING, never black.
+
+  /** Wait budget for readiness before committing optimistically. */
+  private static readonly READY_WAIT_MS: Record<string, number> = {
+    image: 1500,
+    video: 4000,
+  };
+
+  private validatePlaylist(raw: unknown): Playlist | null {
+    if (!raw || typeof raw !== 'object') return null;
+    const candidate = raw as Partial<Playlist>;
+    if (!Array.isArray(candidate.items)) return null;
+    return candidate as Playlist;
+  }
 
   private async updatePlaylist(playlist: Playlist) {
     this.currentPlaylist = playlist;
     this.currentIndex = 0;
+    this.playbackGeneration++; // invalidate any in-flight prepare
+    this.playbackSource = 'live';
 
     // Persist playlist for offline resilience
     try {
@@ -784,130 +882,246 @@ class VizoraAndroidTV {
       this.playbackTimer = null;
     }
 
-    const container = document.getElementById('content-container');
-    if (container) {
-      this.cleanupMediaElements(container);
-      container.innerHTML = '';
-    }
-
     if (playlist.items && playlist.items.length > 0) {
-      this.showScreen('content');
-      this.playContent();
+      // Old content stays on screen until the first new item commits (F9).
+      void this.advance();
       // Preload upcoming content
       this.preloadContent(playlist.items.slice(0, 5));
     } else {
-      console.log('[Vizora] Playlist is empty');
+      console.log('[Vizora] Playlist is empty — holding');
+      this.enterHolding('empty_playlist');
     }
   }
 
-  private async playContent() {
-    if (!this.currentPlaylist || !this.currentPlaylist.items) {
+  /** Kick the engine if it is parked (no timer pending, no advance running). */
+  private ensurePlaying() {
+    if (!this.playbackTimer && !this.advanceInFlight) {
+      void this.advance();
+    }
+  }
+
+  /**
+   * Find and commit the next renderable item. Scans at most items.length
+   * entries (F7: no recursion, no unbounded loop); exhaustion => HOLDING (F5).
+   */
+  private async advance(): Promise<void> {
+    if (this.advanceInFlight) {
+      this.pendingRestart = true;
       return;
     }
+    this.advanceInFlight = true;
+    try {
+      const gen = this.playbackGeneration;
+      const playlist = this.currentPlaylist;
+      const container = document.getElementById('content-container');
+      if (!playlist || !playlist.items || playlist.items.length === 0 || !container) {
+        this.enterHolding('no_playlist');
+        return;
+      }
+      const items = playlist.items;
 
-    const items = this.currentPlaylist.items;
-    if (items.length === 0) return;
+      for (let step = 0; step < items.length; step++) {
+        const idx = (this.currentIndex + step) % items.length;
+        const item = items[idx];
+        if (!item || !item.content) continue;
 
-    const currentItem = items[this.currentIndex];
-    const container = document.getElementById('content-container');
+        const prepared = await this.prepare(item, gen);
+        if (gen !== this.playbackGeneration) {
+          prepared?.cleanup();
+          return; // superseded by a newer playlist
+        }
+        if (!prepared) continue; // unrenderable — skip without touching the DOM
 
-    if (!container || !currentItem || !currentItem.content) {
-      this.nextContent();
-      return;
+        this.currentIndex = idx;
+        this.commitItem(container, item, prepared);
+        return;
+      }
+
+      console.warn('[Vizora] No renderable content in playlist — holding');
+      this.enterHolding('no_renderable_content');
+    } finally {
+      this.advanceInFlight = false;
+      if (this.pendingRestart) {
+        this.pendingRestart = false;
+        void this.advance();
+      }
+    }
+  }
+
+  /**
+   * Build an item's DOM detached from the screen and wait (bounded) for it to
+   * become renderable. Returns null to skip the item — the screen is never
+   * touched on the skip path.
+   */
+  private async prepare(
+    item: PlaylistItem,
+    gen: number,
+  ): Promise<{ el: HTMLElement; cleanup: () => void } | null> {
+    const content = item.content!;
+
+    if (content.type === 'layout') {
+      return this.prepareLayout(item);
     }
 
-    console.log(`[Vizora] Playing content ${this.currentIndex + 1}/${items.length}: ${currentItem.content.name}`);
+    try {
+      const contentDiv = document.createElement('div');
+      contentDiv.className = 'content-item';
+
+      const { ready } = await this.renderContentToDiv(content, contentDiv, {
+        useCache: true,
+        onVideoEnd: () => {
+          if (gen !== this.playbackGeneration) return;
+          if (this.playbackTimer) {
+            clearTimeout(this.playbackTimer);
+            this.playbackTimer = null;
+          }
+          this.completeItem(item);
+        },
+        onError: () => this.handleContentError(gen, content.id),
+      });
+
+      const waitMs = VizoraAndroidTV.READY_WAIT_MS[content.type] ?? 0;
+      const result = await Promise.race([ready, this.timeoutAfter(waitMs)]);
+
+      if (result === 'error') return null;
+      // 'ready' or 'timeout' — commit (timeout = optimistic commit; the asset
+      // may still paint, and post-commit errors advance via onError).
+      return {
+        el: contentDiv,
+        cleanup: () => this.cleanupMediaElements(contentDiv),
+      };
+    } catch (err) {
+      console.warn(`[Vizora] Failed to prepare content ${content.id}:`, err);
+      return null;
+    }
+  }
+
+  private timeoutAfter(ms: number): Promise<'timeout'> {
+    return new Promise(resolve => setTimeout(() => resolve('timeout'), ms));
+  }
+
+  /** Post-commit content failure (e.g. video stream dies mid-play): skip forward. */
+  private handleContentError(gen: number, contentId: string) {
+    if (gen !== this.playbackGeneration) return;
+    if (this.currentContentId !== contentId) return; // pre-commit error — prepare() handles it
+    console.warn(`[Vizora] Content ${contentId} failed after commit — advancing`);
+    if (this.playbackTimer) {
+      clearTimeout(this.playbackTimer);
+      this.playbackTimer = null;
+    }
+    this.completeItem(this.currentPlaylist?.items?.[this.currentIndex] ?? null);
+  }
+
+  /**
+   * The only mutation site for the content container: append the ready
+   * replacement, THEN remove the old frame (never-black by construction),
+   * then run the previous item's cleanup (zone timers, media release — F12).
+   */
+  private commitItem(
+    container: HTMLElement,
+    item: PlaylistItem,
+    prepared: { el: HTMLElement; cleanup: () => void },
+  ) {
+    const content = item.content!;
+    const items = this.currentPlaylist?.items ?? [];
+    console.log(`[Vizora] Playing content ${this.currentIndex + 1}/${items.length}: ${content.name}`);
+
+    const oldChildren = Array.from(container.children) as HTMLElement[];
+    container.appendChild(prepared.el);
+    for (const child of oldChildren) {
+      container.removeChild(child);
+    }
+    const oldCleanup = this.currentItemCleanup;
+    this.currentItemCleanup = prepared.cleanup;
+    oldCleanup?.();
+
+    this.machine.transition('playing', 'content_committed');
 
     // Track current content for heartbeat reporting
-    this.currentContentId = currentItem.content.id;
+    this.currentContentId = content.id;
     this.contentStartTime = Date.now();
 
     // Emit content impression for analytics
     if (this.socket?.connected) {
       this.socket.emit('content:impression', {
-        contentId: currentItem.content.id,
-        playlistId: this.currentPlaylist.id,
+        contentId: content.id,
+        playlistId: this.currentPlaylist?.id,
         timestamp: Date.now(),
       });
     }
 
-    this.cleanupMediaElements(container);
-    container.innerHTML = '';
+    // Schedule advancement. Every type gets a timer (F8 — layout included).
+    // Videos advance on `onended`; their timer is a stall watchdog sized so a
+    // correctly-declared duration never truncates playback.
+    const declaredSec = item.duration || content.duration || 10;
+    const advanceMs =
+      content.type === 'video'
+        ? Math.max(declaredSec * 4, 600) * 1000
+        : declaredSec * 1000;
 
-    const contentDiv = document.createElement('div');
-    contentDiv.className = 'content-item';
-
-    const contentType = currentItem.content.type;
-
-    // Layout is a special case — it manages its own container
-    if (contentType === 'layout') {
-      this.renderLayout(currentItem);
-      return;
-    }
-
-    await this.renderContentToDiv(currentItem.content, contentDiv, {
-      useCache: true,
-      onVideoEnd: () => this.nextContent(),
-      onError: (name) => {
-        this.showContentError(container, name);
-        setTimeout(() => this.nextContent(), 5000);
-      },
-    });
-
-    container.appendChild(contentDiv);
-
-    if (contentType !== 'video') {
-      const expectedDuration = (currentItem.duration || 10) * 1000;
-      this.playbackTimer = setTimeout(() => {
-        // Emit completion impression with duration data
-        if (this.socket?.connected && this.contentStartTime > 0) {
-          const actualDurationMs = Date.now() - this.contentStartTime;
-          const completionPercentage = Math.min(100, Math.round((actualDurationMs / expectedDuration) * 100));
-          this.socket.emit('content:impression', {
-            contentId: currentItem.content!.id,
-            playlistId: this.currentPlaylist?.id,
-            duration: Math.round(actualDurationMs / 1000),
-            completionPercentage,
-            timestamp: Date.now(),
-          });
-        }
-        this.nextContent();
-      }, expectedDuration);
-    }
+    if (this.playbackTimer) clearTimeout(this.playbackTimer);
+    this.playbackTimer = setTimeout(() => {
+      this.playbackTimer = null;
+      this.completeItem(item);
+    }, advanceMs);
   }
 
-  private nextContent() {
-    if (!this.currentPlaylist || !this.currentPlaylist.items) {
-      return;
-    }
+  /** Item finished (timer, video end, or post-commit error): emit completion, move on. */
+  private completeItem(item: PlaylistItem | null) {
+    const playlist = this.currentPlaylist;
 
-    // Log completion for video content
-    const currentItem = this.currentPlaylist.items[this.currentIndex];
-    if (currentItem?.content?.type === 'video' && this.contentStartTime > 0 && this.socket?.connected) {
+    if (item?.content && this.contentStartTime > 0 && this.socket?.connected) {
+      const expectedDuration =
+        (item.duration || item.content.duration || (item.content.type === 'video' ? 30 : 10)) * 1000;
       const actualDurationMs = Date.now() - this.contentStartTime;
-      const expectedDuration = (currentItem.duration || currentItem.content.duration || 30) * 1000;
       const completionPercentage = Math.min(100, Math.round((actualDurationMs / expectedDuration) * 100));
       this.socket.emit('content:impression', {
-        contentId: currentItem.content.id,
-        playlistId: this.currentPlaylist.id,
+        contentId: item.content.id,
+        playlistId: playlist?.id,
         duration: Math.round(actualDurationMs / 1000),
         completionPercentage,
         timestamp: Date.now(),
       });
     }
 
-    this.currentIndex++;
-
-    if (this.currentIndex >= this.currentPlaylist.items.length) {
-      if (this.currentPlaylist.loopPlaylist !== false) {
-        this.currentIndex = 0;
-      } else {
-        console.log('[Vizora] Playlist ended');
-        return;
-      }
+    if (!playlist || !playlist.items || playlist.items.length === 0) {
+      this.enterHolding('playlist_removed');
+      return;
     }
 
-    this.playContent();
+    if (this.currentIndex + 1 >= playlist.items.length && playlist.loopPlaylist === false) {
+      // Explicit park (F35): the last frame stays on screen by design.
+      console.log('[Vizora] Playlist ended — holding last frame (loopPlaylist=false)');
+      this.playbackSource = 'hold-last';
+      return;
+    }
+
+    this.currentIndex = (this.currentIndex + 1) % playlist.items.length;
+    void this.advance();
+  }
+
+  /**
+   * Branded fallback state — the never-black terminal. Self-heals: if a
+   * playlist exists, retry the scan periodically (assets may finish caching).
+   */
+  private enterHolding(reason: string) {
+    if (this.playbackTimer) {
+      clearTimeout(this.playbackTimer);
+      this.playbackTimer = null;
+    }
+    const cleanup = this.currentItemCleanup;
+    this.currentItemCleanup = null;
+    cleanup?.();
+    this.machine.transition('holding', reason);
+    this.setHoldingMessage('Waiting for content…');
+
+    if (this.holdingRetryTimer) clearTimeout(this.holdingRetryTimer);
+    if (this.currentPlaylist?.items?.length) {
+      this.holdingRetryTimer = setTimeout(() => {
+        this.holdingRetryTimer = null;
+        void this.advance();
+      }, 30000);
+    }
   }
 
   private async preloadContent(items: PlaylistItem[]) {
@@ -992,7 +1206,8 @@ class VizoraAndroidTV {
       };
     }
 
-    // Clear current playback timer
+    // Invalidate any in-flight prepare and clear the playback timer
+    this.playbackGeneration++;
     if (this.playbackTimer) {
       clearTimeout(this.playbackTimer);
       this.playbackTimer = null;
@@ -1020,11 +1235,35 @@ class VizoraAndroidTV {
     const container = document.getElementById('content-container');
     if (!container) return;
 
-    this.cleanupMediaElements(container);
-    while (container.firstChild) container.removeChild(container.firstChild);
-
+    // Build off-DOM; the current frame stays visible until the push is ready.
     const contentDiv = document.createElement('div');
     contentDiv.className = 'content-item';
+
+    const { ready } = await this.renderContentToDiv(content, contentDiv, {
+      useCache: true,
+      onVideoEnd: () => {
+        if (this.temporaryContent) this.resumePlaylist();
+      },
+    });
+
+    const waitMs = VizoraAndroidTV.READY_WAIT_MS[content.type] ?? 0;
+    const result = await Promise.race([ready, this.timeoutAfter(waitMs)]);
+    if (this.temporaryContent !== content) return; // superseded / cancelled
+    if (result === 'error') {
+      console.warn(`[Vizora] Pushed content failed to load: ${content.name} — resuming playlist`);
+      this.resumePlaylist();
+      return;
+    }
+
+    // Commit-swap: append new, then remove old (never-black).
+    const oldChildren = Array.from(container.children) as HTMLElement[];
+    container.appendChild(contentDiv);
+    for (const child of oldChildren) container.removeChild(child);
+    const oldCleanup = this.currentItemCleanup;
+    this.currentItemCleanup = () => this.cleanupMediaElements(contentDiv);
+    oldCleanup?.();
+
+    this.machine.transition('playing', 'content_pushed');
 
     // Track current content for heartbeat reporting
     this.currentContentId = content.id;
@@ -1036,25 +1275,6 @@ class VizoraAndroidTV {
         timestamp: Date.now(),
       });
     }
-
-    await this.renderContentToDiv(content, contentDiv, {
-      useCache: true,
-      onVideoEnd: () => {
-        if (this.temporaryContent) this.resumePlaylist();
-      },
-      onError: (name) => this.showContentError(container, name),
-    });
-
-    container.appendChild(contentDiv);
-    this.showScreen('content');
-  }
-
-  private showContentError(container: HTMLElement, contentName: string) {
-    while (container.firstChild) container.removeChild(container.firstChild);
-    const errorDiv = document.createElement('div');
-    errorDiv.style.cssText = 'display:flex;align-items:center;justify-content:center;width:100%;height:100%;background:#111;color:#888;font-family:sans-serif;font-size:24px;text-align:center;padding:40px;';
-    errorDiv.textContent = `Unable to load: ${contentName}`;
-    container.appendChild(errorDiv);
   }
 
   private resumePlaylist() {
@@ -1072,14 +1292,10 @@ class VizoraAndroidTV {
       this.currentPlaylist = this.savedPlaylistState.playlist;
       this.currentIndex = this.savedPlaylistState.index;
       this.savedPlaylistState = null;
-      this.playContent();
+      void this.advance();
     } else {
-      // No playlist was playing, just clear the screen
-      const container = document.getElementById('content-container');
-      if (container) {
-        this.cleanupMediaElements(container);
-        container.innerHTML = '';
-      }
+      // No playlist was playing — branded holding, never a cleared screen.
+      this.enterHolding('push_ended_no_playlist');
     }
   }
 
@@ -1139,16 +1355,19 @@ class VizoraAndroidTV {
 
   // ==================== MULTI-ZONE LAYOUT ====================
 
-  private renderLayout(content: PlaylistItem) {
-    const container = document.getElementById('content-container');
-    if (!container) return;
-
+  /**
+   * Build a layout item's grid off-DOM. Returns null when the metadata is
+   * invalid — the caller skips the item without touching the screen (F8).
+   * Zone timers are instance-local and torn down by the returned cleanup
+   * closure, which commitItem runs on every departure from the item (F12).
+   */
+  private prepareLayout(content: PlaylistItem): { el: HTMLElement; cleanup: () => void } | null {
     const raw = content as unknown as Record<string, unknown>;
     const contentRecord = content.content as unknown as Record<string, unknown> | null;
     const metadata = (raw.metadata || contentRecord?.metadata) as LayoutMetadata | undefined;
-    if (!metadata || !metadata.zones) return;
+    if (!metadata || !Array.isArray(metadata.zones)) return null;
 
-    this.cleanupLayout();
+    const zoneTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
     const grid = document.createElement('div');
     grid.className = 'layout-grid';
@@ -1165,7 +1384,7 @@ class VizoraAndroidTV {
       zoneDiv.style.gridArea = zone.gridArea;
 
       if (zone.resolvedPlaylist?.items && zone.resolvedPlaylist.items.length > 0) {
-        this.createZonePlayer(zone.id, zone.resolvedPlaylist, zoneDiv);
+        this.createZonePlayer(zone.id, zone.resolvedPlaylist, zoneDiv, zoneTimers);
       } else if (zone.resolvedContent) {
         this.renderZoneContent(zone.resolvedContent, zoneDiv);
       }
@@ -1173,19 +1392,25 @@ class VizoraAndroidTV {
       grid.appendChild(zoneDiv);
     }
 
-    this.cleanupMediaElements(container);
-    container.innerHTML = '';
-    container.appendChild(grid);
+    return {
+      el: grid,
+      cleanup: () => {
+        for (const [, timer] of zoneTimers) clearTimeout(timer);
+        zoneTimers.clear();
+        this.cleanupMediaElements(grid);
+      },
+    };
   }
 
-  private createZonePlayer(zoneId: string, playlist: Playlist, container: HTMLElement) {
-    this.zoneIndices.set(zoneId, 0);
+  private createZonePlayer(
+    zoneId: string,
+    playlist: Playlist,
+    container: HTMLElement,
+    zoneTimers: Map<string, ReturnType<typeof setTimeout>>,
+  ) {
+    let index = 0;
 
     const playZoneItem = () => {
-      // Guard: stop if zone was cleaned up during timer wait
-      if (!this.zoneIndices.has(zoneId)) return;
-
-      const index = this.zoneIndices.get(zoneId) || 0;
       const items = playlist.items;
       if (!items || items.length === 0) return;
       const item = items[index % items.length];
@@ -1194,10 +1419,10 @@ class VizoraAndroidTV {
       this.renderZoneContent(item.content, container);
       const duration = (item.duration || item.content.duration || 10) * 1000;
       const timer = setTimeout(() => {
-        this.zoneIndices.set(zoneId, (index + 1) % items.length);
+        index = (index + 1) % items.length;
         playZoneItem();
       }, duration);
-      this.zoneTimers.set(zoneId, timer);
+      zoneTimers.set(zoneId, timer);
     };
 
     playZoneItem();
@@ -1210,19 +1435,13 @@ class VizoraAndroidTV {
     contentDiv.className = 'content-item';
 
     // Zone content uses cache and plays video muted+looping
-    this.renderContentToDiv(content, contentDiv, {
+    void this.renderContentToDiv(content, contentDiv, {
       useCache: true,
       muteVideo: true,
       loopVideo: true,
     });
 
     container.appendChild(contentDiv);
-  }
-
-  private cleanupLayout() {
-    for (const [, timer] of this.zoneTimers) clearTimeout(timer);
-    this.zoneTimers.clear();
-    this.zoneIndices.clear();
   }
 
   // ==================== HTML CONTENT SECURITY ====================
@@ -1242,6 +1461,10 @@ class VizoraAndroidTV {
   /**
    * Renders a content element into a container. Used by playlist playback,
    * temporary push content, and multi-zone layout to avoid triplicated logic.
+   *
+   * Returns a `ready` promise the playback engine races against a deadline:
+   * 'ready' once the asset is renderable, 'error' if it failed. Types without
+   * reliable readiness signals (webpage/html/template) resolve immediately.
    */
   private async renderContentToDiv(
     content: { id: string; name: string; type: string; url: string; mimeType?: string },
@@ -1253,9 +1476,10 @@ class VizoraAndroidTV {
       muteVideo?: boolean;
       loopVideo?: boolean;
     },
-  ): Promise<void> {
+  ): Promise<{ ready: Promise<'ready' | 'error'> }> {
     const contentType = content.type;
     const useCache = options?.useCache ?? true;
+    let ready: Promise<'ready' | 'error'> = Promise.resolve('ready');
 
     // Transform URL (skip for HTML/template which contain raw markup)
     const contentUrl = (contentType === 'html' || contentType === 'template')
@@ -1291,14 +1515,27 @@ class VizoraAndroidTV {
     switch (contentType) {
       case 'image': {
         const img = document.createElement('img');
+        ready = new Promise(resolve => {
+          img.onload = () => resolve('ready');
+          img.onerror = () => {
+            handleError();
+            resolve('error');
+          };
+        });
         img.src = resolvedUrl;
         img.alt = content.name;
-        img.onerror = handleError;
         contentDiv.appendChild(img);
         break;
       }
       case 'video': {
         const video = document.createElement('video');
+        ready = new Promise(resolve => {
+          video.onloadeddata = () => resolve('ready');
+          video.onerror = () => {
+            handleError();
+            resolve('error');
+          };
+        });
         video.src = resolvedUrl;
         video.autoplay = true;
         video.muted = options?.muteVideo ?? false;
@@ -1306,7 +1543,6 @@ class VizoraAndroidTV {
         if (options?.loopVideo) video.loop = true;
         video.setAttribute('x5-video-player-type', 'h5');
         video.setAttribute('x5-video-player-fullscreen', 'true');
-        video.onerror = handleError;
         if (options?.onVideoEnd) video.onended = options.onVideoEnd;
         contentDiv.appendChild(video);
         break;
@@ -1338,7 +1574,10 @@ class VizoraAndroidTV {
       }
       default:
         console.warn('[Vizora] Unknown content type:', contentType);
+        ready = Promise.resolve('error');
     }
+
+    return { ready };
   }
 
   // ==================== MEDIA CLEANUP ====================
@@ -1353,23 +1592,15 @@ class VizoraAndroidTV {
   }
 
   // ==================== UI HELPERS ====================
+  //
+  // Screen visibility is owned exclusively by the ScreenStateMachine
+  // (src/screen-state.ts). There is deliberately no showScreen/showError
+  // helper here — an arbitrary code path must not be able to blank the
+  // display or surface a raw error while renderable content exists.
 
-  private showScreen(screen: 'loading' | 'pairing' | 'content' | 'error') {
-    const screens = ['loading-screen', 'pairing-screen', 'content-screen', 'error-screen'];
-    screens.forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) {
-        el.classList.toggle('hidden', id !== `${screen}-screen`);
-      }
-    });
-  }
-
-  private showError(message: string) {
-    const errorMessage = document.getElementById('error-message');
-    if (errorMessage) {
-      errorMessage.textContent = message;
-    }
-    this.showScreen('error');
+  private setHoldingMessage(message: string) {
+    const el = document.getElementById('holding-message');
+    if (el) el.textContent = message;
   }
 
   private showOfflineOverlay() {
