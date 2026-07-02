@@ -3046,6 +3046,32 @@ describe('VizoraAndroidTV', () => {
       expect(window.location.reload).toHaveBeenCalled();
     });
 
+    it('unpair carve-out REFUSES once the auth-check endpoint has ever responded (mechanical §7.1a gate)', async () => {
+      // Device previously observed a live auth-check endpoint (backend §6.4
+      // deployed) — a 404 now is an anomaly, not "legacy backend".
+      preferencesStore.set('auth_check_seen', '1');
+      await connectAndCommit(); // default handler: auth-check 404
+      triggerSocketEvent('command', { type: 'unpair' });
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(200);
+      // NEGATIVE: no purge, no reload — the carve-out is dead once outgrown
+      expect(secureStorageStore.has('device_token')).toBe(true);
+      expect(window.location.reload).not.toHaveBeenCalled();
+      expect(visibleScreens()).toEqual(['content-screen']);
+    });
+
+    it('a live auth-check response permanently arms the carve-out gate', async () => {
+      httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+        ? { status: 200, data: { status: 'ok' } }
+        : { status: 200, data: { data: { status: 'pending' } } };
+      await connectAndCommit();
+      // Trigger one probe via an auth-degraded signal
+      triggerSocketEvent('connect_error', { message: 'x', data: { code: 'AUTH_EXPIRED' } });
+      await vi.advanceTimersByTimeAsync(40_000);
+      expect((await authCheckCalls()).length).toBeGreaterThanOrEqual(1);
+      expect(preferencesStore.get('auth_check_seen')).toBe('1');
+    });
+
     it('confirmation probes are rate-limited: repeated revocation signals produce one auth-check', async () => {
       await connectAndCommit();
       triggerSocketEvent('device:revoked', { reason: 'a' });

@@ -153,8 +153,28 @@ screen, ever, while credentials exist (state-machine guard from P0-1 enforces th
 
    **7.1a Migration carve-out (the only §1.5 exception):** the `unpair` COMMAND (operator-
    initiated, authenticated socket) executes its purge when the confirmation probe returns
-   `404` (endpoint not yet deployed). Once the backend ships §6.4, a 404 can no longer occur
-   and the carve-out is dead code to be removed with the max-stale-age work.
+   `404` (endpoint not yet deployed).
+
+   **(a) Channel authentication of `unpair` (merge-gate answer):** the command is reachable
+   ONLY via the Socket.IO `command` event or the heartbeat-ack `commands` array — both exist
+   solely on the socket created in `connectToRealtime()` whose handshake carries the device
+   JWT (`auth.token`) and which the backend must accept before any event flows. Stale sockets
+   are stripped (`removeAllListeners` + `disconnect`) before a replacement is created, so
+   commands from superseded connections are not processed. Injection against a legacy backend
+   would require one of: a MITM (defeated — TLS validation is enforced, no cleartext in
+   release, empirically rejects untrusted certs), repointing `realtimeUrl` (only possible via
+   `update_config`, which itself arrives on the authenticated channel, or local device
+   access), or compromising the backend (out of device-side scope; the server must scope
+   command emission per device room — restated in §6.5 audit). Conclusion: honored on the
+   authenticated channel only, legacy or not.
+
+   **(b) Mechanical removal tracking (merge-gate answer):** the carve-out is self-disabling,
+   not comment-tracked. `runAuthCheck()` persists `auth_check_seen=1` the first time the
+   endpoint returns any live status (200/401/403/410 — i.e. backend item §6.4 is deployed);
+   the carve-out branch refuses to fire when that flag is set (a later 404 is an anomaly,
+   telemetry `legacy_carveout_refused`). The flag survives purge/re-pair by design. A
+   `TODO(remove with backend item §6.4 fleet-wide)` marks the branch for deletion once no
+   legacy backends remain. Regression tests cover both the refusal and the arming of the gate.
 2. **Backend second:** ship §6 items. Structured revocation becomes expressible end-to-end.
 3. **Policy last (ties to F22/P1-3):** define max-stale-age N days offline → HOLDING. Proposed
    default: N=7, configurable per tenant via the `config` push. Not implemented in P0-2; listed

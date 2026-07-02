@@ -934,6 +934,13 @@ class VizoraAndroidTV {
         connectTimeout: 10000,
         readTimeout: 10000,
       });
+      // Mechanical gate for the §7.1a carve-out: once this device has ever
+      // seen the auth-check endpoint respond (backend item §6.4 deployed),
+      // remember it — a later 404 can then only mean an anomaly, never
+      // "legacy backend", and the carve-out refuses to fire.
+      if (response.status === 200 || response.status === 401 || response.status === 403 || response.status === 410) {
+        Preferences.set({ key: 'auth_check_seen', value: '1' }).catch(() => {});
+      }
       return response.status;
     } catch (err) {
       console.warn('[Vizora] Auth check unreachable:', err);
@@ -968,8 +975,18 @@ class VizoraAndroidTV {
 
     // §7.1a migration carve-out: operator-initiated unpair on the
     // authenticated socket is honored against a legacy backend that has no
-    // auth-check endpoint (404). Dead code once the backend ships §6.4.
+    // auth-check endpoint (404). Self-disabling: once `auth_check_seen` is
+    // set (the endpoint responded at least once — backend §6.4 is live), a
+    // 404 is an anomaly and the carve-out refuses.
+    // TODO(remove with backend item §6.4 fleet-wide): delete this branch and
+    // the `auth_check_seen` flag once no legacy backends remain.
     if (status === 404 && source === 'unpair_command') {
+      const seen = await Preferences.get({ key: 'auth_check_seen' }).catch(() => ({ value: null }));
+      if (seen.value === '1') {
+        console.warn('[Vizora] unpair carve-out REFUSED — auth-check endpoint was previously available');
+        reportEvent('legacy_carveout_refused', { source });
+        return;
+      }
       await this.purgeDeviceState('unpair_legacy_backend');
       window.location.reload();
       return;
