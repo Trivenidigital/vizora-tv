@@ -96,3 +96,16 @@ Live-safety: staging backend, test devices only, no Play uploads, no production 
 2. Confirm access to the two physical test devices, or authorize purchasing them — §5 cannot run
    on emulators (the March report's failure to catch F1/F2 is exactly emulator blindness).
 3. Confirm SAW justification text can be added to the Play listing/data-safety narrative.
+
+---
+
+## 7. DECISION RECORD (operator, 2026-07-02)
+
+Posture **B approved conditionally**: proceed to hardware verification on both
+devices (Onn 4K Pro certified Google TV + one generic AOSP box). If the
+"Display over other apps" grant flow is unavailable on the certified device,
+**launcher mode (C) becomes the primary posture without further approval**.
+Acceptance tests for the implementation slice: **P-08 (reboot E2E) and a
+re-run of S-19 (crash restart) on physical hardware**, plus **native crash
+capture** (e.g. @sentry/capacitor) which is now part of this slice's
+acceptance criteria — not deferred.

@@ -100,6 +100,7 @@ interface LayoutZone {
 
 interface HeartbeatResponse {
   commands?: Array<{ type: string; payload?: Record<string, unknown>; [key: string]: unknown }>;
+  revoked?: boolean;
 }
 
 interface PerformanceMemory {
@@ -141,6 +142,14 @@ class VizoraAndroidTV {
   private playbackSource: 'live' | 'cached' | 'hold-last' = 'cached';
   private initRetryCount = 0;
   private capacitorSetupDone = false;
+
+  // Trust / revocation state (P0-2 — docs/design/revocation-contract.md)
+  private tenantId: string | null = null;
+  private tenantSuspended = false;
+  private authProbeTimer: ReturnType<typeof setTimeout> | null = null;
+  private authProbeRetry = 0;
+  private lastConfirmProbeAt = 0;
+  private authDegradedSince = 0;
 
   // Temporary content push state
   private temporaryContent: PushContent | null = null;
@@ -211,13 +220,30 @@ class VizoraAndroidTV {
     if (this.deviceToken && this.deviceId) {
       console.log('[Vizora] Found existing device credentials, connecting...');
 
-      // Restore last playlist for offline resilience
+      const storedTenant = await SecureStorage.get({ key: 'tenant_id' });
+      this.tenantId = storedTenant.value;
+      this.cacheManager.setExpectedTenant(this.tenantId);
+
+      // Restore last playlist for offline resilience — tenant-bound (F4):
+      // refuse to render a playlist issued under a different tenant, no
+      // matter how it got here (re-pair, restored backup, cloned image).
       try {
         const lastPlaylist = await Preferences.get({ key: 'last_playlist' });
         if (lastPlaylist.value) {
-          this.currentPlaylist = JSON.parse(lastPlaylist.value);
-          this.playbackSource = 'cached';
-          console.log('[Vizora] Restored last playlist from storage');
+          const parsed = JSON.parse(lastPlaylist.value);
+          const envelope = parsed && typeof parsed === 'object' && 'playlist' in parsed
+            ? (parsed as { tenantId?: string; playlist: unknown })
+            : { tenantId: undefined, playlist: parsed }; // pre-envelope format: migration grace (§2)
+          if (envelope.tenantId && this.tenantId && envelope.tenantId !== this.tenantId) {
+            console.warn('[Vizora] Cached playlist belongs to a different tenant — purging (F4)');
+            reportEvent('tenant_mismatch_purge', { cachedTenant: envelope.tenantId });
+            await Preferences.remove({ key: 'last_playlist' });
+            await this.cacheManager.clearCache();
+          } else {
+            this.currentPlaylist = this.validatePlaylist(envelope.playlist);
+            this.playbackSource = 'cached';
+            console.log('[Vizora] Restored last playlist from storage');
+          }
         }
       } catch (err) {
         console.warn('[Vizora] Failed to restore last playlist:', err);
@@ -643,6 +669,14 @@ class VizoraAndroidTV {
           // Store credentials in encrypted storage
           await SecureStorage.set({ key: 'device_token', value: data.deviceToken });
           await SecureStorage.set({ key: 'device_id', value: this.deviceId || '' });
+          // Tenant identity binds the cache/playlist (contract §2). Absent on
+          // the legacy backend — the load-time check degrades to grace mode.
+          if (typeof data.tenantId === 'string' && data.tenantId) {
+            this.tenantId = data.tenantId;
+            await SecureStorage.set({ key: 'tenant_id', value: data.tenantId });
+          }
+          this.cacheManager.setExpectedTenant(this.tenantId);
+          setCrashReportingDevice(this.deviceId);
 
           this.connectToRealtime();
         }
@@ -718,6 +752,9 @@ class VizoraAndroidTV {
       };
 
       this.socket.emit('heartbeat', heartbeatData, (response: HeartbeatResponse) => {
+        if (response && response.revoked) {
+          void this.confirmRevocation('heartbeat_ack');
+        }
         if (response && response.commands) {
           response.commands.forEach((cmd) => this.handleCommand(cmd));
         }
@@ -780,6 +817,7 @@ class VizoraAndroidTV {
         this.offlineTimeout = null;
       }
       this.hideOfflineOverlay();
+      this.exitAuthDegraded();
       this.startHeartbeat();
 
       if (this.currentPlaylist && this.currentPlaylist.items?.length > 0) {
@@ -808,17 +846,45 @@ class VizoraAndroidTV {
       }, 60_000);
     });
 
-    this.socket.on('connect_error', async (error) => {
+    this.socket.on('connect_error', (error) => {
       console.error('[Vizora] Connection error:', error);
       this.updateStatus('offline', 'Connection failed');
 
-      if (error.message.includes('unauthorized') || error.message.includes('invalid token')) {
-        console.log('[Vizora] Token invalid, clearing credentials...');
-        await SecureStorage.remove({ key: 'device_token' });
-        await SecureStorage.remove({ key: 'device_id' });
-        this.deviceToken = null;
-        this.deviceId = null;
-        setTimeout(() => this.startPairing(), 2000);
+      const code = (error as { data?: { code?: string } }).data?.code;
+
+      if (code === 'DEVICE_REVOKED') {
+        void this.confirmRevocation('connect_error');
+        return;
+      }
+      if (code === 'TENANT_SUSPENDED') {
+        this.enterTenantSuspended('connect_error');
+        return;
+      }
+      // AUTH_EXPIRED / AUTH_INVALID / unknown codes / legacy message strings:
+      // transport-layer by default (contract §1.5a). Credentials untouched,
+      // the cached loop keeps playing (F3 fix), and the REST probe
+      // disambiguates in the background.
+      if (code) reportEvent('auth_degraded_signal', { code });
+      this.scheduleAuthProbe();
+    });
+
+    this.socket.on('device:revoked', (payload) => {
+      console.warn('[Vizora] device:revoked received:', payload);
+      void this.confirmRevocation('device_revoked_event');
+    });
+
+    this.socket.on('tenant:suspended', () => {
+      this.enterTenantSuspended('tenant_suspended_event');
+    });
+
+    this.socket.on('tenant:resumed', () => {
+      console.log('[Vizora] Tenant resumed');
+      reportEvent('tenant_resumed', {});
+      this.tenantSuspended = false;
+      if (this.currentPlaylist?.items?.length) {
+        void this.advance();
+      } else {
+        this.enterHolding('paired_no_playlist');
       }
     });
 
@@ -851,6 +917,213 @@ class VizoraAndroidTV {
     });
   }
 
+  // ==================== TRUST / REVOCATION (P0-2) ====================
+  //
+  // Contract: docs/design/revocation-contract.md. The invariants enforced
+  // here: no credential wipe without a 410 confirmation from auth-check
+  // (§1.5/§3.4); anything unclassified is transport-layer (§1.5a); tenant
+  // binding is verified at load time (§1.4/§2).
+
+  /** GET /devices/auth/check — returns HTTP status, or null if unreachable. */
+  private async runAuthCheck(): Promise<number | null> {
+    if (!this.deviceToken) return null;
+    try {
+      const response: HttpResponse = await CapacitorHttp.get({
+        url: `${this.config.apiUrl}/api/v1/devices/auth/check`,
+        headers: { Authorization: `Bearer ${this.deviceToken}` },
+        connectTimeout: 10000,
+        readTimeout: 10000,
+      });
+      // Mechanical gate for the §7.1a carve-out: once this device has ever
+      // seen the auth-check endpoint respond (backend item §6.4 deployed),
+      // remember it — a later 404 can then only mean an anomaly, never
+      // "legacy backend", and the carve-out refuses to fire.
+      if (response.status === 200 || response.status === 401 || response.status === 403 || response.status === 410) {
+        Preferences.set({ key: 'auth_check_seen', value: '1' }).catch(() => {});
+      }
+      return response.status;
+    } catch (err) {
+      console.warn('[Vizora] Auth check unreachable:', err);
+      return null;
+    }
+  }
+
+  /**
+   * Confirm-then-purge (§3.4). Every revocation signal funnels through here;
+   * only a 410 destroys device state. Rate-limited to one confirmation probe
+   * per 5 minutes regardless of signal volume (§3.3).
+   */
+  private async confirmRevocation(source: string): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastConfirmProbeAt < 5 * 60_000) {
+      console.warn(`[Vizora] Revocation signal (${source}) dropped — confirmation rate limit`);
+      return;
+    }
+    this.lastConfirmProbeAt = now;
+
+    const status = await this.runAuthCheck();
+
+    if (status === 410) {
+      await this.purgeDeviceState(`revocation_confirmed:${source}`);
+      if (source === 'unpair_command') {
+        window.location.reload();
+      } else {
+        this.startPairing();
+      }
+      return;
+    }
+
+    // §7.1a migration carve-out: operator-initiated unpair on the
+    // authenticated socket is honored against a legacy backend that has no
+    // auth-check endpoint (404). Self-disabling: once `auth_check_seen` is
+    // set (the endpoint responded at least once — backend §6.4 is live), a
+    // 404 is an anomaly and the carve-out refuses.
+    // TODO(remove with backend item §6.4 fleet-wide): delete this branch and
+    // the `auth_check_seen` flag once no legacy backends remain.
+    if (status === 404 && source === 'unpair_command') {
+      const seen = await Preferences.get({ key: 'auth_check_seen' }).catch(() => ({ value: null }));
+      if (seen.value === '1') {
+        console.warn('[Vizora] unpair carve-out REFUSED — auth-check endpoint was previously available');
+        reportEvent('legacy_carveout_refused', { source });
+        return;
+      }
+      await this.purgeDeviceState('unpair_legacy_backend');
+      window.location.reload();
+      return;
+    }
+
+    console.warn(`[Vizora] Revocation signal (${source}) NOT confirmed (auth-check=${status}) — keeping state`);
+    reportEvent('revocation_unconfirmed', { source, authCheckStatus: status });
+  }
+
+  /**
+   * Background disambiguation loop for auth-degraded mode (§5): backoff
+   * 30s -> 15min with ±25% jitter. Playback continues from cache throughout.
+   */
+  private scheduleAuthProbe() {
+    if (this.authProbeTimer || !this.deviceToken) return;
+    if (!this.authDegradedSince) {
+      this.authDegradedSince = Date.now();
+      reportEvent('auth_degraded_enter', {});
+    }
+    const base = Math.min(30_000 * Math.pow(2, this.authProbeRetry), 900_000);
+    const jitter = base * 0.25 * (Math.random() * 2 - 1);
+    const delay = Math.round(base + jitter);
+    this.authProbeRetry = Math.min(this.authProbeRetry + 1, 5);
+    console.log(`[Vizora] Auth probe scheduled in ${delay}ms`);
+
+    this.authProbeTimer = setTimeout(async () => {
+      this.authProbeTimer = null;
+      const status = await this.runAuthCheck();
+
+      if (status === 200) {
+        this.exitAuthDegraded();
+        if (!this.socket?.connected) this.connectToRealtime();
+        return;
+      }
+      if (status === 410) {
+        await this.purgeDeviceState('auth_check_revoked');
+        this.startPairing();
+        return;
+      }
+      if (status === 403) {
+        this.enterTenantSuspended('auth_check');
+      }
+      if (status === 404) {
+        // Legacy backend — the endpoint teaches us nothing; stop probing and
+        // let the socket reconnection loop carry recovery.
+        console.log('[Vizora] Auth-check endpoint absent (legacy backend) — probe loop stopped');
+        return;
+      }
+
+      // 24h continuously degraded: unobtrusive badge, cached loop continues (§5)
+      if (this.authDegradedSince && Date.now() - this.authDegradedSince > 24 * 3600_000) {
+        this.showAuthDegradedBadge();
+      }
+      this.scheduleAuthProbe();
+    }, delay);
+  }
+
+  private exitAuthDegraded() {
+    if (this.authProbeTimer) {
+      clearTimeout(this.authProbeTimer);
+      this.authProbeTimer = null;
+    }
+    this.authProbeRetry = 0;
+    if (this.authDegradedSince) {
+      reportEvent('auth_degraded_exit', {
+        degradedForSeconds: Math.round((Date.now() - this.authDegradedSince) / 1000),
+      });
+      this.authDegradedSince = 0;
+    }
+    this.hideAuthDegradedBadge();
+  }
+
+  /** Tenant suspension: fail closed for rendering, keep credentials (§3.1). */
+  private enterTenantSuspended(source: string) {
+    console.warn('[Vizora] Tenant suspended:', source);
+    reportEvent('tenant_suspended', { source });
+    this.tenantSuspended = true;
+    this.enterHolding('tenant_suspended');
+    this.setHoldingMessage('Display paused — contact your administrator');
+  }
+
+  /**
+   * Destroy all tenant-bound device state. Only reachable via a confirmed
+   * revocation (§3.4) or the legacy unpair carve-out (§7.1a).
+   */
+  private async purgeDeviceState(reason: string) {
+    console.warn('[Vizora] Purging device state:', reason);
+    reportEvent('device_purged', { reason });
+
+    // Halt playback first: no further frame of this tenant's content renders.
+    this.playbackGeneration++;
+    if (this.playbackTimer) {
+      clearTimeout(this.playbackTimer);
+      this.playbackTimer = null;
+    }
+    if (this.temporaryContentTimer) {
+      clearTimeout(this.temporaryContentTimer);
+      this.temporaryContentTimer = null;
+    }
+    this.exitAuthDegraded();
+    this.tenantSuspended = false;
+    this.currentPlaylist = null;
+    this.savedPlaylistState = null;
+    this.temporaryContent = null;
+    this.deviceToken = null;
+    this.deviceId = null;
+    this.tenantId = null;
+    setCrashReportingDevice(null);
+
+    if (this.socket) {
+      this.stopHeartbeat();
+      this.socket.removeAllListeners();
+      this.socket.disconnect();
+      this.socket = null;
+    }
+
+    await SecureStorage.remove({ key: 'device_token' });
+    await SecureStorage.remove({ key: 'device_id' });
+    await SecureStorage.remove({ key: 'tenant_id' });
+    await Preferences.remove({ key: 'last_playlist' });
+    await this.cacheManager.clearCache();
+  }
+
+  private showAuthDegradedBadge() {
+    if (document.getElementById('auth-degraded-badge')) return;
+    const badge = document.createElement('div');
+    badge.id = 'auth-degraded-badge';
+    badge.style.cssText = 'position:fixed;bottom:16px;left:16px;background:rgba(0,0,0,0.7);color:#ccc;padding:8px 14px;border-radius:8px;font-size:14px;z-index:9999;';
+    badge.textContent = 'Check display registration — see dashboard';
+    document.body.appendChild(badge);
+  }
+
+  private hideAuthDegradedBadge() {
+    const badge = document.getElementById('auth-degraded-badge');
+    if (badge) badge.remove();
+  }
+
   // ==================== PLAYBACK ENGINE ====================
   //
   // Structure (docs/design/playback-state-machine.md):
@@ -881,9 +1154,18 @@ class VizoraAndroidTV {
     this.playbackGeneration++; // invalidate any in-flight prepare
     this.playbackSource = 'live';
 
-    // Persist playlist for offline resilience
+    // Persist playlist for offline resilience, tenant-bound (contract §2):
+    // the envelope's tenantId is verified at load time before any render.
     try {
-      await Preferences.set({ key: 'last_playlist', value: JSON.stringify(playlist) });
+      await Preferences.set({
+        key: 'last_playlist',
+        value: JSON.stringify({
+          tenantId: this.tenantId ?? undefined,
+          deviceId: this.deviceId ?? undefined,
+          savedAt: Date.now(),
+          playlist,
+        }),
+      });
     } catch (err) {
       console.warn('[Vizora] Failed to persist playlist:', err);
     }
@@ -922,6 +1204,12 @@ class VizoraAndroidTV {
     }
     this.advanceInFlight = true;
     try {
+      // Fail closed while the tenant is suspended: no rendering, branded
+      // holding until an explicit resume signal (contract §3.1/§4).
+      if (this.tenantSuspended) {
+        this.machine.transition('holding', 'tenant_suspended');
+        return;
+      }
       const gen = this.playbackGeneration;
       const playlist = this.currentPlaylist;
       const container = document.getElementById('content-container');
@@ -1168,9 +1456,9 @@ class VizoraAndroidTV {
         break;
 
       case 'unpair':
-        await SecureStorage.remove({ key: 'device_token' });
-        await SecureStorage.remove({ key: 'device_id' });
-        window.location.reload();
+        // Confirm-then-purge (contract §3.4); the legacy-backend carve-out
+        // (§7.1a) lives inside confirmRevocation.
+        await this.confirmRevocation('unpair_command');
         break;
 
       case 'update_config':

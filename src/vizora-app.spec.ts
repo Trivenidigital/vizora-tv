@@ -224,10 +224,13 @@ function resetCapacitorFakes() {
       data: { code: 'ABCD1234', deviceId: 'dev-123', expiresInSeconds: 300 },
     },
   });
-  httpGetHandler = () => ({
-    status: 200,
-    data: { data: { status: 'pending' } },
-  });
+  httpGetHandler = (opts: { url: string }) => {
+    // auth-check endpoint absent by default (legacy backend, contract §7.1a)
+    if (opts.url.includes('/devices/auth/check')) {
+      return { status: 404, data: {} };
+    }
+    return { status: 200, data: { data: { status: 'pending' } } };
+  };
 }
 
 vi.mock('@capacitor/preferences', () => ({
@@ -310,6 +313,7 @@ const mockCacheManager = {
   clearCache: vi.fn(async () => {}),
   getCacheStats: vi.fn(() => ({ itemCount: 0, totalSizeMB: 0, maxSizeMB: 500 })),
   init: vi.fn(async () => {}),
+  setExpectedTenant: vi.fn(),
 };
 
 vi.mock('./cache-manager', () => ({
@@ -1073,16 +1077,23 @@ describe('VizoraAndroidTV', () => {
         for (let i = 0; i < 30; i++) await Promise.resolve();
       }
       expect(secureStorageStore.has('device_token')).toBe(true);
-      // Let countdown ticks that were already enqueued by the async timer
-      // advance land before taking the baseline (fake-timer artifact: a tick
-      // scheduled before clearInterval still fires).
-      await vi.advanceTimersByTimeAsync(1100);
-      for (let i = 0; i < 30; i++) await Promise.resolve();
-      // After pairing succeeds, countdown text should be frozen
-      const text1 = domElements.get('pairing-countdown')?.textContent || '';
+      // Absorb countdown ticks already enqueued by the async timer engine (a
+      // tick scheduled before clearInterval still fires under fake timers):
+      // settle until the text is stable across a 1s advance...
+      let prev = domElements.get('pairing-countdown')?.textContent || '';
+      let stable = false;
+      for (let i = 0; i < 5 && !stable; i++) {
+        await vi.advanceTimersByTimeAsync(1000);
+        const cur = domElements.get('pairing-countdown')?.textContent || '';
+        stable = cur === prev;
+        prev = cur;
+      }
+      // ...a genuinely running countdown changes every second and never stabilizes
+      expect(stable).toBe(true);
+      // ...and must then stay frozen over 2 more seconds
+      const text1 = prev;
       await vi.advanceTimersByTimeAsync(2000);
       const text2 = domElements.get('pairing-countdown')?.textContent || '';
-      // If countdown stopped, text won't change over 2 more seconds
       expect(text1).toBe(text2);
     });
   });
@@ -1160,16 +1171,18 @@ describe('VizoraAndroidTV', () => {
       expect(bodyChildren.find(c => c.id === 'offline-overlay')).toBeDefined();
     });
 
-    it('clears credentials and restarts pairing on unauthorized error', async () => {
+    it('does NOT clear credentials on unauthorized connect_error (F3 fix, contract §1.5a)', async () => {
       const { SecureStorage } = await import('./secure-storage');
       await importFresh();
       triggerSocketEvent('connect_error', { message: 'unauthorized' });
       await vi.advanceTimersByTimeAsync(100);
-      expect(SecureStorage.remove).toHaveBeenCalledWith({ key: 'device_token' });
+      // NEGATIVE: legacy string errors are transport-layer — no wipe, ever
+      expect(SecureStorage.remove).not.toHaveBeenCalledWith({ key: 'device_token' });
+      expect(secureStorageStore.has('device_token')).toBe(true);
       await vi.advanceTimersByTimeAsync(2100);
       const { CapacitorHttp } = await import('@capacitor/core');
-      // Should have called POST for pairing
-      expect((CapacitorHttp.post as Mock).mock.calls.length).toBeGreaterThan(0);
+      // NEGATIVE: no pairing request was made — the device is still paired
+      expect((CapacitorHttp.post as Mock).mock.calls.length).toBe(0);
     });
 
     it('disconnects existing socket before creating new connection', async () => {
@@ -1394,7 +1407,10 @@ describe('VizoraAndroidTV', () => {
       triggerSocketEvent('connect');
       triggerSocketEvent('playlist:update', { playlist: mkPlaylist([{ id: 'c1', type: 'image', url: '/i.jpg' }]) });
       await vi.advanceTimersByTimeAsync(50);
-      expect(JSON.parse(preferencesStore.get('last_playlist')!).id).toBe('pl-1');
+      // Persisted as a tenant-bound envelope (contract §2)
+      const envelope = JSON.parse(preferencesStore.get('last_playlist')!);
+      expect(envelope.playlist.id).toBe('pl-1');
+      expect(envelope).toHaveProperty('savedAt');
     });
 
     it('renders current item based on content type', async () => {
@@ -2899,6 +2915,232 @@ describe('VizoraAndroidTV', () => {
       // NEGATIVE: no stale "now playing" claim while the screen is on holding
       expect(payload.currentContent).toBeUndefined();
       expect(payload.screenState).toBe('holding');
+    });
+  });
+
+  // ==================== 23. REVOCATION & TENANT TRUST (P0-2 negative suite) ====================
+  //
+  // Contract: docs/design/revocation-contract.md §8. Playback fails open on
+  // transport errors; credential destruction requires a confirmed (410)
+  // revocation; tenant binding is verified at load time.
+
+  describe('Revocation & Tenant Trust', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      resetCapacitorFakes();
+      resetDOM();
+      (window.location as { search: string }).search = '';
+      (window.location.reload as Mock).mockClear();
+      ioFactory.mockClear();
+      currentMockSocket = createMockSocket();
+      ioFactory.mockReturnValue(currentMockSocket);
+      mockCacheManager.getCachedUri.mockReset().mockResolvedValue(null);
+      mockCacheManager.downloadContent.mockReset().mockResolvedValue(null);
+      mockCacheManager.clearCache.mockClear();
+      qrToCanvasMock.mockReset().mockResolvedValue(undefined);
+      secureStorageStore.set('device_token', 'tok-123');
+      secureStorageStore.set('device_id', 'dev-123');
+      vi.spyOn(console, 'log').mockImplementation(() => {});
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    const visibleScreens = () =>
+      ['loading-screen', 'pairing-screen', 'content-screen', 'holding-screen', 'error-screen']
+        .filter(id => {
+          const el = domElements.get(id);
+          return el && !el._classListSet.has('hidden');
+        });
+
+    const playlistPayload = {
+      playlist: { id: 'pl', name: 'PL', items: [{ id: 'it-1', contentId: 'c1', duration: 10, order: 0,
+        content: { id: 'c1', name: 'C', type: 'image', url: '/c1.jpg' } }], loopPlaylist: true },
+    };
+
+    const connectAndCommit = async () => {
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+      triggerSocketEvent('playlist:update', playlistPayload);
+      await vi.advanceTimersByTimeAsync(1600);
+      expect(visibleScreens()).toEqual(['content-screen']);
+    };
+
+    const authCheckCalls = async () => {
+      const { CapacitorHttp } = await import('@capacitor/core');
+      return (CapacitorHttp.get as Mock).mock.calls.filter(
+        (c: unknown[]) => String((c[0] as { url: string }).url).includes('/devices/auth/check'),
+      );
+    };
+
+    it('AUTH_INVALID connect_error: credentials intact, playback continues, background probe runs', async () => {
+      await connectAndCommit();
+      triggerSocketEvent('connect_error', { message: 'jwt malformed', data: { code: 'AUTH_INVALID' } });
+      await vi.advanceTimersByTimeAsync(100);
+      // NEGATIVE: no wipe, no pairing screen — the F3 fleet-de-pair bomb is defused
+      expect(secureStorageStore.has('device_token')).toBe(true);
+      expect(visibleScreens()).toEqual(['content-screen']);
+      // Probe fires within backoff window (30s ±25%)
+      await vi.advanceTimersByTimeAsync(40_000);
+      expect((await authCheckCalls()).length).toBeGreaterThanOrEqual(1);
+      // Legacy 404 answer → probing stops, still no wipe
+      expect(secureStorageStore.has('device_token')).toBe(true);
+    });
+
+    it('device:revoked + auth-check 410: full purge, pairing shown, no further content renders', async () => {
+      httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+        ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
+        : { status: 200, data: { data: { status: 'pending' } } };
+      await connectAndCommit();
+      const container = domElements.get('content-container')!;
+      const appendsBefore = (container.appendChild as Mock).mock.calls.length;
+
+      triggerSocketEvent('device:revoked', { reason: 'operator' });
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(200);
+
+      expect(secureStorageStore.has('device_token')).toBe(false);
+      expect(secureStorageStore.has('device_id')).toBe(false);
+      expect(preferencesStore.has('last_playlist')).toBe(false);
+      expect(mockCacheManager.clearCache).toHaveBeenCalled();
+      expect(visibleScreens()).toEqual(['pairing-screen']);
+      // NEGATIVE: not one further frame of tenant content after the purge
+      await vi.advanceTimersByTimeAsync(35_000);
+      expect((container.appendChild as Mock).mock.calls.length).toBe(appendsBefore);
+    });
+
+    it('device:revoked + auth-check 200: unconfirmed signal — NO wipe', async () => {
+      httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+        ? { status: 200, data: { status: 'ok' } }
+        : { status: 200, data: { data: { status: 'pending' } } };
+      await connectAndCommit();
+      triggerSocketEvent('device:revoked', { reason: 'spoof?' });
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(secureStorageStore.has('device_token')).toBe(true);
+      expect(visibleScreens()).toEqual(['content-screen']);
+    });
+
+    it('device:revoked + auth-check 404 (legacy backend): NO wipe — carve-out is unpair-only', async () => {
+      await connectAndCommit(); // default handler: auth-check 404
+      triggerSocketEvent('device:revoked', { reason: 'x' });
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(secureStorageStore.has('device_token')).toBe(true);
+      expect(visibleScreens()).toEqual(['content-screen']);
+    });
+
+    it('unpair command + auth-check 404: legacy carve-out purges and reloads (old-backend unpair still works)', async () => {
+      await connectAndCommit();
+      triggerSocketEvent('command', { type: 'unpair' });
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(secureStorageStore.has('device_token')).toBe(false);
+      expect(preferencesStore.has('last_playlist')).toBe(false);
+      expect(mockCacheManager.clearCache).toHaveBeenCalled();
+      expect(window.location.reload).toHaveBeenCalled();
+    });
+
+    it('unpair carve-out REFUSES once the auth-check endpoint has ever responded (mechanical §7.1a gate)', async () => {
+      // Device previously observed a live auth-check endpoint (backend §6.4
+      // deployed) — a 404 now is an anomaly, not "legacy backend".
+      preferencesStore.set('auth_check_seen', '1');
+      await connectAndCommit(); // default handler: auth-check 404
+      triggerSocketEvent('command', { type: 'unpair' });
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(200);
+      // NEGATIVE: no purge, no reload — the carve-out is dead once outgrown
+      expect(secureStorageStore.has('device_token')).toBe(true);
+      expect(window.location.reload).not.toHaveBeenCalled();
+      expect(visibleScreens()).toEqual(['content-screen']);
+    });
+
+    it('a live auth-check response permanently arms the carve-out gate', async () => {
+      httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+        ? { status: 200, data: { status: 'ok' } }
+        : { status: 200, data: { data: { status: 'pending' } } };
+      await connectAndCommit();
+      // Trigger one probe via an auth-degraded signal
+      triggerSocketEvent('connect_error', { message: 'x', data: { code: 'AUTH_EXPIRED' } });
+      await vi.advanceTimersByTimeAsync(40_000);
+      expect((await authCheckCalls()).length).toBeGreaterThanOrEqual(1);
+      expect(preferencesStore.get('auth_check_seen')).toBe('1');
+    });
+
+    it('confirmation probes are rate-limited: repeated revocation signals produce one auth-check', async () => {
+      await connectAndCommit();
+      triggerSocketEvent('device:revoked', { reason: 'a' });
+      triggerSocketEvent('device:revoked', { reason: 'b' });
+      await vi.advanceTimersByTimeAsync(60_000);
+      triggerSocketEvent('device:revoked', { reason: 'c' });
+      await vi.advanceTimersByTimeAsync(200);
+      expect((await authCheckCalls()).length).toBe(1);
+    });
+
+    it('boot with a different tenant\'s cached playlist refuses to render it and purges (F4)', async () => {
+      secureStorageStore.set('tenant_id', 'tenant-B');
+      preferencesStore.set('last_playlist', JSON.stringify({
+        tenantId: 'tenant-A', deviceId: 'dev-old', savedAt: 1,
+        playlist: { id: 'pl-A', name: 'A', items: [{ id: 'i1', contentId: 'cA', duration: 10, order: 0,
+          content: { id: 'cA', name: 'TenantA', type: 'image', url: '/tenant-a.jpg' } }], loopPlaylist: true },
+      }));
+      await importFresh();
+      await vi.advanceTimersByTimeAsync(2000);
+      // NEGATIVE: tenant-A content never rendered
+      expect(findCreatedElements('img').some(i => i.src.includes('tenant-a'))).toBe(false);
+      expect(preferencesStore.has('last_playlist')).toBe(false);
+      expect(mockCacheManager.clearCache).toHaveBeenCalled();
+      expect(visibleScreens()).toEqual(['holding-screen']);
+    });
+
+    it('boot with a legacy (pre-envelope) playlist still renders — migration grace', async () => {
+      preferencesStore.set('last_playlist', JSON.stringify({
+        id: 'pl-legacy', name: 'L', items: [{ id: 'i1', contentId: 'cL', duration: 10, order: 0,
+          content: { id: 'cL', name: 'Legacy', type: 'image', url: '/legacy.jpg' } }], loopPlaylist: true,
+      }));
+      await importFresh();
+      await vi.advanceTimersByTimeAsync(1600);
+      expect(findCreatedElements('img').some(i => i.src.includes('legacy'))).toBe(true);
+      expect(visibleScreens()).toEqual(['content-screen']);
+    });
+
+    it('tenant:suspended fails closed (holding, no re-render) and tenant:resumed restores playback', async () => {
+      await connectAndCommit();
+      triggerSocketEvent('tenant:suspended');
+      await vi.advanceTimersByTimeAsync(100);
+      expect(visibleScreens()).toEqual(['holding-screen']);
+      expect(domElements.get('holding-message')!.textContent).toContain('paused');
+      expect(secureStorageStore.has('device_token')).toBe(true); // credentials kept
+      // NEGATIVE: the holding self-heal loop must NOT resurrect suspended content
+      const container = domElements.get('content-container')!;
+      const appends = (container.appendChild as Mock).mock.calls.length;
+      await vi.advanceTimersByTimeAsync(65_000);
+      expect((container.appendChild as Mock).mock.calls.length).toBe(appends);
+      expect(visibleScreens()).toEqual(['holding-screen']);
+      // Resume restores rendering
+      triggerSocketEvent('tenant:resumed');
+      await vi.advanceTimersByTimeAsync(1600);
+      expect(visibleScreens()).toEqual(['content-screen']);
+    });
+
+    it('heartbeat ack with revoked:true triggers the confirm flow', async () => {
+      httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+        ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
+        : { status: 200, data: { data: { status: 'pending' } } };
+      await connectAndCommit();
+      const hbCall = currentMockSocket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'heartbeat').pop();
+      expect(hbCall).toBeDefined();
+      const ack = hbCall![2] as (r: unknown) => void;
+      ack({ revoked: true });
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(secureStorageStore.has('device_token')).toBe(false);
+      expect(visibleScreens()).toEqual(['pairing-screen']);
     });
   });
 });

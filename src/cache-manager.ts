@@ -13,6 +13,8 @@ interface CacheManifestEntry {
 interface CacheManifest {
   entries: Record<string, CacheManifestEntry>;
   version: number;
+  /** Tenant the cached assets were downloaded under (P0-2 tenant binding). */
+  tenantId?: string;
 }
 
 export class AndroidCacheManager {
@@ -25,8 +27,19 @@ export class AndroidCacheManager {
   private debounceSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly DEBOUNCE_INTERVAL = 60000;
 
+  private expectedTenant: string | null = null;
+
   constructor(maxCacheSizeMB = 500) {
     this.maxCacheSizeMB = maxCacheSizeMB;
+  }
+
+  /**
+   * Tenant binding (P0-2, contract §1.4/§2): set before first cache use.
+   * A cache written under a different tenant is never served — it is purged
+   * wholesale at load time, regardless of how it got here.
+   */
+  setExpectedTenant(tenantId: string | null): void {
+    this.expectedTenant = tenantId;
   }
 
   async init(): Promise<void> {
@@ -43,6 +56,14 @@ export class AndroidCacheManager {
     }
 
     await this.loadManifest();
+
+    if (this.manifest.tenantId && this.expectedTenant && this.manifest.tenantId !== this.expectedTenant) {
+      console.warn('[AndroidCache] Cache belongs to a different tenant — clearing');
+      this.initialized = true; // clearCache() re-enters via public API paths
+      await this.clearCache();
+      return;
+    }
+
     this.initialized = true;
   }
 
@@ -130,6 +151,9 @@ export class AndroidCacheManager {
         lastAccessed: Date.now(),
         downloadedAt: Date.now(),
       };
+      if (this.expectedTenant) {
+        this.manifest.tenantId = this.expectedTenant;
+      }
 
       await this.saveManifest();
       await this.enforceMaxCacheSize();
