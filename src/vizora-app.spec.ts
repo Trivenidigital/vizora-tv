@@ -1005,8 +1005,14 @@ describe('VizoraAndroidTV', () => {
   // ==================== 7. PAIRING — COUNTDOWN TIMER ====================
 
   describe('Pairing — Countdown Timer', () => {
-    beforeEach(() => {
+    beforeEach(async () => {
       vi.useFakeTimers();
+      // Drain in-flight async chains from the PREVIOUS test's app instance
+      // BEFORE resetting the fake stores. A stale pairing-poll continuation
+      // that resolves later would otherwise write its token into THIS test's
+      // freshly-reset store, tricking settle loops into thinking the current
+      // instance had paired (the historical flake in the countdown-freeze test).
+      for (let i = 0; i < 50; i++) await Promise.resolve();
       resetCapacitorFakes();
       resetDOM();
       (window.location as { search: string }).search = '';
@@ -1067,6 +1073,11 @@ describe('VizoraAndroidTV', () => {
         for (let i = 0; i < 30; i++) await Promise.resolve();
       }
       expect(secureStorageStore.has('device_token')).toBe(true);
+      // Let countdown ticks that were already enqueued by the async timer
+      // advance land before taking the baseline (fake-timer artifact: a tick
+      // scheduled before clearInterval still fires).
+      await vi.advanceTimersByTimeAsync(1100);
+      for (let i = 0; i < 30; i++) await Promise.resolve();
       // After pairing succeeds, countdown text should be frozen
       const text1 = domElements.get('pairing-countdown')?.textContent || '';
       await vi.advanceTimersByTimeAsync(2000);

@@ -21,6 +21,9 @@ import { AndroidCacheManager } from './cache-manager';
 import { SecureStorage } from './secure-storage';
 import { transformContentUrl, injectContentSecurityPolicy } from './utils';
 import { ScreenStateMachine } from './screen-state';
+import { initCrashReporting, setCrashReportingDevice, reportEvent } from './crash-reporting';
+
+initCrashReporting();
 
 declare const __APP_VERSION__: string;
 
@@ -203,6 +206,7 @@ class VizoraAndroidTV {
 
     this.deviceToken = storedToken.value;
     this.deviceId = storedDeviceId.value;
+    setCrashReportingDevice(this.deviceId);
 
     if (this.deviceToken && this.deviceId) {
       console.log('[Vizora] Found existing device credentials, connecting...');
@@ -618,8 +622,15 @@ class VizoraAndroidTV {
         const responseBody = response.data;
         const data = responseBody?.data ?? responseBody;
 
+        // Overlapping poll continuations can resume after pairing already
+        // succeeded (async interval callbacks are not serialized) — only the
+        // first wins, otherwise the success path runs twice and churns the
+        // socket connection.
+        if (!this.pairingCode) return;
+
         if (data.status === 'paired' && typeof data.deviceToken === 'string' && data.deviceToken) {
           console.log('[Vizora] Device paired successfully!');
+          this.pairingCode = null;
           this.stopPairingCheck();
           this.stopPairingCountdown();
           this.pairingRetryCount = 0;
@@ -938,6 +949,7 @@ class VizoraAndroidTV {
       }
 
       console.warn('[Vizora] No renderable content in playlist — holding');
+      reportEvent('playback_holding', { reason: 'no_renderable_content', playlistId: playlist.id });
       this.enterHolding('no_renderable_content');
     } finally {
       this.advanceInFlight = false;

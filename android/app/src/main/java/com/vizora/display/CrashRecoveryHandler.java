@@ -44,19 +44,30 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
             if (alarmManager != null) {
                 long triggerTime = System.currentTimeMillis() + RESTART_DELAY_MS;
 
-                // Use setExactAndAllowWhileIdle for reliable restart on API 23+.
-                // Plain AlarmManager.set() is inexact on API 19+ and may be deferred
-                // by battery optimization on API 31+, which is unacceptable for 24/7 signage.
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                // Exact alarms are auto-granted only on API 31-32 (SCHEDULE_EXACT_ALARM,
+                // maxSdkVersion=32). USE_EXACT_ALARM is Play-policy-restricted to
+                // alarm/clock apps, so on 33+ we must check the grant and fall back to
+                // a windowed inexact alarm — a restart within ~1 minute is acceptable
+                // for crash recovery; a SecurityException killing the handler is not.
+                boolean exactAllowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.S
+                    || alarmManager.canScheduleExactAlarms();
+
+                if (exactAllowed && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     alarmManager.setExactAndAllowWhileIdle(
                         AlarmManager.RTC_WAKEUP, triggerTime, pendingIntent
                     );
-                } else {
+                    Log.i(TAG, "Restart scheduled in " + RESTART_DELAY_MS + "ms (exact, wake)");
+                } else if (exactAllowed) {
                     alarmManager.setExact(
                         AlarmManager.RTC_WAKEUP, triggerTime, pendingIntent
                     );
+                    Log.i(TAG, "Restart scheduled in " + RESTART_DELAY_MS + "ms (exact)");
+                } else {
+                    alarmManager.setWindow(
+                        AlarmManager.RTC_WAKEUP, triggerTime, 60_000L, pendingIntent
+                    );
+                    Log.i(TAG, "Restart scheduled in " + RESTART_DELAY_MS + "ms (windowed, exact-alarm not granted)");
                 }
-                Log.i(TAG, "Restart scheduled in " + RESTART_DELAY_MS + "ms (exact, wake)");
             }
         } catch (Exception e) {
             Log.e(TAG, "Failed to schedule restart", e);
