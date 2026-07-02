@@ -43,6 +43,7 @@ export default defineConfig(({ mode }) => {
       'import.meta.env.VITE_API_URL': JSON.stringify(env.VITE_API_URL || 'https://api.vizora.io'),
       'import.meta.env.VITE_REALTIME_URL': JSON.stringify(env.VITE_REALTIME_URL || 'wss://realtime.vizora.io'),
       'import.meta.env.VITE_DASHBOARD_URL': JSON.stringify(env.VITE_DASHBOARD_URL || 'https://dashboard.vizora.io'),
+      'import.meta.env.VITE_SENTRY_DSN': JSON.stringify(env.VITE_SENTRY_DSN || ''),
     },
   };
 });
