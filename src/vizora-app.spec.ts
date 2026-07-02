@@ -148,6 +148,7 @@ function resetDOM() {
   const elementIds = [
     'pairing-code', 'pairing-countdown', 'qr-code', 'content-container',
     'loading-screen', 'pairing-screen', 'content-screen', 'error-screen',
+    'holding-screen', 'holding-message',
     'error-message', 'status-dot', 'status-text', 'qr-overlay',
   ];
   for (const id of elementIds) {
@@ -201,6 +202,8 @@ vi.stubGlobal('performance', {
 
 let preferencesStore: Map<string, string>;
 let secureStorageStore: Map<string, string>;
+/** When true, the next Preferences.get throws — used to exercise init retry. */
+let preferencesFailNext = false;
 let httpGetHandler: (opts: { url: string }) => { status: number; data: unknown };
 let httpPostHandler: (opts: { url: string; data?: unknown; connectTimeout?: number; readTimeout?: number }) => { status: number; data: unknown };
 let networkListeners: Map<string, Function[]>;
@@ -210,6 +213,7 @@ let networkConnected: boolean;
 function resetCapacitorFakes() {
   preferencesStore = new Map();
   secureStorageStore = new Map();
+  preferencesFailNext = false;
   networkListeners = new Map();
   appListeners = new Map();
   networkConnected = true;
@@ -228,9 +232,13 @@ function resetCapacitorFakes() {
 
 vi.mock('@capacitor/preferences', () => ({
   Preferences: {
-    get: vi.fn(async ({ key }: { key: string }) => ({
-      value: preferencesStore.get(key) ?? null,
-    })),
+    get: vi.fn(async ({ key }: { key: string }) => {
+      if (preferencesFailNext) {
+        preferencesFailNext = false;
+        throw new Error('simulated Preferences failure');
+      }
+      return { value: preferencesStore.get(key) ?? null };
+    }),
     set: vi.fn(async ({ key, value }: { key: string; value: string }) => {
       preferencesStore.set(key, value);
     }),
@@ -1050,11 +1058,15 @@ describe('VizoraAndroidTV', () => {
       // decrementing) after enough time has passed for pairing to complete.
       httpGetHandler = () => ({ status: 200, data: { data: { status: 'paired', deviceToken: 'jwt', deviceId: 'dev' } } });
       await importFresh();
-      // Advance well past the 2s poll interval + async settling
-      for (let round = 0; round < 25; round++) {
+      // Settle until pairing has actually completed (token stored). The
+      // countdown is stopped synchronously BEFORE the token is stored, so a
+      // stored token guarantees a frozen countdown — deterministic, unlike a
+      // fixed number of settling rounds.
+      for (let round = 0; round < 100 && !secureStorageStore.has('device_token'); round++) {
         await vi.advanceTimersByTimeAsync(200);
         for (let i = 0; i < 30; i++) await Promise.resolve();
       }
+      expect(secureStorageStore.has('device_token')).toBe(true);
       // After pairing succeeds, countdown text should be frozen
       const text1 = domElements.get('pairing-countdown')?.textContent || '';
       await vi.advanceTimersByTimeAsync(2000);
@@ -1194,7 +1206,8 @@ describe('VizoraAndroidTV', () => {
           { id: 'i1', contentId: 'c1', duration: 10, order: 0, content: { id: 'c1', name: 'I', type: 'image', url: '/i.jpg' } },
         ], loopPlaylist: true },
       });
-      await vi.advanceTimersByTimeAsync(50);
+      // Image readiness wait is 1500ms before optimistic commit
+      await vi.advanceTimersByTimeAsync(1600);
       expect((domElements.get('content-container')!.appendChild as Mock).mock.calls.length).toBeGreaterThan(0);
     });
 
@@ -1228,7 +1241,8 @@ describe('VizoraAndroidTV', () => {
       await importFresh();
       currentMockSocket.connected = true;
       triggerSocketEvent('connect');
-      await vi.advanceTimersByTimeAsync(50);
+      // Image readiness wait is 1500ms before optimistic commit
+      await vi.advanceTimersByTimeAsync(1600);
       expect((domElements.get('content-container')!.appendChild as Mock).mock.calls.length).toBeGreaterThan(0);
     });
   });
@@ -1387,7 +1401,8 @@ describe('VizoraAndroidTV', () => {
       triggerSocketEvent('connect');
       currentMockSocket.emit.mockClear();
       triggerSocketEvent('playlist:update', { playlist: mkPlaylist([{ id: 'c1', type: 'image', url: '/i.jpg' }]) });
-      await vi.advanceTimersByTimeAsync(50);
+      // Impression is emitted at commit time — after the 1500ms readiness wait
+      await vi.advanceTimersByTimeAsync(1600);
       const imp = currentMockSocket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'content:impression');
       expect(imp.length).toBeGreaterThanOrEqual(1);
       expect((imp[0][1] as Record<string, unknown>).contentId).toBe('c1');
@@ -1442,11 +1457,13 @@ describe('VizoraAndroidTV', () => {
       currentMockSocket.connected = true;
       triggerSocketEvent('connect');
       triggerSocketEvent('playlist:update', { playlist: mkPlaylist([{ id: 'c1', type: 'image', url: '/i.jpg', duration: 2 }], false) });
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(1600); // commit after readiness wait
       currentMockSocket.emit.mockClear();
-      await vi.advanceTimersByTimeAsync(2100);
+      await vi.advanceTimersByTimeAsync(2100); // item duration elapses
       await vi.advanceTimersByTimeAsync(50);
       expect((console.log as Mock).mock.calls.some(c => String(c[0]).includes('Playlist ended'))).toBe(true);
+      // F35: the last frame is retained — content stays visible, engine parked
+      expect(domElements.get('content-container')!.children.length).toBeGreaterThan(0);
     });
 
     it('emits completion impression with duration and percentage', async () => {
@@ -1457,7 +1474,7 @@ describe('VizoraAndroidTV', () => {
         { id: 'c1', type: 'image', url: '/i1.jpg', duration: 10 },
         { id: 'c2', type: 'image', url: '/i2.jpg', duration: 10 },
       ]) });
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(1600); // commit after readiness wait
       currentMockSocket.emit.mockClear();
       await vi.advanceTimersByTimeAsync(10_000);
       const imp = currentMockSocket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'content:impression');
@@ -1575,17 +1592,22 @@ describe('VizoraAndroidTV', () => {
       expect(allCalls).not.toContain('allow-same-origin');
     });
 
-    it('html/template 10s load timeout triggers error handler', async () => {
+    it('html/template 10s load timeout advances without an error surface', async () => {
       await play('template', '<html><head></head><body>T</body></html>');
-      // Advancing 10s triggers the load timeout → error handler calls showContentError
+      const iframesBefore = findCreatedElements('iframe').length;
+      expect(iframesBefore).toBeGreaterThan(0);
+      // Advancing 10s triggers the load timeout → post-commit error → advance.
       await vi.advanceTimersByTimeAsync(10_000);
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(100);
+      expect((console.warn as Mock).mock.calls.some(c => String(c[0]).includes('failed after commit'))).toBe(true);
+      // Single-item loop: the item is re-prepared — a fresh iframe exists.
+      expect(findCreatedElements('iframe').length).toBeGreaterThan(iframesBefore);
+      // NEGATIVE: no "Unable to load" error card is ever rendered.
       const container = domElements.get('content-container')!;
-      // showContentError creates a div with "Unable to load:" text in the container
       const errorChild = container.children.find(
         (c: ElementStub) => c.textContent && c.textContent.includes('Unable to load')
       );
-      expect(errorChild).toBeDefined();
+      expect(errorChild).toBeUndefined();
     });
 
     it('logs warning for unknown content type and advances to next', async () => {
@@ -1615,7 +1637,8 @@ describe('VizoraAndroidTV', () => {
           { id: 'i2', contentId: 'c2', duration: 10, order: 1, content: { id: 'c2', name: 'I', type: 'image', url: '/i.jpg' } },
         ], loopPlaylist: true },
       });
-      await vi.advanceTimersByTimeAsync(50);
+      // Video readiness wait is 4000ms before optimistic commit
+      await vi.advanceTimersByTimeAsync(4100);
       // Find the video element and trigger onended
       const videos = findCreatedElements('video');
       expect(videos.length).toBeGreaterThan(0);
@@ -1623,12 +1646,12 @@ describe('VizoraAndroidTV', () => {
       expect(video.onended).toBeDefined();
       // Trigger onended — should advance to next item (image)
       video.onended!();
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(1600);
       const imgs = findCreatedElements('img');
       expect(imgs.length).toBeGreaterThan(0);
     });
 
-    it('image onerror shows error and advances after 5s', async () => {
+    it('image onerror skips the item without any error surface', async () => {
       await importFresh();
       currentMockSocket.connected = true;
       triggerSocketEvent('connect');
@@ -1643,18 +1666,21 @@ describe('VizoraAndroidTV', () => {
       expect(imgs.length).toBeGreaterThan(0);
       const img = imgs[imgs.length - 1];
       expect(img.onerror).toBeDefined();
-      // Trigger onerror — should show error message
+      // Pre-commit failure: prepare() returns null and the scan moves to the
+      // next item immediately — the bad image never reaches the screen.
       img.onerror!();
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(1600);
+      const newImgs = findCreatedElements('img');
+      expect(newImgs.length).toBeGreaterThan(imgs.length);
+      // The good image commits into the container.
+      expect((domElements.get('content-container')!.appendChild as Mock).mock.calls.length).toBeGreaterThan(0);
+      // NEGATIVE: no "Unable to load" error card is ever rendered (the old
+      // behavior showed an error surface for 5s per loop iteration).
       const container = domElements.get('content-container')!;
       const errorChild = container.children.find(
         (c: ElementStub) => c.textContent && c.textContent.includes('Unable to load')
       );
-      expect(errorChild).toBeDefined();
-      // After 5s, should advance to next content
-      await vi.advanceTimersByTimeAsync(5100);
-      const newImgs = findCreatedElements('img');
-      expect(newImgs.length).toBeGreaterThan(imgs.length);
+      expect(errorChild).toBeUndefined();
     });
 
     it('resolves through cacheManager.getCachedUri first', async () => {
@@ -1835,7 +1861,8 @@ describe('VizoraAndroidTV', () => {
         type: 'push_content',
         payload: { content: { id: 'pp1', name: 'P', type: 'image', url: '/p.jpg' }, duration: 3 },
       });
-      await vi.advanceTimersByTimeAsync(50);
+      // Impression is emitted at commit — after the 1500ms readiness wait
+      await vi.advanceTimersByTimeAsync(1600);
       const imp = currentMockSocket.emit.mock.calls.filter(
         (c: unknown[]) => c[0] === 'content:impression' && (c[1] as Record<string, unknown>).contentId === 'pp1'
       );
@@ -1929,7 +1956,8 @@ describe('VizoraAndroidTV', () => {
       currentMockSocket.connected = true;
       triggerSocketEvent('connect');
       setupPlaylist();
-      await vi.advanceTimersByTimeAsync(50);
+      // Let the playlist item commit so a playback timer exists
+      await vi.advanceTimersByTimeAsync(1600);
       spy.mockClear();
       triggerSocketEvent('command', {
         type: 'push_content',
@@ -1948,7 +1976,8 @@ describe('VizoraAndroidTV', () => {
         type: 'push_content',
         payload: { content: { id: 'pp', name: 'P', type: 'image', url: '/p.jpg' }, duration: 1 },
       });
-      await vi.advanceTimersByTimeAsync(50);
+      // Push content commits after the 1500ms readiness wait
+      await vi.advanceTimersByTimeAsync(1600);
       expect((domElements.get('content-container')!.appendChild as Mock).mock.calls.length).toBeGreaterThan(0);
     });
 
@@ -2494,40 +2523,50 @@ describe('VizoraAndroidTV', () => {
       vi.restoreAllMocks();
     });
 
-    const setupWithVideo = async () => {
+    /**
+     * Commit a video item, wire its containing div's querySelectorAll to find
+     * it, then swap to an image playlist. The engine runs the old item's
+     * cleanup at commit time — the video must be paused and released.
+     */
+    const setupCommittedVideoThenSwap = async () => {
       await importFresh();
       currentMockSocket.connected = true;
       triggerSocketEvent('connect');
-      const videoEl = createElementStub('video');
-      (domElements.get('content-container')!.querySelectorAll as Mock).mockReturnValue([videoEl]);
+      triggerSocketEvent('playlist:update', {
+        playlist: { id: 'p1', name: 'V', items: [{ id: 'i1', contentId: 'v1', duration: 30, order: 0,
+          content: { id: 'v1', name: 'Vid', type: 'video', url: '/v.mp4' } }], loopPlaylist: true },
+      });
+      await vi.advanceTimersByTimeAsync(4100); // video readiness wait -> commit
+      const videos = findCreatedElements('video');
+      expect(videos.length).toBeGreaterThan(0);
+      const videoEl = videos[videos.length - 1];
+      // Make the committed content div report the video to cleanupMediaElements
+      const divs = findCreatedElements('div');
+      const videoDiv = divs.find(d => d.children.includes(videoEl))!;
+      expect(videoDiv).toBeDefined();
+      (videoDiv.querySelectorAll as Mock).mockReturnValue([videoEl]);
+
+      // Swap to an image playlist — old item cleanup runs at the new commit
+      triggerSocketEvent('playlist:update', {
+        playlist: { id: 'p2', name: 'T', items: [{ id: 'i1', contentId: 'c1', duration: 10, order: 0,
+          content: { id: 'c1', name: 'I', type: 'image', url: '/i.jpg' } }], loopPlaylist: true },
+      });
+      await vi.advanceTimersByTimeAsync(1600); // image readiness wait -> commit
       return videoEl;
     };
 
-    const triggerCleanup = () => {
-      triggerSocketEvent('playlist:update', {
-        playlist: { id: 'p1', name: 'T', items: [{ id: 'i1', contentId: 'c1', duration: 10, order: 0,
-          content: { id: 'c1', name: 'I', type: 'image', url: '/i.jpg' } }], loopPlaylist: true },
-      });
-    };
-
     it('pauses all video elements in container', async () => {
-      const videoEl = await setupWithVideo();
-      triggerCleanup();
-      await vi.advanceTimersByTimeAsync(50);
+      const videoEl = await setupCommittedVideoThenSwap();
       expect(videoEl.pause).toHaveBeenCalled();
     });
 
     it('removes src attribute from videos', async () => {
-      const videoEl = await setupWithVideo();
-      triggerCleanup();
-      await vi.advanceTimersByTimeAsync(50);
+      const videoEl = await setupCommittedVideoThenSwap();
       expect(videoEl.removeAttribute).toHaveBeenCalledWith('src');
     });
 
     it('calls video.load() to release media resources', async () => {
-      const videoEl = await setupWithVideo();
-      triggerCleanup();
-      await vi.advanceTimersByTimeAsync(50);
+      const videoEl = await setupCommittedVideoThenSwap();
       expect(videoEl.load).toHaveBeenCalled();
     });
   });
@@ -2564,24 +2603,291 @@ describe('VizoraAndroidTV', () => {
       expect((cs.classList.toggle as Mock).mock.calls.some((c: unknown[]) => c[0] === 'hidden' && c[1] === true)).toBe(true);
     });
 
-    it('showScreen(content) shows content and hides others', async () => {
+    it('credentials without cached playlist boot into HOLDING, not a black content screen', async () => {
       secureStorageStore.set('device_token', 'tok-123');
       secureStorageStore.set('device_id', 'dev-123');
       await importFresh();
-      const cs = domElements.get('content-screen')!;
+      const hs = domElements.get('holding-screen')!;
       const ps = domElements.get('pairing-screen')!;
-      expect((cs.classList.toggle as Mock).mock.calls.some((c: unknown[]) => c[0] === 'hidden' && c[1] === false)).toBe(true);
-      expect((ps.classList.toggle as Mock).mock.calls.some((c: unknown[]) => c[0] === 'hidden' && c[1] === true)).toBe(true);
+      expect(hs._classListSet.has('hidden')).toBe(false);
+      expect(ps._classListSet.has('hidden')).toBe(true);
+      // NEGATIVE: the content screen (empty container = black) is NOT shown
+      expect(domElements.get('content-screen')!._classListSet.has('hidden')).toBe(true);
     });
 
-    it('showError sets error message text and shows error screen', async () => {
+    it('credentials with cached playlist show content only after the first frame commits', async () => {
+      secureStorageStore.set('device_token', 'tok-123');
+      secureStorageStore.set('device_id', 'dev-123');
+      preferencesStore.set('last_playlist', JSON.stringify({
+        id: 'p1', name: 'T', items: [{ id: 'i1', contentId: 'c1', duration: 10, order: 0,
+          content: { id: 'c1', name: 'I', type: 'image', url: '/i.jpg' } }], loopPlaylist: true,
+      }));
+      await importFresh();
+      await vi.advanceTimersByTimeAsync(1600); // readiness wait -> commit -> PLAYING
+      const cs = domElements.get('content-screen')!;
+      expect(cs._classListSet.has('hidden')).toBe(false);
+      expect((domElements.get('content-container')!.appendChild as Mock).mock.calls.length).toBeGreaterThan(0);
+    });
+
+    it('pairing request failure stays on the pairing screen — the error screen is never shown', async () => {
       httpPostHandler = () => ({ status: 500, data: { error: 'Internal' } });
       await importFresh();
-      const em = domElements.get('error-message')!;
-      expect(em.textContent.length).toBeGreaterThan(0);
-      expect(em.textContent).toContain('Failed');
+      const ps = domElements.get('pairing-screen')!;
+      expect(ps._classListSet.has('hidden')).toBe(false);
+      expect(domElements.get('status-text')!.textContent).toContain('retrying');
+      // NEGATIVE: no error surface — the error screen was never made visible
       const es = domElements.get('error-screen')!;
-      expect((es.classList.toggle as Mock).mock.calls.some((c: unknown[]) => c[0] === 'hidden' && c[1] === false)).toBe(true);
+      expect((es.classList.toggle as Mock).mock.calls.every(
+        (c: unknown[]) => !(c[0] === 'hidden' && c[1] === false)
+      )).toBe(true);
+    });
+  });
+
+  // ==================== 22. NEVER-BLACK STATE MACHINE (P0-1 negative suite) ====================
+  //
+  // These tests assert what the app did NOT do: no cleared container without a
+  // ready replacement, no error surface while renderable content exists, no
+  // black content screen for states that lack content. Design:
+  // docs/design/playback-state-machine.md §7.
+
+  describe('Never-Black State Machine', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      resetCapacitorFakes();
+      resetDOM();
+      (window.location as { search: string }).search = '';
+      (window.location.reload as Mock).mockClear();
+      ioFactory.mockClear();
+      currentMockSocket = createMockSocket();
+      ioFactory.mockReturnValue(currentMockSocket);
+      mockCacheManager.getCachedUri.mockReset().mockResolvedValue(null);
+      mockCacheManager.downloadContent.mockReset().mockResolvedValue(null);
+      qrToCanvasMock.mockReset().mockResolvedValue(undefined);
+      secureStorageStore.set('device_token', 'tok-123');
+      secureStorageStore.set('device_id', 'dev-123');
+      vi.spyOn(console, 'log').mockImplementation(() => {});
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    /** The five top-level screens that are currently visible (not .hidden). */
+    const visibleScreens = () =>
+      ['loading-screen', 'pairing-screen', 'content-screen', 'holding-screen', 'error-screen']
+        .filter(id => {
+          const el = domElements.get(id);
+          return el && !el._classListSet.has('hidden');
+        });
+
+    const imageItem = (id: string, duration = 10) => ({
+      id: `it-${id}`, contentId: id, duration, order: 0,
+      content: { id, name: `C-${id}`, type: 'image', url: `/${id}.jpg` },
+    });
+
+    const connectAndPlay = async (items: unknown[], loop = true) => {
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+      triggerSocketEvent('playlist:update', { playlist: { id: 'pl', name: 'PL', items, loopPlaylist: loop } });
+      await vi.advanceTimersByTimeAsync(1600);
+    };
+
+    it('empty playlist push lands in branded HOLDING — exactly one screen visible, never a bare content screen', async () => {
+      await connectAndPlay([]);
+      expect(visibleScreens()).toEqual(['holding-screen']);
+      expect(domElements.get('holding-message')!.textContent).toContain('Waiting');
+    });
+
+    it('empty playlist replacing a playing one switches to HOLDING (did not leave a cleared black container on screen)', async () => {
+      await connectAndPlay([imageItem('c1')]);
+      expect(visibleScreens()).toEqual(['content-screen']);
+      triggerSocketEvent('playlist:update', { playlist: { id: 'pl2', name: 'E', items: [], loopPlaylist: true } });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(visibleScreens()).toEqual(['holding-screen']);
+    });
+
+    it('malformed playlist pushes are inert — current content stays committed and playing', async () => {
+      await connectAndPlay([imageItem('c1')]);
+      const container = domElements.get('content-container')!;
+      const childrenBefore = container.children.length;
+      expect(childrenBefore).toBeGreaterThan(0);
+
+      for (const garbage of [undefined, null, {}, { playlist: null }, { playlist: 42 }, { playlist: { items: 'not-an-array' } }]) {
+        triggerSocketEvent('playlist:update', garbage);
+      }
+      await vi.advanceTimersByTimeAsync(100);
+
+      // NEGATIVE: nothing was removed, screen unchanged, machine still on content
+      expect(container.children.length).toBe(childrenBefore);
+      expect(visibleScreens()).toEqual(['content-screen']);
+      expect((console.warn as Mock).mock.calls.some(c => String(c[0]).includes('malformed'))).toBe(true);
+    });
+
+    it('playlist with 100% null-content items lands in HOLDING with no stack overflow', async () => {
+      const nullItems = Array.from({ length: 5 }, (_, i) => ({
+        id: `it-${i}`, contentId: `c${i}`, duration: 10, order: i, content: null,
+      }));
+      await connectAndPlay(nullItems);
+      expect(visibleScreens()).toEqual(['holding-screen']);
+      // NEGATIVE: no RangeError escaped (vitest would fail the test on an
+      // unhandled rejection); the bounded scan logged its terminal warning.
+      expect((console.warn as Mock).mock.calls.some(c => String(c[0]).includes('No renderable content'))).toBe(true);
+    });
+
+    it('layout items advance after their duration (no terminal layout state)', async () => {
+      const layoutItem = {
+        id: 'it-l', contentId: 'l1', duration: 2, order: 0,
+        content: { id: 'l1', name: 'L', type: 'layout', url: '' },
+        metadata: {
+          gridTemplate: { columns: '1fr', rows: '1fr' },
+          zones: [{ id: 'z1', gridArea: '1/1', resolvedContent: { id: 'zi', name: 'Z', type: 'image', url: '/z.jpg' } }],
+        },
+      };
+      await connectAndPlay([layoutItem, imageItem('after-layout')]);
+      // Layout committed (no readiness wait for layouts)
+      expect(visibleScreens()).toEqual(['content-screen']);
+      // After the layout's 2s duration + image readiness, the next item commits
+      await vi.advanceTimersByTimeAsync(2100);
+      await vi.advanceTimersByTimeAsync(1600);
+      const imgs = findCreatedElements('img');
+      expect(imgs.some(i => i.src.includes('after-layout'))).toBe(true);
+    });
+
+    it('layout zone timers are cleaned up when the playlist moves on (no ghost zone loops)', async () => {
+      const layoutItem = {
+        id: 'it-l', contentId: 'l1', duration: 2, order: 0,
+        content: { id: 'l1', name: 'L', type: 'layout', url: '' },
+        metadata: {
+          zones: [{
+            id: 'z1', gridArea: '1/1',
+            resolvedPlaylist: { id: 'zp', name: 'ZP', items: [
+              { id: 'z-i1', contentId: 'z1c', duration: 1, order: 0, content: { id: 'z1c', name: 'Z1', type: 'image', url: '/z1.jpg' } },
+              { id: 'z-i2', contentId: 'z2c', duration: 1, order: 1, content: { id: 'z2c', name: 'Z2', type: 'image', url: '/z2.jpg' } },
+            ] },
+          }],
+        },
+      };
+      await connectAndPlay([layoutItem, imageItem('next', 10)]);
+      await vi.advanceTimersByTimeAsync(2100); // layout duration elapses
+      await vi.advanceTimersByTimeAsync(1600); // next image commits, cleanup ran
+      const zoneImgsAfterSwap = findCreatedElements('img').filter(i => i.src.includes('/z')).length;
+      // NEGATIVE: zone rotation stopped — no new zone images appear afterwards
+      await vi.advanceTimersByTimeAsync(5000);
+      const zoneImgsLater = findCreatedElements('img').filter(i => i.src.includes('/z')).length;
+      expect(zoneImgsLater).toBe(zoneImgsAfterSwap);
+    });
+
+    it('layout with invalid metadata is skipped without touching the screen', async () => {
+      const badLayout = {
+        id: 'it-l', contentId: 'l1', duration: 5, order: 0,
+        content: { id: 'l1', name: 'BadL', type: 'layout', url: '' },
+        // no metadata at all
+      };
+      await connectAndPlay([badLayout, imageItem('good')]);
+      // The good image committed; the bad layout produced no grid
+      const grids = findCreatedElements('div').filter(d => d.className === 'layout-grid');
+      expect(grids.length).toBe(0);
+      expect(findCreatedElements('img').some(i => i.src.includes('good'))).toBe(true);
+      expect(visibleScreens()).toEqual(['content-screen']);
+    });
+
+    it('item transitions append the replacement BEFORE removing the old frame', async () => {
+      await connectAndPlay([imageItem('c1', 2), imageItem('c2', 2)]);
+      const container = domElements.get('content-container')!;
+      expect(container.children.length).toBe(1);
+      // Advance to the second item's commit
+      await vi.advanceTimersByTimeAsync(2100);
+      await vi.advanceTimersByTimeAsync(1600);
+      // Exactly one committed frame remains
+      expect(container.children.length).toBe(1);
+      // NEGATIVE (ordering): every removeChild happened after an appendChild —
+      // the container can never pass through an empty state during a swap.
+      const appendOrders = (container.appendChild as Mock).mock.invocationCallOrder;
+      const removeOrders = (container.removeChild as Mock).mock.invocationCallOrder;
+      expect(appendOrders.length).toBeGreaterThanOrEqual(2);
+      expect(removeOrders.length).toBeGreaterThanOrEqual(1);
+      expect(Math.min(...removeOrders)).toBeGreaterThan(Math.min(...appendOrders));
+      for (let k = 0; k < removeOrders.length; k++) {
+        // k-th removal must come after (k+1)-th append: remove #1 after append #2
+        expect(removeOrders[k]).toBeGreaterThan(appendOrders[k + 1] ?? -Infinity);
+      }
+    });
+
+    it('the old frame stays on screen while the next item is still preparing (slow asset)', async () => {
+      await connectAndPlay([imageItem('c1', 2), imageItem('c2', 2)]);
+      const container = domElements.get('content-container')!;
+      const firstChild = container.children[0];
+      // Item 1's duration elapses; item 2 is preparing (readiness wait pending)
+      await vi.advanceTimersByTimeAsync(2100);
+      await vi.advanceTimersByTimeAsync(800); // less than the 1500ms wait
+      // NEGATIVE: the old frame was NOT removed early
+      expect(container.children.length).toBeGreaterThan(0);
+      expect(container.children[0]).toBe(firstChild);
+    });
+
+    it('paired device with no playlist shows HOLDING on connect — never a black content screen (F11)', async () => {
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+      await vi.advanceTimersByTimeAsync(100);
+      expect(visibleScreens()).toEqual(['holding-screen']);
+      expect(domElements.get('content-screen')!._classListSet.has('hidden')).toBe(true);
+    });
+
+    it('fresh device with no credentials boots to PAIRING', async () => {
+      secureStorageStore.clear();
+      await importFresh();
+      expect(visibleScreens()).toEqual(['pairing-screen']);
+    });
+
+    it('dangling token without deviceId still reaches PAIRING — no dead loading screen', async () => {
+      secureStorageStore.clear();
+      secureStorageStore.set('device_token', 'orphan-token');
+      await importFresh();
+      expect(visibleScreens()).toEqual(['pairing-screen']);
+    });
+
+    it('init failure enters RECOVERING and retries to a working state — the error screen is never shown', async () => {
+      secureStorageStore.clear();
+      preferencesFailNext = true; // first Preferences.get throws inside init()
+      await importFresh();
+      // RECOVERING renders on the branded holding screen
+      expect(visibleScreens()).toEqual(['holding-screen']);
+      expect(domElements.get('holding-message')!.textContent).toContain('retrying');
+      // Backoff elapses -> init retries -> lands in pairing (no creds)
+      await vi.advanceTimersByTimeAsync(5100);
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(100);
+      expect(visibleScreens()).toEqual(['pairing-screen']);
+      // NEGATIVE: the raw error screen never became visible at any point
+      const es = domElements.get('error-screen')!;
+      expect((es.classList.toggle as Mock).mock.calls.every(
+        (c: unknown[]) => !(c[0] === 'hidden' && c[1] === false)
+      )).toBe(true);
+    });
+
+    it('heartbeat stops reporting currentContent when the machine leaves PLAYING (F13)', async () => {
+      await connectAndPlay([imageItem('c1')]);
+      // Playing: heartbeat carries the content id
+      currentMockSocket.emit.mockClear();
+      await vi.advanceTimersByTimeAsync(15_000);
+      const playingHb = currentMockSocket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'heartbeat');
+      expect(playingHb.length).toBeGreaterThan(0);
+      // Drop to holding via an empty playlist
+      triggerSocketEvent('playlist:update', { playlist: { id: 'e', name: 'E', items: [], loopPlaylist: true } });
+      await vi.advanceTimersByTimeAsync(100);
+      currentMockSocket.emit.mockClear();
+      await vi.advanceTimersByTimeAsync(15_100);
+      const holdingHb = currentMockSocket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'heartbeat');
+      expect(holdingHb.length).toBeGreaterThan(0);
+      const payload = holdingHb[holdingHb.length - 1][1] as Record<string, unknown>;
+      // NEGATIVE: no stale "now playing" claim while the screen is on holding
+      expect(payload.currentContent).toBeUndefined();
+      expect(payload.screenState).toBe('holding');
     });
   });
 });
