@@ -37,6 +37,26 @@ export function computePlaylistSignature(
 }
 
 /**
+ * Version-wins decision (T2 idempotency layer) — the CLIENT half of the coherence
+ * model the server resolver produces. Apply the resolver's answer when it is a
+ * DIFFERENT playlist (schedule boundary / reassignment — always, even if its version
+ * is older) OR a NEWER version of the SAME playlist; ignore a same-or-older re-delivery
+ * of the same playlist (a stale push arriving after a pull, or an exact re-send — the
+ * PD-1/PD-7 re-flash this closes end-to-end because the CLIENT honors the version).
+ * Must match the server's shouldApplyContent (@vizora/database) exactly. ISO version
+ * strings compare chronologically as strings.
+ */
+export function shouldApplyContent(
+  incoming: { playlistId: string | null; version: string },
+  current: { playlistId: string | null; version: string } | null,
+): boolean {
+  if (incoming.playlistId == null) return false; // nothing to show
+  if (!current || current.playlistId == null) return true; // first content
+  if (incoming.playlistId !== current.playlistId) return true; // boundary / reassignment
+  return incoming.version > current.version; // same playlist → newer wins, older ignored
+}
+
+/**
  * Injects a Content-Security-Policy meta tag into HTML content.
  * Security model: iframe sandbox (allow-scripts only) + restrictive CSP.
  * This does NOT sanitize HTML — it relies on CSP to block network access

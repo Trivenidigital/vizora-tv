@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature } from './utils';
+import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature, shouldApplyContent } from './utils';
 
 describe('computePlaylistSignature (PD-1 playback idempotency)', () => {
   const P = (id: string, items: Array<{ contentId: string; order: number; duration: number }>) => ({ id, items });
@@ -193,5 +193,47 @@ describe('injectContentSecurityPolicy', () => {
     const result = injectContentSecurityPolicy('<head></head>');
     expect(result).toContain("style-src 'unsafe-inline'");
     expect(result).toContain("script-src 'unsafe-inline'");
+  });
+});
+
+describe('shouldApplyContent — T2 client version-wins (increment 5 acceptance)', () => {
+  const V = (playlistId: string | null, version: string) => ({ playlistId, version });
+
+  it('ACCEPTANCE 1 — pull-on-connect applies fresh content (no current)', () => {
+    expect(shouldApplyContent(V('pl-1', '2026-02-01T00:00:00.000Z'), null)).toBe(true);
+  });
+
+  it('ACCEPTANCE 2 (CRITICAL) — a same-version delivery after a pull does NOT re-apply (no re-flash)', () => {
+    // This is where the PD-1/PD-7 re-flash actually closes: the CLIENT honors the version,
+    // so a same-version push arriving after a pull is a no-op → no duplicate content:impression.
+    const cur = V('pl-1', '2026-02-01T00:00:00.000Z');
+    expect(shouldApplyContent({ ...cur }, cur)).toBe(false);
+  });
+
+  it('ACCEPTANCE 3 — a newer version of the same playlist applies (boundary re-pull / drift reconcile)', () => {
+    const cur = V('pl-1', '2026-02-01T00:00:00.000Z');
+    expect(shouldApplyContent(V('pl-1', '2026-06-01T00:00:00.000Z'), cur)).toBe(true);
+  });
+
+  it('ACCEPTANCE 4 — a different playlist (schedule boundary / reassignment) ALWAYS applies, even if older', () => {
+    const cur = V('pl-A', '2026-06-01T00:00:00.000Z');
+    expect(shouldApplyContent(V('pl-B', '2026-01-01T00:00:00.000Z'), cur)).toBe(true);
+  });
+
+  it('a stale older-version re-delivery of the same playlist is ignored (push↔pull race)', () => {
+    const cur = V('pl-1', '2026-06-01T00:00:00.000Z');
+    expect(shouldApplyContent(V('pl-1', '2026-01-01T00:00:00.000Z'), cur)).toBe(false);
+  });
+
+  it('a null-playlist resolution never applies (holding stays put, never blanks to a wrong payload)', () => {
+    expect(shouldApplyContent({ playlistId: null, version: '' }, V('pl-1', 'v'))).toBe(false);
+  });
+
+  it('matches the server definition exactly (same signature/semantics as @vizora/database)', () => {
+    // Identical logic both sides → pull and push are reconciled to the same decision.
+    const cur = V('pl-1', 'v2');
+    expect(shouldApplyContent(V('pl-1', 'v2'), cur)).toBe(false); // equal → no-op
+    expect(shouldApplyContent(V('pl-1', 'v3'), cur)).toBe(true); // newer → apply
+    expect(shouldApplyContent(V('pl-1', 'v1'), cur)).toBe(false); // older → ignore
   });
 });

@@ -19,7 +19,7 @@ import { CapacitorHttp, HttpResponse } from '@capacitor/core';
 import { io, Socket } from 'socket.io-client';
 import { AndroidCacheManager } from './cache-manager';
 import { SecureStorage } from './secure-storage';
-import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature } from './utils';
+import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature, shouldApplyContent } from './utils';
 import { ScreenStateMachine } from './screen-state';
 import { initCrashReporting, setCrashReportingDevice, reportEvent } from './crash-reporting';
 
@@ -102,6 +102,9 @@ interface LayoutZone {
 interface HeartbeatResponse {
   commands?: Array<{ type: string; payload?: Record<string, unknown>; [key: string]: unknown }>;
   revoked?: boolean;
+  // T2: server sets this when the device's reported contentVersion has drifted from the
+  // authoritative resolveEffectiveContent version → the device re-pulls (self-heal).
+  reconcileContent?: boolean;
 }
 
 interface PerformanceMemory {
@@ -126,6 +129,10 @@ class VizoraAndroidTV {
 
   private currentPlaylist: Playlist | null = null;
   private currentIndex = 0;
+  // T2 version-wins: the authoritative content version currently rendered, so pull and
+  // push are reconciled by shouldApplyContent (a same-or-older re-delivery is a no-op).
+  private currentContentVersion = '';
+  private currentContentPlaylistId: string | null = null;
   private playbackTimer: ReturnType<typeof setTimeout> | null = null;
   private isOnline = true;
   private cacheManager = new AndroidCacheManager();
@@ -737,6 +744,11 @@ class VizoraAndroidTV {
       const heartbeatData = {
         uptime: uptimeSeconds,
         appVersion: typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.0',
+        // T2 heartbeat-reconcile: report the content version currently rendered so the
+        // server can compare against resolveEffectiveContent and, on drift, tell this
+        // device to re-pull — the self-heal for a connected-but-flaky device that never
+        // dropped its socket (Finding-2 residual 1). Server side wires the compare.
+        contentVersion: this.currentContentVersion,
         metrics: {
           cpuUsage: 0, // not available in browser/WebView context
           memoryUsage,
@@ -759,9 +771,65 @@ class VizoraAndroidTV {
         if (response && response.commands) {
           response.commands.forEach((cmd) => this.handleCommand(cmd));
         }
+        // T2 heartbeat-reconcile: the server saw our contentVersion drift from the
+        // authoritative version → re-pull (self-heal without a disconnect). Fails safe.
+        if (response && response.reconcileContent) {
+          void this.pullContent();
+        }
       });
     } catch (error) {
       console.error('[Vizora] Error sending heartbeat:', error);
+    }
+  }
+
+  /**
+   * T2 pull: fetch the device's AUTHORITATIVE effective content (the same resolver
+   * realtime pushes) and apply it via version-wins. Called on connect, on a heartbeat
+   * reconcile signal (the server detected the rendered version drifted from truth — the
+   * connected-but-flaky-never-drops self-heal), and it is the backstop the whole
+   * delivery model rests on. FAILS SAFE: on any error the device keeps playing
+   * last-known-good — it NEVER blanks (never-black on the reconcile path).
+   */
+  private async pullContent(): Promise<void> {
+    if (!this.deviceToken || !this.isOnline) return;
+    try {
+      const response: HttpResponse = await CapacitorHttp.get({
+        url: `${this.config.apiUrl}/api/v1/devices/me/content`,
+        headers: { Authorization: `Bearer ${this.deviceToken}` },
+        connectTimeout: 10000,
+        readTimeout: 10000,
+      });
+      if (response.status < 200 || response.status >= 300) {
+        console.warn(`[Vizora] pullContent non-2xx (${response.status}) — keeping last-known-good`);
+        return; // fail safe
+      }
+      const body = response.data;
+      const payload = body?.data ?? body; // unwrap { success, data } envelope
+      this.applyPulledContent(payload);
+    } catch (error) {
+      // Fail safe: a reconcile/pull failure NEVER blanks the screen — keep last-known-good.
+      console.warn('[Vizora] pullContent failed — keeping last-known-good:', error);
+    }
+  }
+
+  /**
+   * Apply an effective-content payload (pull, or a versioned push) via version-wins
+   * (shouldApplyContent). A same-or-older re-delivery of the same playlist is a NO-OP
+   * (no re-flash, no duplicate content:impression — the PD-1/PD-7 close, now honored on
+   * the CLIENT so the whole coherence model is closed end-to-end). A different playlist
+   * (schedule boundary / reassignment) or a newer version applies.
+   */
+  private applyPulledContent(
+    payload: { version?: string; playlist?: Playlist | null } | null | undefined,
+  ): void {
+    if (!payload) return;
+    const incoming = { playlistId: payload.playlist?.id ?? null, version: payload.version ?? '' };
+    const current = { playlistId: this.currentContentPlaylistId, version: this.currentContentVersion };
+    if (!shouldApplyContent(incoming, current)) return; // stale/duplicate → no-op, no re-flash
+    this.currentContentVersion = incoming.version;
+    this.currentContentPlaylistId = incoming.playlistId;
+    if (payload.playlist) {
+      this.updatePlaylist(payload.playlist);
     }
   }
 
@@ -820,6 +888,12 @@ class VizoraAndroidTV {
       this.hideOfflineOverlay();
       this.exitAuthDegraded();
       this.startHeartbeat();
+
+      // T2 pull-on-connect: fetch the authoritative effective content on every
+      // (re)connect and apply it via version-wins. This makes delivery resilient to any
+      // single push's fate (closes Finding-2's reconnect strand + C-7 on the pull side);
+      // push remains the low-latency fast-path. Fails safe — keeps last-known-good.
+      void this.pullContent();
 
       if (this.currentPlaylist && this.currentPlaylist.items?.length > 0) {
         // Restored/ongoing playlist — keep or start playing while waiting for
@@ -904,7 +978,15 @@ class VizoraAndroidTV {
         console.warn('[Vizora] Ignoring malformed playlist:update payload');
         return;
       }
-      this.updatePlaylist(playlist);
+      // A VERSIONED push (T2 sendInitialState / future push paths) goes through the same
+      // version-wins as the pull, so a same-version push arriving after a pull does NOT
+      // re-apply (no re-flash). A legacy push without a version falls back to
+      // updatePlaylist, whose signature no-op still absorbs an identical re-send (PD-1).
+      if (typeof data?.version === 'string' && data.version) {
+        this.applyPulledContent({ version: data.version, playlist });
+      } else {
+        this.updatePlaylist(playlist);
+      }
     });
 
     this.socket.on('command', (command) => {
