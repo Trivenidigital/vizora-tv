@@ -14,6 +14,30 @@ describe('computePlaylistSignature (PD-1 playback idempotency)', () => {
     expect(computePlaylistSignature(a)).toBe(computePlaylistSignature(b));
   });
 
+  describe('PD-7 — in-place content edit must change the signature (not absorbed as a no-op)', () => {
+    // Same contentId + order + duration + url, but the content was edited
+    // (template re-render / file replacement) → updatedAt bumps. The reconnect
+    // re-push is the ONLY delivery path for edits, so the signature MUST differ or
+    // "edit the sign → device updates" never heals.
+    it('a bumped content.updatedAt changes the signature', () => {
+      const before = { id: 'pl-1', items: [{ contentId: 'c1', order: 0, duration: 10, content: { updatedAt: '2026-07-04T10:00:00Z' } }] };
+      const after = { id: 'pl-1', items: [{ contentId: 'c1', order: 0, duration: 10, content: { updatedAt: '2026-07-04T11:30:00Z' } }] };
+      expect(computePlaylistSignature(before)).not.toBe(computePlaylistSignature(after));
+    });
+
+    it('same content + same updatedAt is still a no-op (idempotency preserved)', () => {
+      const a = { id: 'pl-1', items: [{ contentId: 'c1', order: 0, duration: 10, content: { updatedAt: '2026-07-04T10:00:00Z' } }] };
+      const b = { id: 'pl-1', items: [{ contentId: 'c1', order: 0, duration: 10, content: { updatedAt: '2026-07-04T10:00:00Z' } }] };
+      expect(computePlaylistSignature(a)).toBe(computePlaylistSignature(b));
+    });
+
+    it('is backward-compatible with payloads lacking updatedAt (undefined → stable empty discriminator)', () => {
+      const a = P('pl-1', [{ contentId: 'c1', order: 0, duration: 10 }]);
+      const b = { id: 'pl-1', items: [{ contentId: 'c1', order: 0, duration: 10, content: null }] };
+      expect(computePlaylistSignature(a)).toBe(computePlaylistSignature(b));
+    });
+  });
+
   it('a STRANDED device (empty/null current) never matches a real playlist — it re-renders', () => {
     const real = P('pl-1', [{ contentId: 'c1', order: 0, duration: 10 }]);
     expect(computePlaylistSignature(null)).toBe('');

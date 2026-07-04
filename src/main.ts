@@ -60,6 +60,7 @@ interface PlaylistItem {
     thumbnail?: string;
     mimeType?: string;
     duration?: number;
+    updatedAt?: string; // PD-7: content-mutation discriminator for the playback signature
   } | null;
 }
 
