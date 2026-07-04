@@ -19,7 +19,7 @@ import { CapacitorHttp, HttpResponse } from '@capacitor/core';
 import { io, Socket } from 'socket.io-client';
 import { AndroidCacheManager } from './cache-manager';
 import { SecureStorage } from './secure-storage';
-import { transformContentUrl, injectContentSecurityPolicy } from './utils';
+import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature } from './utils';
 import { ScreenStateMachine } from './screen-state';
 import { initCrashReporting, setCrashReportingDevice, reportEvent } from './crash-reporting';
 
@@ -1149,6 +1149,24 @@ class VizoraAndroidTV {
   }
 
   private async updatePlaylist(playlist: Playlist) {
+    // PD-1 idempotency: a redundant delivery of the playlist ALREADY playing must
+    // be a no-op — no rotation restart, no re-render flash, no duplicate
+    // content:impression. The Finding-2 backend fix deliberately re-sends the
+    // authoritative playlist on reconnect (best-effort pending + DB re-send); if
+    // the device already has it, absorb it silently. This is the elegant half of
+    // that fix: it distinguishes "already rendered" (signature matches → no-op)
+    // from "stranded" (device holding → currentPlaylist empty → signature differs
+    // → render). An EDITED playlist (same id, changed items) has a different
+    // signature and still re-renders.
+    const incomingSig = computePlaylistSignature(playlist);
+    if (incomingSig && incomingSig === computePlaylistSignature(this.currentPlaylist)) {
+      // Keep the running rotation; only nudge the engine if it somehow parked
+      // (ensurePlaying resumes from the current index — it does NOT reset to 0).
+      this.playbackSource = 'live';
+      this.ensurePlaying();
+      return;
+    }
+
     this.currentPlaylist = playlist;
     this.currentIndex = 0;
     this.playbackGeneration++; // invalidate any in-flight prepare

@@ -3,7 +3,43 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { transformContentUrl, injectContentSecurityPolicy } from './utils';
+import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature } from './utils';
+
+describe('computePlaylistSignature (PD-1 playback idempotency)', () => {
+  const P = (id: string, items: Array<{ contentId: string; order: number; duration: number }>) => ({ id, items });
+
+  it('is stable for the same content — a redundant re-send is a no-op', () => {
+    const a = P('pl-1', [{ contentId: 'c1', order: 0, duration: 10 }, { contentId: 'c2', order: 1, duration: 20 }]);
+    const b = P('pl-1', [{ contentId: 'c1', order: 0, duration: 10 }, { contentId: 'c2', order: 1, duration: 20 }]);
+    expect(computePlaylistSignature(a)).toBe(computePlaylistSignature(b));
+  });
+
+  it('a STRANDED device (empty/null current) never matches a real playlist — it re-renders', () => {
+    const real = P('pl-1', [{ contentId: 'c1', order: 0, duration: 10 }]);
+    expect(computePlaylistSignature(null)).toBe('');
+    expect(computePlaylistSignature(P('pl-1', []))).toBe('');
+    expect(computePlaylistSignature(real)).not.toBe(computePlaylistSignature(null));
+    expect(computePlaylistSignature(real)).not.toBe(''); // '' guard means holding→render
+  });
+
+  it('an EDITED playlist (same id, changed items) has a different signature — it re-renders', () => {
+    const base = P('pl-1', [{ contentId: 'c1', order: 0, duration: 10 }]);
+    expect(computePlaylistSignature(base)).not.toBe(
+      computePlaylistSignature(P('pl-1', [{ contentId: 'c1', order: 0, duration: 15 }])), // duration changed
+    );
+    expect(computePlaylistSignature(base)).not.toBe(
+      computePlaylistSignature(P('pl-1', [{ contentId: 'c2', order: 0, duration: 10 }])), // content swapped
+    );
+    expect(computePlaylistSignature(P('pl-1', [{ contentId: 'c1', order: 0, duration: 10 }, { contentId: 'c2', order: 1, duration: 10 }]))).not.toBe(
+      computePlaylistSignature(P('pl-1', [{ contentId: 'c2', order: 0, duration: 10 }, { contentId: 'c1', order: 1, duration: 10 }])), // reorder
+    );
+  });
+
+  it('a DIFFERENT playlist id has a different signature', () => {
+    const items = [{ contentId: 'c1', order: 0, duration: 10 }];
+    expect(computePlaylistSignature(P('pl-1', items))).not.toBe(computePlaylistSignature(P('pl-2', items)));
+  });
+});
 
 describe('transformContentUrl', () => {
   const API = 'https://api.vizora.io';
