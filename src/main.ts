@@ -765,6 +765,13 @@ class VizoraAndroidTV {
       };
 
       this.socket.emit('heartbeat', heartbeatData, (response: HeartbeatResponse) => {
+        // The server wraps the ack payload in `.data` (createSuccessResponse), so read
+        // from there; fall back to the top level so this is robust either way. (The
+        // revoked/commands reads below predate this and read the top level — left as-is
+        // to avoid a behavior change; revocation also flows via the device:revoked event.)
+        const ack = ((response as unknown as { data?: HeartbeatResponse })?.data ?? response) as
+          | HeartbeatResponse
+          | undefined;
         if (response && response.revoked) {
           void this.confirmRevocation('heartbeat_ack');
         }
@@ -773,7 +780,7 @@ class VizoraAndroidTV {
         }
         // T2 heartbeat-reconcile: the server saw our contentVersion drift from the
         // authoritative version → re-pull (self-heal without a disconnect). Fails safe.
-        if (response && response.reconcileContent) {
+        if (ack && ack.reconcileContent) {
           void this.pullContent();
         }
       });
