@@ -26,11 +26,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
           cache: gradle
+      - run: npm ci
+      # cap sync generates the capacitor-cordova-android-plugins module
+      # (cordova.variables.gradle etc.), which is gitignored — Gradle needs it.
+      # cap copy needs dist/, so build the web app first.
+      - name: Build web + sync Capacitor Android
+        run: |
+          npm run build
+          npx cap sync android
       - name: Make gradlew executable
         run: chmod +x android/gradlew
       - name: Run JVM unit tests (F36 RendererRecoveryGuard, etc.)
