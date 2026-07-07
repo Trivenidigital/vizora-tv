@@ -1392,6 +1392,16 @@ describe('VizoraAndroidTV', () => {
       ack({ commands: [{ type: 'reload' }] });
       expect(window.location.reload).toHaveBeenCalled();
     });
+
+    it('processes commands wrapped in the ack .data envelope (createSuccessResponse — backend Q#3)', async () => {
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+      const hb = currentMockSocket.emit.mock.calls.find((c: unknown[]) => c[0] === 'heartbeat')!;
+      const ack = hb[hb.length - 1] as Function;
+      ack({ data: { commands: [{ type: 'reload' }] } });
+      expect(window.location.reload).toHaveBeenCalled();
+    });
   });
 
   // ==================== 11. PLAYLIST PLAYBACK ====================
