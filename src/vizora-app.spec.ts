@@ -740,6 +740,33 @@ describe('VizoraAndroidTV', () => {
         (c: unknown[]) => c[0] === 'hidden' && c[1] === false
       )).toBe(false);
     });
+
+    it('fails closed with a loud surface when secure storage is unavailable — no plaintext, no pairing (F39)', async () => {
+      const { SecureStorage } = await import('./secure-storage');
+      const { reportEvent } = await import('./crash-reporting');
+      (reportEvent as Mock).mockClear();
+      (SecureStorage.get as Mock).mockRejectedValue(
+        Object.assign(new Error('Secure storage unavailable'), { code: 'SECURE_STORAGE_UNAVAILABLE' }),
+      );
+      await importFresh();
+      // Advance past the F37 bounded-retry window: F39 must NOT fall through to the
+      // pairing route (a device with no secure store cannot pair safely).
+      for (let i = 0; i < 6; i++) {
+        await vi.advanceTimersByTimeAsync(20000);
+        for (let j = 0; j < 20; j++) await Promise.resolve();
+      }
+      // Loud + visible + telemetry
+      expect((reportEvent as Mock).mock.calls.some((c: unknown[]) => c[0] === 'secure_storage_unavailable')).toBe(true);
+      const holding = domElements.get('holding-screen')!;
+      expect((holding.classList.toggle as Mock).mock.calls.some(
+        (c: unknown[]) => c[0] === 'hidden' && c[1] === false
+      )).toBe(true);
+      // NEGATIVE: not the normal pairing screen
+      const ps = domElements.get('pairing-screen')!;
+      expect((ps.classList.toggle as Mock).mock.calls.some(
+        (c: unknown[]) => c[0] === 'hidden' && c[1] === false
+      )).toBe(false);
+    });
   });
 
   // ==================== 4. PAIRING — REQUEST ====================
