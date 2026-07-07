@@ -1,15 +1,29 @@
 package com.vizora.display;
 
+import android.content.Intent;
 import android.os.Bundle;
+import android.os.SystemClock;
+import android.util.Log;
+import android.webkit.RenderProcessGoneDetail;
 import android.webkit.WebSettings;
+import android.webkit.WebView;
 
 import androidx.core.view.WindowCompat;
 import androidx.core.view.WindowInsetsCompat;
 import androidx.core.view.WindowInsetsControllerCompat;
 
 import com.getcapacitor.BridgeActivity;
+import com.getcapacitor.WebViewListener;
 
 public class MainActivity extends BridgeActivity {
+    private static final String TAG = "VizoraMainActivity";
+
+    // Guard against a tight renderer-death loop (a content item that OOMs the
+    // renderer on every render). Static so it survives the activity relaunch
+    // within the same process. elapsedRealtime is monotonic (clock-change safe).
+    private static final long RENDERER_RECOVERY_MIN_INTERVAL_MS = 10_000L;
+    private static long lastRendererRecoveryAt = 0L;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         // Register SecureStorage plugin before super.onCreate (which initializes the bridge)
@@ -26,6 +40,49 @@ public class MainActivity extends BridgeActivity {
         if (BuildConfig.DEBUG) {
             getBridge().getWebView().getSettings().setMixedContentMode(WebSettings.MIXED_CONTENT_ALWAYS_ALLOW);
         }
+
+        // F36: recover from WebView renderer-process death in-process. A renderer
+        // OOM/crash raises NO Java exception (so CrashRecoveryHandler never sees it)
+        // and does not reboot the device (so BootReceiver never fires) — without this
+        // the screen goes blank until a manual power-cycle. Capacitor's
+        // BridgeWebViewClient.onRenderProcessGone delegates to registered
+        // WebViewListeners (ORs their return values); a listener returning true
+        // prevents the framework from killing the app process. We relaunch the
+        // activity to rebuild a fresh Bridge + WebView. This fires in the still-alive
+        // foreground process, so it is NOT a background activity launch — no
+        // SYSTEM_ALERT_WINDOW / kiosk-posture dependency (orthogonal to F1/F2).
+        // Hardware acceptance: P0-3 test S-19d.
+        getBridge().addWebViewListener(new WebViewListener() {
+            @Override
+            public boolean onRenderProcessGone(WebView webView, RenderProcessGoneDetail detail) {
+                return recoverFromRendererGone(detail);
+            }
+        });
+    }
+
+    private boolean recoverFromRendererGone(RenderProcessGoneDetail detail) {
+        boolean didCrash = detail != null && detail.didCrash();
+        Log.e(TAG, "WebView renderer gone (didCrash=" + didCrash + ") — recovering in-process");
+
+        long now = SystemClock.elapsedRealtime();
+        if (now - lastRendererRecoveryAt < RENDERER_RECOVERY_MIN_INTERVAL_MS) {
+            // Renderer died again within the guard window — a tight loop. Don't
+            // hot-loop: return false so the framework terminates the process and the
+            // restart falls to the crash-recovery / next-boot path. (Full
+            // renderer-loop safe-mode is folded into the F2/S-19c crash-loop work.)
+            Log.e(TAG, "Renderer gone again within " + RENDERER_RECOVERY_MIN_INTERVAL_MS
+                + "ms — deferring to process restart");
+            return false;
+        }
+        lastRendererRecoveryAt = now;
+
+        // Relaunch cleanly. The dead WebView must not be reused; finishing the
+        // activity tears it down and a fresh Intent rebuilds the Bridge + WebView.
+        Intent intent = new Intent(getApplicationContext(), MainActivity.class);
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        startActivity(intent);
+        finish();
+        return true; // handled — do not let the framework kill the app process
     }
 
     /**
