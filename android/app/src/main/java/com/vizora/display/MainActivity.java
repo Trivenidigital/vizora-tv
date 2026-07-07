@@ -18,15 +18,12 @@ import com.getcapacitor.WebViewListener;
 public class MainActivity extends BridgeActivity {
     private static final String TAG = "VizoraMainActivity";
 
-    // Guard against a tight renderer-death loop (a content item that OOMs the
-    // renderer on every render). Static so it survives the activity relaunch
-    // within the same process. elapsedRealtime is monotonic (clock-change safe).
-    // Seed one interval in the past — NOT 0 — because elapsedRealtime is ms since
-    // BOOT: with 0, a renderer death within the first 10s of boot would satisfy
-    // (now - 0 < interval) and wrongly skip the FIRST recovery. (-interval, not
-    // Long.MIN_VALUE, to avoid subtraction overflow.)
-    private static final long RENDERER_RECOVERY_MIN_INTERVAL_MS = 10_000L;
-    private static long lastRendererRecoveryAt = -RENDERER_RECOVERY_MIN_INTERVAL_MS;
+    // Renderer-recovery loop-guard state. The DECISION lives in RendererRecoveryGuard
+    // (pure, host-JVM-testable); this field holds the mutable timestamp across the
+    // in-process activity relaunch (static → survives the relaunch in the same
+    // process). Seeded to SENTINEL so the first death — even within the boot window —
+    // always recovers.
+    private static long lastRendererRecoveryAt = RendererRecoveryGuard.SENTINEL;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -69,12 +66,12 @@ public class MainActivity extends BridgeActivity {
         Log.e(TAG, "WebView renderer gone (didCrash=" + didCrash + ") — recovering in-process");
 
         long now = SystemClock.elapsedRealtime();
-        if (now - lastRendererRecoveryAt < RENDERER_RECOVERY_MIN_INTERVAL_MS) {
+        if (!RendererRecoveryGuard.shouldRecover(now, lastRendererRecoveryAt)) {
             // Renderer died again within the guard window — a tight loop. Don't
             // hot-loop: return false so the framework terminates the process and the
             // restart falls to the crash-recovery / next-boot path. (Full
             // renderer-loop safe-mode is folded into the F2/S-19c crash-loop work.)
-            Log.e(TAG, "Renderer gone again within " + RENDERER_RECOVERY_MIN_INTERVAL_MS
+            Log.e(TAG, "Renderer gone again within " + RendererRecoveryGuard.MIN_INTERVAL_MS
                 + "ms — deferring to process restart");
             return false;
         }
