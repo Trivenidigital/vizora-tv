@@ -696,6 +696,44 @@ describe('VizoraAndroidTV', () => {
       await importFresh();
       expect(SplashScreen.hide).toHaveBeenCalled();
     });
+
+    it('routes to pairing after bounded retries when SecureStorage read fails persistently (F37)', async () => {
+      const { SecureStorage } = await import('./secure-storage');
+      (SecureStorage.get as Mock).mockRejectedValue(new Error('keystore corrupt (AEADBadTag)'));
+      await importFresh();
+      // startInit retries init() at 5s/10s/20s backoff; the credential-read guard
+      // re-throws for the first CRED_READ_MAX_RETRIES attempts, then routes to
+      // pairing on the next. Advance well past ~35s of backoff.
+      for (let i = 0; i < 6; i++) {
+        await vi.advanceTimersByTimeAsync(20000);
+        for (let j = 0; j < 20; j++) await Promise.resolve();
+      }
+      const ps = domElements.get('pairing-screen')!;
+      expect((ps.classList.toggle as Mock).mock.calls.some(
+        (c: unknown[]) => c[0] === 'hidden' && c[1] === false
+      )).toBe(true);
+    });
+
+    it('recovers without pairing when a SecureStorage read blip is transient (F37 — no premature de-pair)', async () => {
+      const { SecureStorage } = await import('./secure-storage');
+      secureStorageStore.set('device_token', 'tok-123');
+      secureStorageStore.set('device_id', 'dev-123');
+      let calls = 0;
+      (SecureStorage.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+        calls++;
+        if (calls <= 2) throw new Error('transient keystore blip');
+        return { value: secureStorageStore.get(key) ?? null };
+      });
+      await importFresh();
+      // One startInit retry (5s) lets the transient blip clear; device connects.
+      await vi.advanceTimersByTimeAsync(6000);
+      for (let j = 0; j < 20; j++) await Promise.resolve();
+      expect(ioFactory).toHaveBeenCalled();
+      const ps = domElements.get('pairing-screen')!;
+      expect((ps.classList.toggle as Mock).mock.calls.some(
+        (c: unknown[]) => c[0] === 'hidden' && c[1] === false
+      )).toBe(false);
+    });
   });
 
   // ==================== 4. PAIRING — REQUEST ====================

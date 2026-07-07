@@ -218,8 +218,33 @@ class VizoraAndroidTV {
 
     // Check for existing device token (from encrypted storage)
     await this.migrateCredentialsToSecureStorage();
-    const storedToken = await SecureStorage.get({ key: 'device_token' });
-    const storedDeviceId = await SecureStorage.get({ key: 'device_id' });
+    // Read credentials from encrypted storage. A REJECTION here (not a null
+    // value) means the keystore/decrypt failed — the documented Android
+    // EncryptedSharedPreferences failure where an OS update invalidates the
+    // Keystore master key (AEADBadTagException). Unguarded, that rejection
+    // propagates into the startInit RECOVERING loop and retries FOREVER,
+    // never reaching the pairing fallback (F37) — a permanent brick. Give a
+    // transient blip a few retries via the startInit backoff; on a persistent
+    // failure route to pairing so an operator can recover the device. Pairing
+    // is non-destructive: canPair() gates on the in-memory creds (both null
+    // here) and stored credentials are left untouched.
+    const CRED_READ_MAX_RETRIES = 3;
+    let storedToken: { value: string | null };
+    let storedDeviceId: { value: string | null };
+    try {
+      storedToken = await SecureStorage.get({ key: 'device_token' });
+      storedDeviceId = await SecureStorage.get({ key: 'device_id' });
+    } catch (err) {
+      if (this.initRetryCount < CRED_READ_MAX_RETRIES) {
+        throw err; // transient — let startInit retry init()
+      }
+      console.error('[Vizora] SecureStorage credential read failing persistently — routing to pairing (F37):', err);
+      reportEvent('secure_storage_read_failed', { retries: this.initRetryCount });
+      await SplashScreen.hide();
+      this.initRetryCount = 0;
+      this.startPairing();
+      return;
+    }
 
     this.deviceToken = storedToken.value;
     this.deviceId = storedDeviceId.value;
