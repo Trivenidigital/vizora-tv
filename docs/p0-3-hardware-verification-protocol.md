@@ -85,8 +85,11 @@ On each device (SAW state as decided in §1–2):
   resumes rendering ≤ 30s **without** a full app relaunch, via the `onRenderProcessGone` override
   (F36); FAIL: screen stays blank with the app process alive, OR recovery relies on the unproven
   BAL-gated full restart. This test settles the §86-vs-F36 dispute empirically (does the framework
-  auto-restart after a renderer kill?). *(Runnable after the F36 override lands; the override needs
-  no SAW and can ship independently of the posture decision.)*
+  auto-restart after a renderer kill?). Also exercise the RAPID re-death path (induce a second
+  renderer kill within 10s): the F36 loop-guard returns false and defers to the process-restart
+  path, which assumes the OEM's AMS relaunches the visible task — firmware-dependent, so record
+  whether the app comes back or stays dark. *(Runnable after the F36 override lands; the override
+  needs no SAW and can ship independently of the posture decision.)*
 
 ## 4. UPD-1 — package-replaced relaunch
 

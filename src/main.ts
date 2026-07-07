@@ -219,15 +219,22 @@ class VizoraAndroidTV {
     // Check for existing device token (from encrypted storage)
     await this.migrateCredentialsToSecureStorage();
     // Read credentials from encrypted storage. A REJECTION here (not a null
-    // value) means the keystore/decrypt failed — the documented Android
-    // EncryptedSharedPreferences failure where an OS update invalidates the
-    // Keystore master key (AEADBadTagException). Unguarded, that rejection
-    // propagates into the startInit RECOVERING loop and retries FOREVER,
-    // never reaching the pairing fallback (F37) — a permanent brick. Give a
-    // transient blip a few retries via the startInit backoff; on a persistent
-    // failure route to pairing so an operator can recover the device. Pairing
-    // is non-destructive: canPair() gates on the in-memory creds (both null
-    // here) and stored credentials are left untouched.
+    // value) means securePrefs.getString() itself threw — a VALUE-level
+    // decrypt failure reading an existing encrypted entry (per-value AEAD
+    // validation failing against a corrupted keyset). Unguarded, that
+    // rejection propagates into the startInit RECOVERING loop and retries
+    // FOREVER, never reaching the pairing fallback (F37) — a permanent brick.
+    // Route to pairing so an operator can recover the device.
+    //   NOTE: the other keystore failure mode — create()/master-key
+    //   invalidation at plugin load() — is NOT a reject. SecureStoragePlugin
+    //   .load() catches it and falls back to an empty (plaintext) store, so
+    //   get() returns {value:null} and the device already drops to pairing via
+    //   the no-credentials path below. This catch specifically covers the
+    //   value-level getString() throw. (See F39: the plaintext fallback is a
+    //   separate silent security-downgrade concern.)
+    // The bounded re-throw gives a transient blip a few retries via the
+    // startInit backoff first; pairing is non-destructive — canPair() gates on
+    // the in-memory creds (both null here) and stored credentials are untouched.
     const CRED_READ_MAX_RETRIES = 3;
     let storedToken: { value: string | null };
     let storedDeviceId: { value: string | null };

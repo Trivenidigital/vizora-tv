@@ -21,8 +21,12 @@ public class MainActivity extends BridgeActivity {
     // Guard against a tight renderer-death loop (a content item that OOMs the
     // renderer on every render). Static so it survives the activity relaunch
     // within the same process. elapsedRealtime is monotonic (clock-change safe).
+    // Seed one interval in the past — NOT 0 — because elapsedRealtime is ms since
+    // BOOT: with 0, a renderer death within the first 10s of boot would satisfy
+    // (now - 0 < interval) and wrongly skip the FIRST recovery. (-interval, not
+    // Long.MIN_VALUE, to avoid subtraction overflow.)
     private static final long RENDERER_RECOVERY_MIN_INTERVAL_MS = 10_000L;
-    private static long lastRendererRecoveryAt = 0L;
+    private static long lastRendererRecoveryAt = -RENDERER_RECOVERY_MIN_INTERVAL_MS;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
