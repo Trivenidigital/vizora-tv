@@ -4,6 +4,59 @@
  */
 
 /**
+ * Playback-identity signature (PD-1 + PD-7). Same signature = same content in the
+ * same order/timing, so re-applying it is a visual no-op — no rotation restart, no
+ * re-render flash, no duplicate content:impression.
+ *
+ * Includes contentId + order + duration AND `content.updatedAt` (PD-7): an in-place
+ * edit — a template's regenerated HTML or a file replacement — keeps the same
+ * content id and (id-keyed) url, so WITHOUT updatedAt the signature would collide
+ * and the reconnect re-push (the primary delivery path for edits, since
+ * content.updated doesn't push) would be absorbed as a no-op → edits never
+ * propagate. `updatedAt` is the mutation discriminator (auto-bumped on any content
+ * edit), so an edit changes the signature and re-renders. Name/loop don't affect
+ * frames and are excluded. Empty string for null/empty — never equals a real
+ * playlist's signature, so a stranded device (holding, currentPlaylist empty)
+ * always re-renders on a re-send.
+ */
+export function computePlaylistSignature(
+  p: {
+    id: string;
+    items?: Array<{
+      contentId: string;
+      order: number;
+      duration: number;
+      content?: { updatedAt?: string | number | null } | null;
+    }>;
+  } | null,
+): string {
+  if (!p || !p.items || p.items.length === 0) return '';
+  return `${p.id}|${p.items
+    .map((i) => `${i.contentId}@${i.order}x${i.duration}~${i.content?.updatedAt ?? ''}`)
+    .join(',')}`;
+}
+
+/**
+ * Version-wins decision (T2 idempotency layer) — the CLIENT half of the coherence
+ * model the server resolver produces. Apply the resolver's answer when it is a
+ * DIFFERENT playlist (schedule boundary / reassignment — always, even if its version
+ * is older) OR a NEWER version of the SAME playlist; ignore a same-or-older re-delivery
+ * of the same playlist (a stale push arriving after a pull, or an exact re-send — the
+ * PD-1/PD-7 re-flash this closes end-to-end because the CLIENT honors the version).
+ * Must match the server's shouldApplyContent (@vizora/database) exactly. ISO version
+ * strings compare chronologically as strings.
+ */
+export function shouldApplyContent(
+  incoming: { playlistId: string | null; version: string },
+  current: { playlistId: string | null; version: string } | null,
+): boolean {
+  if (incoming.playlistId == null) return false; // nothing to show
+  if (!current || current.playlistId == null) return true; // first content
+  if (incoming.playlistId !== current.playlistId) return true; // boundary / reassignment
+  return incoming.version > current.version; // same playlist → newer wins, older ignored
+}
+
+/**
  * Injects a Content-Security-Policy meta tag into HTML content.
  * Security model: iframe sandbox (allow-scripts only) + restrictive CSP.
  * This does NOT sanitize HTML — it relies on CSP to block network access

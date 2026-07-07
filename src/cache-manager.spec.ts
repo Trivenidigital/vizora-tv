@@ -205,6 +205,63 @@ describe('AndroidCacheManager', () => {
   });
 
   // -----------------------------------------------------------------------
+  // 1b. Tenant binding (P0-2 — docs/design/revocation-contract.md §2)
+  // -----------------------------------------------------------------------
+  describe('Tenant Binding', () => {
+    const seedTenantManifest = (tenantId: string, entries: Record<string, any>) => {
+      getFsTree()['DATA/content-cache/manifest.json'] = {
+        type: 'file',
+        data: JSON.stringify({ entries, version: 1, tenantId }),
+        size: 100,
+      };
+    };
+
+    it('purges the whole cache when the manifest belongs to a different tenant', async () => {
+      seedTenantManifest('tenant-A', { abc: makeEntry('abc', 'abc.png', 500) });
+      seedFile('abc.png', 500);
+
+      const cm = new AndroidCacheManager();
+      cm.setExpectedTenant('tenant-B');
+      await cm.init();
+
+      expect(cm.getCacheStats().itemCount).toBe(0);
+      // NEGATIVE: the other tenant's asset is not servable
+      expect(await cm.getCachedUri('abc')).toBeNull();
+    });
+
+    it('keeps the cache when the tenant matches', async () => {
+      seedTenantManifest('tenant-A', { abc: makeEntry('abc', 'abc.png', 500) });
+      seedFile('abc.png', 500);
+
+      const cm = new AndroidCacheManager();
+      cm.setExpectedTenant('tenant-A');
+      await cm.init();
+
+      expect(cm.getCacheStats().itemCount).toBe(1);
+    });
+
+    it('keeps a legacy cache when no expected tenant is set (pre-migration grace)', async () => {
+      seedManifest({ abc: makeEntry('abc', 'abc.png', 500) });
+      seedFile('abc.png', 500);
+
+      const cm = new AndroidCacheManager();
+      await cm.init();
+
+      expect(cm.getCacheStats().itemCount).toBe(1);
+    });
+
+    it('stamps the expected tenant into the manifest on download', async () => {
+      const cm = new AndroidCacheManager();
+      cm.setExpectedTenant('tenant-A');
+      await cm.downloadContent('vid1', 'https://cdn/x.png', 'image/png');
+
+      const manifestFile = getFsTree()['DATA/content-cache/manifest.json'];
+      expect(manifestFile).toBeDefined();
+      expect(JSON.parse(manifestFile.data!).tenantId).toBe('tenant-A');
+    });
+  });
+
+  // -----------------------------------------------------------------------
   // 2. Download & Cache
   // -----------------------------------------------------------------------
   describe('Download & Cache', () => {

@@ -33,7 +33,8 @@ const config: CapacitorConfig = {
     webContentsDebuggingEnabled: false,
     backgroundColor: '#1a1a2e',
     buildOptions: {
-      releaseType: 'APK',
+      // Play requires AAB for new apps; sideload/test APKs via gradlew assembleRelease
+      releaseType: 'AAB',
     },
   },
 };

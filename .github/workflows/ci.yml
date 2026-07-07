@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+jobs:
+  web:
+    name: Web (tsc + vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Unit tests
+        run: npx vitest run
+
+  android-unit-tests:
+    name: Android JVM unit tests (testDebugUnitTest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - run: npm ci
+      # cap sync generates the capacitor-cordova-android-plugins module
+      # (cordova.variables.gradle etc.), which is gitignored — Gradle needs it.
+      # cap copy needs dist/, so build the web app first.
+      - name: Build web + sync Capacitor Android
+        run: |
+          npm run build
+          npx cap sync android
+      - name: Make gradlew executable
+        run: chmod +x android/gradlew
+      - name: Run JVM unit tests (F36 RendererRecoveryGuard, etc.)
+        working-directory: android
+        run: ./gradlew testDebugUnitTest --no-daemon --stacktrace

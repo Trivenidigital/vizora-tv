@@ -19,7 +19,11 @@ import { CapacitorHttp, HttpResponse } from '@capacitor/core';
 import { io, Socket } from 'socket.io-client';
 import { AndroidCacheManager } from './cache-manager';
 import { SecureStorage } from './secure-storage';
-import { transformContentUrl, injectContentSecurityPolicy } from './utils';
+import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature, shouldApplyContent } from './utils';
+import { ScreenStateMachine } from './screen-state';
+import { initCrashReporting, setCrashReportingDevice, reportEvent } from './crash-reporting';
+
+initCrashReporting();
 
 declare const __APP_VERSION__: string;
 
@@ -56,6 +60,7 @@ interface PlaylistItem {
     thumbnail?: string;
     mimeType?: string;
     duration?: number;
+    updatedAt?: string; // PD-7: content-mutation discriminator for the playback signature
   } | null;
 }
 
@@ -96,6 +101,10 @@ interface LayoutZone {
 
 interface HeartbeatResponse {
   commands?: Array<{ type: string; payload?: Record<string, unknown>; [key: string]: unknown }>;
+  revoked?: boolean;
+  // T2: server sets this when the device's reported contentVersion has drifted from the
+  // authoritative resolveEffectiveContent version → the device re-pulls (self-heal).
+  reconcileContent?: boolean;
 }
 
 interface PerformanceMemory {
@@ -120,9 +129,35 @@ class VizoraAndroidTV {
 
   private currentPlaylist: Playlist | null = null;
   private currentIndex = 0;
+  // T2 version-wins: the authoritative content version currently rendered, so pull and
+  // push are reconciled by shouldApplyContent (a same-or-older re-delivery is a no-op).
+  private currentContentVersion = '';
+  private currentContentPlaylistId: string | null = null;
   private playbackTimer: ReturnType<typeof setTimeout> | null = null;
   private isOnline = true;
   private cacheManager = new AndroidCacheManager();
+
+  // Screen ownership state machine (P0-1) — the only screen-visibility authority
+  private machine: ScreenStateMachine;
+  // Playback engine state. `playbackGeneration` invalidates in-flight prepares
+  // when the playlist changes; `advanceInFlight`/`pendingRestart` serialize the
+  // advance loop so it can never run concurrently or recurse.
+  private playbackGeneration = 0;
+  private advanceInFlight = false;
+  private pendingRestart = false;
+  private currentItemCleanup: (() => void) | null = null;
+  private holdingRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private playbackSource: 'live' | 'cached' | 'hold-last' = 'cached';
+  private initRetryCount = 0;
+  private capacitorSetupDone = false;
+
+  // Trust / revocation state (P0-2 — docs/design/revocation-contract.md)
+  private tenantId: string | null = null;
+  private tenantSuspended = false;
+  private authProbeTimer: ReturnType<typeof setTimeout> | null = null;
+  private authProbeRetry = 0;
+  private lastConfirmProbeAt = 0;
+  private authDegradedSince = 0;
 
   // Temporary content push state
   private temporaryContent: PushContent | null = null;
@@ -132,14 +167,43 @@ class VizoraAndroidTV {
   // Pairing retry state
   private pairingRetryCount = 0;
 
-  private zoneTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
-  private zoneIndices: Map<string, number> = new Map();
   private dpadHandler: ((event: KeyboardEvent) => void) | null = null;
 
   constructor() {
+    this.machine = new ScreenStateMachine(
+      {
+        // Usable credentials = token AND deviceId (init connects only with
+        // both). A dangling token without an id must still be able to pair.
+        canPair: () => !(this.deviceToken && this.deviceId),
+        canPlay: () =>
+          !!(this.currentPlaylist?.items?.length) || this.temporaryContent != null,
+      },
+      (rec) => {
+        // Leaving PLAYING: heartbeat must stop claiming content is on glass.
+        if (rec.from === 'playing' && rec.to !== 'playing') {
+          this.currentContentId = null;
+        }
+        if (rec.from === 'holding' && this.holdingRetryTimer) {
+          clearTimeout(this.holdingRetryTimer);
+          this.holdingRetryTimer = null;
+        }
+      },
+    );
+    this.startInit();
+  }
+
+  /**
+   * Init with retry — a transient failure at boot must never dead-end on an
+   * error screen (F19). Backoff 5s -> 5min cap.
+   */
+  private startInit() {
     this.init().catch(err => {
-      console.error('[Vizora] Fatal initialization error:', err);
-      this.showError('Failed to initialize. Please restart the app.');
+      console.error('[Vizora] Initialization error, will retry:', err);
+      this.machine.transition('recovering', 'init_failure');
+      this.setHoldingMessage('Starting up — retrying…');
+      const delay = Math.min(5000 * Math.pow(2, this.initRetryCount), 300000);
+      this.initRetryCount = Math.min(this.initRetryCount + 1, 6);
+      setTimeout(() => this.startInit(), delay);
     });
   }
 
@@ -154,35 +218,86 @@ class VizoraAndroidTV {
 
     // Check for existing device token (from encrypted storage)
     await this.migrateCredentialsToSecureStorage();
-    const storedToken = await SecureStorage.get({ key: 'device_token' });
-    const storedDeviceId = await SecureStorage.get({ key: 'device_id' });
+    // Read credentials from encrypted storage. A REJECTION here (not a null
+    // value) means securePrefs.getString() itself threw — a VALUE-level
+    // decrypt failure reading an existing encrypted entry (per-value AEAD
+    // validation failing against a corrupted keyset). Unguarded, that
+    // rejection propagates into the startInit RECOVERING loop and retries
+    // FOREVER, never reaching the pairing fallback (F37) — a permanent brick.
+    // Route to pairing so an operator can recover the device.
+    //   NOTE: the other keystore failure mode — create()/master-key
+    //   invalidation at plugin load() — is NOT a reject. SecureStoragePlugin
+    //   .load() catches it and falls back to an empty (plaintext) store, so
+    //   get() returns {value:null} and the device already drops to pairing via
+    //   the no-credentials path below. This catch specifically covers the
+    //   value-level getString() throw. (See F39: the plaintext fallback is a
+    //   separate silent security-downgrade concern.)
+    // The bounded re-throw gives a transient blip a few retries via the
+    // startInit backoff first; pairing is non-destructive — canPair() gates on
+    // the in-memory creds (both null here) and stored credentials are untouched.
+    const CRED_READ_MAX_RETRIES = 3;
+    let storedToken: { value: string | null };
+    let storedDeviceId: { value: string | null };
+    try {
+      storedToken = await SecureStorage.get({ key: 'device_token' });
+      storedDeviceId = await SecureStorage.get({ key: 'device_id' });
+    } catch (err) {
+      if (this.initRetryCount < CRED_READ_MAX_RETRIES) {
+        throw err; // transient — let startInit retry init()
+      }
+      console.error('[Vizora] SecureStorage credential read failing persistently — routing to pairing (F37):', err);
+      reportEvent('secure_storage_read_failed', { retries: this.initRetryCount });
+      await SplashScreen.hide();
+      this.initRetryCount = 0;
+      this.startPairing();
+      return;
+    }
 
     this.deviceToken = storedToken.value;
     this.deviceId = storedDeviceId.value;
+    setCrashReportingDevice(this.deviceId);
 
     if (this.deviceToken && this.deviceId) {
       console.log('[Vizora] Found existing device credentials, connecting...');
 
-      // Restore last playlist for offline resilience
+      const storedTenant = await SecureStorage.get({ key: 'tenant_id' });
+      this.tenantId = storedTenant.value;
+      this.cacheManager.setExpectedTenant(this.tenantId);
+
+      // Restore last playlist for offline resilience — tenant-bound (F4):
+      // refuse to render a playlist issued under a different tenant, no
+      // matter how it got here (re-pair, restored backup, cloned image).
       try {
         const lastPlaylist = await Preferences.get({ key: 'last_playlist' });
         if (lastPlaylist.value) {
-          this.currentPlaylist = JSON.parse(lastPlaylist.value);
-          console.log('[Vizora] Restored last playlist from storage');
+          const parsed = JSON.parse(lastPlaylist.value);
+          const envelope = parsed && typeof parsed === 'object' && 'playlist' in parsed
+            ? (parsed as { tenantId?: string; playlist: unknown })
+            : { tenantId: undefined, playlist: parsed }; // pre-envelope format: migration grace (§2)
+          if (envelope.tenantId && this.tenantId && envelope.tenantId !== this.tenantId) {
+            console.warn('[Vizora] Cached playlist belongs to a different tenant — purging (F4)');
+            reportEvent('tenant_mismatch_purge', { cachedTenant: envelope.tenantId });
+            await Preferences.remove({ key: 'last_playlist' });
+            await this.cacheManager.clearCache();
+          } else {
+            this.currentPlaylist = this.validatePlaylist(envelope.playlist);
+            this.playbackSource = 'cached';
+            console.log('[Vizora] Restored last playlist from storage');
+          }
         }
       } catch (err) {
         console.warn('[Vizora] Failed to restore last playlist:', err);
       }
 
-      // Show content screen after playlist restore to avoid blank flash
-      // (also prevents showing pairing screen on restart — BUG #7)
-      this.showScreen('content');
-
-      // Start playback immediately from restored playlist (don't wait for WebSocket).
-      // The connect handler also calls playContent() as a fallback, but starting here
-      // ensures content is visible even if the WebSocket connection is slow or offline.
+      // Start playback immediately from the restored playlist (don't wait for
+      // the WebSocket — BUG #7). The loading screen stays up until the first
+      // frame commits; the machine enters PLAYING at commit time, so there is
+      // no window where the content screen shows an empty container.
       if (this.currentPlaylist && this.currentPlaylist.items?.length > 0) {
-        this.playContent();
+        void this.advance();
+      } else {
+        this.machine.transition('holding', 'boot_no_cached_playlist');
+        this.setHoldingMessage('Connecting…');
       }
 
       this.connectToRealtime();
@@ -193,6 +308,7 @@ class VizoraAndroidTV {
 
     // Hide splash screen
     await SplashScreen.hide();
+    this.initRetryCount = 0;
   }
 
   private async loadConfig() {
@@ -220,6 +336,9 @@ class VizoraAndroidTV {
   }
 
   private async setupCapacitor() {
+    // Init retries must not double-register listeners (F19 retry path)
+    if (this.capacitorSetupDone) return;
+
     // Setup network status monitoring
     Network.addListener('networkStatusChange', (status) => {
       console.log('[Vizora] Network status changed:', status);
@@ -253,6 +372,8 @@ class VizoraAndroidTV {
       // Don't exit the app on back button
       console.log('[Vizora] Back button pressed, ignoring...');
     });
+
+    this.capacitorSetupDone = true;
 
     // Setup D-pad navigation
     this.setupDpadNavigation();
@@ -372,12 +493,18 @@ class VizoraAndroidTV {
   }
 
   private async startPairing() {
-    this.showScreen('pairing');
+    // Guarded: a credentialed device can never land on the pairing screen.
+    if (!this.machine.transition('pairing', 'pairing_requested')) {
+      return;
+    }
     this.stopPairingCountdown();
     this.updateStatus('connecting', 'Requesting pairing code...');
 
     if (!this.isOnline) {
-      this.showError('No network connection. Please check your network settings.');
+      // Stay on the pairing screen (deliberate branded surface) — no error screen.
+      this.updateStatus('offline', 'No network connection — retrying…');
+      const countdownEl = document.getElementById('pairing-countdown');
+      if (countdownEl) countdownEl.textContent = 'Waiting for network…';
       const delay = this.getPairingRetryDelay();
       this.pairingRetryCount = Math.min(this.pairingRetryCount + 1, 6);
       console.log(`[Vizora] Pairing retry in ${delay}ms (attempt ${this.pairingRetryCount})`);
@@ -449,7 +576,10 @@ class VizoraAndroidTV {
       this.updateStatus('connecting', 'Waiting for pairing...');
     } catch (error) {
       console.error('[Vizora] Pairing request failed:', error);
-      this.showError('Failed to request pairing code. Retrying...');
+      // Stay on the pairing screen — status line reports the retry.
+      this.updateStatus('offline', 'Pairing request failed — retrying…');
+      const countdownEl = document.getElementById('pairing-countdown');
+      if (countdownEl) countdownEl.textContent = 'Retrying…';
       const delay = this.getPairingRetryDelay();
       this.pairingRetryCount = Math.min(this.pairingRetryCount + 1, 6);
       console.log(`[Vizora] Pairing retry in ${delay}ms (attempt ${this.pairingRetryCount})`);
@@ -558,8 +688,15 @@ class VizoraAndroidTV {
         const responseBody = response.data;
         const data = responseBody?.data ?? responseBody;
 
+        // Overlapping poll continuations can resume after pairing already
+        // succeeded (async interval callbacks are not serialized) — only the
+        // first wins, otherwise the success path runs twice and churns the
+        // socket connection.
+        if (!this.pairingCode) return;
+
         if (data.status === 'paired' && typeof data.deviceToken === 'string' && data.deviceToken) {
           console.log('[Vizora] Device paired successfully!');
+          this.pairingCode = null;
           this.stopPairingCheck();
           this.stopPairingCountdown();
           this.pairingRetryCount = 0;
@@ -572,6 +709,14 @@ class VizoraAndroidTV {
           // Store credentials in encrypted storage
           await SecureStorage.set({ key: 'device_token', value: data.deviceToken });
           await SecureStorage.set({ key: 'device_id', value: this.deviceId || '' });
+          // Tenant identity binds the cache/playlist (contract §2). Absent on
+          // the legacy backend — the load-time check degrades to grace mode.
+          if (typeof data.tenantId === 'string' && data.tenantId) {
+            this.tenantId = data.tenantId;
+            await SecureStorage.set({ key: 'tenant_id', value: data.tenantId });
+          }
+          this.cacheManager.setExpectedTenant(this.tenantId);
+          setCrashReportingDevice(this.deviceId);
 
           this.connectToRealtime();
         }
@@ -631,22 +776,101 @@ class VizoraAndroidTV {
       const heartbeatData = {
         uptime: uptimeSeconds,
         appVersion: typeof __APP_VERSION__ !== 'undefined' ? __APP_VERSION__ : '1.0.0',
+        // T2 heartbeat-reconcile: report the content version currently rendered so the
+        // server can compare against resolveEffectiveContent and, on drift, tell this
+        // device to re-pull — the self-heal for a connected-but-flaky device that never
+        // dropped its socket (Finding-2 residual 1). Server side wires the compare.
+        contentVersion: this.currentContentVersion,
         metrics: {
           cpuUsage: 0, // not available in browser/WebView context
           memoryUsage,
         },
+        // Screen truth for the backend: which state owns the glass and where
+        // the playing content came from. currentContent is cleared whenever
+        // the machine leaves PLAYING, so a dark engine can no longer report
+        // stale "now playing" data (F13 partial; full enrichment is P1-1).
+        screenState: this.machine.state,
+        playbackSource: this.playbackSource,
         currentContent: this.currentContentId
           ? { contentId: this.currentContentId }
           : undefined,
       };
 
       this.socket.emit('heartbeat', heartbeatData, (response: HeartbeatResponse) => {
-        if (response && response.commands) {
-          response.commands.forEach((cmd) => this.handleCommand(cmd));
+        // The server wraps the ack payload in `.data` (createSuccessResponse), so read
+        // from there; fall back to the top level so this is robust either way (a legacy
+        // unwrapped ack still works). Read revoked/commands/reconcileContent all from the
+        // SAME unwrapped envelope — reading revoked/commands from the raw top level
+        // silently dropped ack-piggybacked commands whenever the server wrapped them
+        // (audit 2026-07-06, backend Q#3).
+        const ack = ((response as unknown as { data?: HeartbeatResponse })?.data ?? response) as
+          | HeartbeatResponse
+          | undefined;
+        if (ack && ack.revoked) {
+          void this.confirmRevocation('heartbeat_ack');
+        }
+        if (ack && ack.commands) {
+          ack.commands.forEach((cmd) => this.handleCommand(cmd));
+        }
+        // T2 heartbeat-reconcile: the server saw our contentVersion drift from the
+        // authoritative version → re-pull (self-heal without a disconnect). Fails safe.
+        if (ack && ack.reconcileContent) {
+          void this.pullContent();
         }
       });
     } catch (error) {
       console.error('[Vizora] Error sending heartbeat:', error);
+    }
+  }
+
+  /**
+   * T2 pull: fetch the device's AUTHORITATIVE effective content (the same resolver
+   * realtime pushes) and apply it via version-wins. Called on connect, on a heartbeat
+   * reconcile signal (the server detected the rendered version drifted from truth — the
+   * connected-but-flaky-never-drops self-heal), and it is the backstop the whole
+   * delivery model rests on. FAILS SAFE: on any error the device keeps playing
+   * last-known-good — it NEVER blanks (never-black on the reconcile path).
+   */
+  private async pullContent(): Promise<void> {
+    if (!this.deviceToken || !this.isOnline) return;
+    try {
+      const response: HttpResponse = await CapacitorHttp.get({
+        url: `${this.config.apiUrl}/api/v1/devices/me/content`,
+        headers: { Authorization: `Bearer ${this.deviceToken}` },
+        connectTimeout: 10000,
+        readTimeout: 10000,
+      });
+      if (response.status < 200 || response.status >= 300) {
+        console.warn(`[Vizora] pullContent non-2xx (${response.status}) — keeping last-known-good`);
+        return; // fail safe
+      }
+      const body = response.data;
+      const payload = body?.data ?? body; // unwrap { success, data } envelope
+      this.applyPulledContent(payload);
+    } catch (error) {
+      // Fail safe: a reconcile/pull failure NEVER blanks the screen — keep last-known-good.
+      console.warn('[Vizora] pullContent failed — keeping last-known-good:', error);
+    }
+  }
+
+  /**
+   * Apply an effective-content payload (pull, or a versioned push) via version-wins
+   * (shouldApplyContent). A same-or-older re-delivery of the same playlist is a NO-OP
+   * (no re-flash, no duplicate content:impression — the PD-1/PD-7 close, now honored on
+   * the CLIENT so the whole coherence model is closed end-to-end). A different playlist
+   * (schedule boundary / reassignment) or a newer version applies.
+   */
+  private applyPulledContent(
+    payload: { version?: string; playlist?: Playlist | null } | null | undefined,
+  ): void {
+    if (!payload) return;
+    const incoming = { playlistId: payload.playlist?.id ?? null, version: payload.version ?? '' };
+    const current = { playlistId: this.currentContentPlaylistId, version: this.currentContentVersion };
+    if (!shouldApplyContent(incoming, current)) return; // stale/duplicate → no-op, no re-flash
+    this.currentContentVersion = incoming.version;
+    this.currentContentPlaylistId = incoming.playlistId;
+    if (payload.playlist) {
+      this.updatePlaylist(payload.playlist);
     }
   }
 
@@ -663,10 +887,9 @@ class VizoraAndroidTV {
       console.log('[Vizora] Offline, will retry when network is available');
       this.updateStatus('offline', 'No network connection');
       // Start playback from restored playlist if available
-      if (this.currentPlaylist && this.currentPlaylist.items?.length > 0 && !this.playbackTimer) {
+      if (this.currentPlaylist && this.currentPlaylist.items?.length > 0) {
         console.log('[Vizora] Starting offline playback from restored playlist');
-        this.showScreen('content');
-        this.playContent();
+        this.ensurePlaying();
       }
       return;
     }
@@ -704,13 +927,23 @@ class VizoraAndroidTV {
         this.offlineTimeout = null;
       }
       this.hideOfflineOverlay();
-      this.showScreen('content');
+      this.exitAuthDegraded();
       this.startHeartbeat();
 
-      // If we have a restored playlist from offline, start playback while waiting for server update
-      if (this.currentPlaylist && this.currentPlaylist.items?.length > 0 && !this.playbackTimer) {
-        console.log('[Vizora] Starting playback from restored playlist');
-        this.playContent();
+      // T2 pull-on-connect: fetch the authoritative effective content on every
+      // (re)connect and apply it via version-wins. This makes delivery resilient to any
+      // single push's fate (closes Finding-2's reconnect strand + C-7 on the pull side);
+      // push remains the low-latency fast-path. Fails safe — keeps last-known-good.
+      void this.pullContent();
+
+      if (this.currentPlaylist && this.currentPlaylist.items?.length > 0) {
+        // Restored/ongoing playlist — keep or start playing while waiting for
+        // a server update. The machine enters PLAYING when a frame commits.
+        this.ensurePlaying();
+      } else if (!this.temporaryContent) {
+        // Paired but nothing assigned: branded holding, never a bare black
+        // content screen (F11).
+        this.enterHolding('paired_no_playlist');
       }
     });
 
@@ -729,17 +962,45 @@ class VizoraAndroidTV {
       }, 60_000);
     });
 
-    this.socket.on('connect_error', async (error) => {
+    this.socket.on('connect_error', (error) => {
       console.error('[Vizora] Connection error:', error);
       this.updateStatus('offline', 'Connection failed');
 
-      if (error.message.includes('unauthorized') || error.message.includes('invalid token')) {
-        console.log('[Vizora] Token invalid, clearing credentials...');
-        await SecureStorage.remove({ key: 'device_token' });
-        await SecureStorage.remove({ key: 'device_id' });
-        this.deviceToken = null;
-        this.deviceId = null;
-        setTimeout(() => this.startPairing(), 2000);
+      const code = (error as { data?: { code?: string } }).data?.code;
+
+      if (code === 'DEVICE_REVOKED') {
+        void this.confirmRevocation('connect_error');
+        return;
+      }
+      if (code === 'TENANT_SUSPENDED') {
+        this.enterTenantSuspended('connect_error');
+        return;
+      }
+      // AUTH_EXPIRED / AUTH_INVALID / unknown codes / legacy message strings:
+      // transport-layer by default (contract §1.5a). Credentials untouched,
+      // the cached loop keeps playing (F3 fix), and the REST probe
+      // disambiguates in the background.
+      if (code) reportEvent('auth_degraded_signal', { code });
+      this.scheduleAuthProbe();
+    });
+
+    this.socket.on('device:revoked', (payload) => {
+      console.warn('[Vizora] device:revoked received:', payload);
+      void this.confirmRevocation('device_revoked_event');
+    });
+
+    this.socket.on('tenant:suspended', () => {
+      this.enterTenantSuspended('tenant_suspended_event');
+    });
+
+    this.socket.on('tenant:resumed', () => {
+      console.log('[Vizora] Tenant resumed');
+      reportEvent('tenant_resumed', {});
+      this.tenantSuspended = false;
+      if (this.currentPlaylist?.items?.length) {
+        void this.advance();
+      } else {
+        this.enterHolding('paired_no_playlist');
       }
     });
 
@@ -752,7 +1013,21 @@ class VizoraAndroidTV {
 
     this.socket.on('playlist:update', (data) => {
       console.log('[Vizora] Received playlist update:', data);
-      this.updatePlaylist(data.playlist);
+      const playlist = this.validatePlaylist(data?.playlist);
+      if (!playlist) {
+        // A malformed push must be inert — current playback continues (F6).
+        console.warn('[Vizora] Ignoring malformed playlist:update payload');
+        return;
+      }
+      // A VERSIONED push (T2 sendInitialState / future push paths) goes through the same
+      // version-wins as the pull, so a same-version push arriving after a pull does NOT
+      // re-apply (no re-flash). A legacy push without a version falls back to
+      // updatePlaylist, whose signature no-op still absorbs an identical re-send (PD-1).
+      if (typeof data?.version === 'string' && data.version) {
+        this.applyPulledContent({ version: data.version, playlist });
+      } else {
+        this.updatePlaylist(playlist);
+      }
     });
 
     this.socket.on('command', (command) => {
@@ -766,15 +1041,288 @@ class VizoraAndroidTV {
     });
   }
 
-  // ==================== PLAYBACK ====================
+  // ==================== TRUST / REVOCATION (P0-2) ====================
+  //
+  // Contract: docs/design/revocation-contract.md. The invariants enforced
+  // here: no credential wipe without a 410 confirmation from auth-check
+  // (§1.5/§3.4); anything unclassified is transport-layer (§1.5a); tenant
+  // binding is verified at load time (§1.4/§2).
+
+  /** GET /devices/auth/check — returns HTTP status, or null if unreachable. */
+  private async runAuthCheck(): Promise<number | null> {
+    if (!this.deviceToken) return null;
+    try {
+      const response: HttpResponse = await CapacitorHttp.get({
+        url: `${this.config.apiUrl}/api/v1/devices/auth/check`,
+        headers: { Authorization: `Bearer ${this.deviceToken}` },
+        connectTimeout: 10000,
+        readTimeout: 10000,
+      });
+      // Mechanical gate for the §7.1a carve-out: once this device has ever
+      // seen the auth-check endpoint respond (backend item §6.4 deployed),
+      // remember it — a later 404 can then only mean an anomaly, never
+      // "legacy backend", and the carve-out refuses to fire.
+      if (response.status === 200 || response.status === 401 || response.status === 403 || response.status === 410) {
+        Preferences.set({ key: 'auth_check_seen', value: '1' }).catch(() => {});
+      }
+      return response.status;
+    } catch (err) {
+      console.warn('[Vizora] Auth check unreachable:', err);
+      return null;
+    }
+  }
+
+  /**
+   * Confirm-then-purge (§3.4). Every revocation signal funnels through here;
+   * only a 410 destroys device state. Rate-limited to one confirmation probe
+   * per 5 minutes regardless of signal volume (§3.3).
+   */
+  private async confirmRevocation(source: string): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastConfirmProbeAt < 5 * 60_000) {
+      console.warn(`[Vizora] Revocation signal (${source}) dropped — confirmation rate limit`);
+      return;
+    }
+    this.lastConfirmProbeAt = now;
+
+    const status = await this.runAuthCheck();
+
+    if (status === 410) {
+      await this.purgeDeviceState(`revocation_confirmed:${source}`);
+      if (source === 'unpair_command') {
+        window.location.reload();
+      } else {
+        this.startPairing();
+      }
+      return;
+    }
+
+    // §7.1a migration carve-out: operator-initiated unpair on the
+    // authenticated socket is honored against a legacy backend that has no
+    // auth-check endpoint (404). Self-disabling: once `auth_check_seen` is
+    // set (the endpoint responded at least once — backend §6.4 is live), a
+    // 404 is an anomaly and the carve-out refuses.
+    // TODO(remove with backend item §6.4 fleet-wide): delete this branch and
+    // the `auth_check_seen` flag once no legacy backends remain.
+    if (status === 404 && source === 'unpair_command') {
+      const seen = await Preferences.get({ key: 'auth_check_seen' }).catch(() => ({ value: null }));
+      if (seen.value === '1') {
+        console.warn('[Vizora] unpair carve-out REFUSED — auth-check endpoint was previously available');
+        reportEvent('legacy_carveout_refused', { source });
+        return;
+      }
+      await this.purgeDeviceState('unpair_legacy_backend');
+      window.location.reload();
+      return;
+    }
+
+    console.warn(`[Vizora] Revocation signal (${source}) NOT confirmed (auth-check=${status}) — keeping state`);
+    reportEvent('revocation_unconfirmed', { source, authCheckStatus: status });
+  }
+
+  /**
+   * Background disambiguation loop for auth-degraded mode (§5): backoff
+   * 30s -> 15min with ±25% jitter. Playback continues from cache throughout.
+   */
+  private scheduleAuthProbe() {
+    if (this.authProbeTimer || !this.deviceToken) return;
+    if (!this.authDegradedSince) {
+      this.authDegradedSince = Date.now();
+      reportEvent('auth_degraded_enter', {});
+    }
+    const base = Math.min(30_000 * Math.pow(2, this.authProbeRetry), 900_000);
+    const jitter = base * 0.25 * (Math.random() * 2 - 1);
+    const delay = Math.round(base + jitter);
+    this.authProbeRetry = Math.min(this.authProbeRetry + 1, 5);
+    console.log(`[Vizora] Auth probe scheduled in ${delay}ms`);
+
+    this.authProbeTimer = setTimeout(async () => {
+      this.authProbeTimer = null;
+      const status = await this.runAuthCheck();
+
+      if (status === 200) {
+        this.exitAuthDegraded();
+        if (!this.socket?.connected) this.connectToRealtime();
+        return;
+      }
+      if (status === 410) {
+        await this.purgeDeviceState('auth_check_revoked');
+        this.startPairing();
+        return;
+      }
+      if (status === 403) {
+        this.enterTenantSuspended('auth_check');
+      }
+      if (status === 404) {
+        // Legacy backend — the endpoint teaches us nothing; stop probing and
+        // let the socket reconnection loop carry recovery.
+        console.log('[Vizora] Auth-check endpoint absent (legacy backend) — probe loop stopped');
+        return;
+      }
+      if (status === 401) {
+        // Fail-open by contract (§1.5a / F3): a 401 is the generic auth-hiccup
+        // status any gateway/proxy/token-validator emits — treating it as
+        // revocation would de-pair the whole fleet on a transient blip. ONLY a
+        // 410 (confirmed revocation) purges. NEVER purge or re-pair here. The
+        // one thing we add is observability: distinct telemetry so an operator
+        // can tell a rejected token from a transport blip; recovery is a human
+        // re-pair or a server-side re-issue, not an auto-wipe. Fall through to
+        // the shared degraded tail (24h badge + reschedule).
+        reportEvent('auth_check_401', {
+          degradedForSeconds: this.authDegradedSince
+            ? Math.round((Date.now() - this.authDegradedSince) / 1000)
+            : 0,
+        });
+      }
+
+      // 24h continuously degraded: unobtrusive badge, cached loop continues (§5)
+      if (this.authDegradedSince && Date.now() - this.authDegradedSince > 24 * 3600_000) {
+        this.showAuthDegradedBadge();
+      }
+      this.scheduleAuthProbe();
+    }, delay);
+  }
+
+  private exitAuthDegraded() {
+    if (this.authProbeTimer) {
+      clearTimeout(this.authProbeTimer);
+      this.authProbeTimer = null;
+    }
+    this.authProbeRetry = 0;
+    if (this.authDegradedSince) {
+      reportEvent('auth_degraded_exit', {
+        degradedForSeconds: Math.round((Date.now() - this.authDegradedSince) / 1000),
+      });
+      this.authDegradedSince = 0;
+    }
+    this.hideAuthDegradedBadge();
+  }
+
+  /** Tenant suspension: fail closed for rendering, keep credentials (§3.1). */
+  private enterTenantSuspended(source: string) {
+    console.warn('[Vizora] Tenant suspended:', source);
+    reportEvent('tenant_suspended', { source });
+    this.tenantSuspended = true;
+    this.enterHolding('tenant_suspended');
+    this.setHoldingMessage('Display paused — contact your administrator');
+  }
+
+  /**
+   * Destroy all tenant-bound device state. Only reachable via a confirmed
+   * revocation (§3.4) or the legacy unpair carve-out (§7.1a).
+   */
+  private async purgeDeviceState(reason: string) {
+    console.warn('[Vizora] Purging device state:', reason);
+    reportEvent('device_purged', { reason });
+
+    // Halt playback first: no further frame of this tenant's content renders.
+    this.playbackGeneration++;
+    if (this.playbackTimer) {
+      clearTimeout(this.playbackTimer);
+      this.playbackTimer = null;
+    }
+    if (this.temporaryContentTimer) {
+      clearTimeout(this.temporaryContentTimer);
+      this.temporaryContentTimer = null;
+    }
+    this.exitAuthDegraded();
+    this.tenantSuspended = false;
+    this.currentPlaylist = null;
+    this.savedPlaylistState = null;
+    this.temporaryContent = null;
+    this.deviceToken = null;
+    this.deviceId = null;
+    this.tenantId = null;
+    setCrashReportingDevice(null);
+
+    if (this.socket) {
+      this.stopHeartbeat();
+      this.socket.removeAllListeners();
+      this.socket.disconnect();
+      this.socket = null;
+    }
+
+    await SecureStorage.remove({ key: 'device_token' });
+    await SecureStorage.remove({ key: 'device_id' });
+    await SecureStorage.remove({ key: 'tenant_id' });
+    await Preferences.remove({ key: 'last_playlist' });
+    await this.cacheManager.clearCache();
+  }
+
+  private showAuthDegradedBadge() {
+    if (document.getElementById('auth-degraded-badge')) return;
+    const badge = document.createElement('div');
+    badge.id = 'auth-degraded-badge';
+    badge.style.cssText = 'position:fixed;bottom:16px;left:16px;background:rgba(0,0,0,0.7);color:#ccc;padding:8px 14px;border-radius:8px;font-size:14px;z-index:9999;';
+    badge.textContent = 'Check display registration — see dashboard';
+    document.body.appendChild(badge);
+  }
+
+  private hideAuthDegradedBadge() {
+    const badge = document.getElementById('auth-degraded-badge');
+    if (badge) badge.remove();
+  }
+
+  // ==================== PLAYBACK ENGINE ====================
+  //
+  // Structure (docs/design/playback-state-machine.md):
+  //  - advance(): bounded scan for the next renderable item — recursion-free.
+  //  - prepare(): builds the item's DOM off-screen; the previous frame stays
+  //    visible for the whole cache/download/decode wait.
+  //  - commitItem(): the ONLY place content leaves the container — appends the
+  //    ready replacement first, then removes the old frame.
+  //  - completeItem(): duration/onended handler, schedules the next advance.
+  // A full scan with nothing renderable lands in branded HOLDING, never black.
+
+  /** Wait budget for readiness before committing optimistically. */
+  private static readonly READY_WAIT_MS: Record<string, number> = {
+    image: 1500,
+    video: 4000,
+  };
+
+  private validatePlaylist(raw: unknown): Playlist | null {
+    if (!raw || typeof raw !== 'object') return null;
+    const candidate = raw as Partial<Playlist>;
+    if (!Array.isArray(candidate.items)) return null;
+    return candidate as Playlist;
+  }
 
   private async updatePlaylist(playlist: Playlist) {
+    // PD-1 idempotency: a redundant delivery of the playlist ALREADY playing must
+    // be a no-op — no rotation restart, no re-render flash, no duplicate
+    // content:impression. The Finding-2 backend fix deliberately re-sends the
+    // authoritative playlist on reconnect (best-effort pending + DB re-send); if
+    // the device already has it, absorb it silently. This is the elegant half of
+    // that fix: it distinguishes "already rendered" (signature matches → no-op)
+    // from "stranded" (device holding → currentPlaylist empty → signature differs
+    // → render). An EDITED playlist (same id, changed items) has a different
+    // signature and still re-renders.
+    const incomingSig = computePlaylistSignature(playlist);
+    if (incomingSig && incomingSig === computePlaylistSignature(this.currentPlaylist)) {
+      // Keep the running rotation; only nudge the engine if it somehow parked
+      // (ensurePlaying resumes from the current index — it does NOT reset to 0).
+      this.playbackSource = 'live';
+      this.ensurePlaying();
+      return;
+    }
+
     this.currentPlaylist = playlist;
     this.currentIndex = 0;
+    this.playbackGeneration++; // invalidate any in-flight prepare
+    this.playbackSource = 'live';
 
-    // Persist playlist for offline resilience
+    // Persist playlist for offline resilience, tenant-bound (contract §2):
+    // the envelope's tenantId is verified at load time before any render.
     try {
-      await Preferences.set({ key: 'last_playlist', value: JSON.stringify(playlist) });
+      await Preferences.set({
+        key: 'last_playlist',
+        value: JSON.stringify({
+          tenantId: this.tenantId ?? undefined,
+          deviceId: this.deviceId ?? undefined,
+          savedAt: Date.now(),
+          playlist,
+        }),
+      });
     } catch (err) {
       console.warn('[Vizora] Failed to persist playlist:', err);
     }
@@ -784,130 +1332,253 @@ class VizoraAndroidTV {
       this.playbackTimer = null;
     }
 
-    const container = document.getElementById('content-container');
-    if (container) {
-      this.cleanupMediaElements(container);
-      container.innerHTML = '';
-    }
-
     if (playlist.items && playlist.items.length > 0) {
-      this.showScreen('content');
-      this.playContent();
+      // Old content stays on screen until the first new item commits (F9).
+      void this.advance();
       // Preload upcoming content
       this.preloadContent(playlist.items.slice(0, 5));
     } else {
-      console.log('[Vizora] Playlist is empty');
+      console.log('[Vizora] Playlist is empty — holding');
+      this.enterHolding('empty_playlist');
     }
   }
 
-  private async playContent() {
-    if (!this.currentPlaylist || !this.currentPlaylist.items) {
+  /** Kick the engine if it is parked (no timer pending, no advance running). */
+  private ensurePlaying() {
+    if (!this.playbackTimer && !this.advanceInFlight) {
+      void this.advance();
+    }
+  }
+
+  /**
+   * Find and commit the next renderable item. Scans at most items.length
+   * entries (F7: no recursion, no unbounded loop); exhaustion => HOLDING (F5).
+   */
+  private async advance(): Promise<void> {
+    if (this.advanceInFlight) {
+      this.pendingRestart = true;
       return;
     }
+    this.advanceInFlight = true;
+    try {
+      // Fail closed while the tenant is suspended: no rendering, branded
+      // holding until an explicit resume signal (contract §3.1/§4).
+      if (this.tenantSuspended) {
+        this.machine.transition('holding', 'tenant_suspended');
+        return;
+      }
+      const gen = this.playbackGeneration;
+      const playlist = this.currentPlaylist;
+      const container = document.getElementById('content-container');
+      if (!playlist || !playlist.items || playlist.items.length === 0 || !container) {
+        this.enterHolding('no_playlist');
+        return;
+      }
+      const items = playlist.items;
 
-    const items = this.currentPlaylist.items;
-    if (items.length === 0) return;
+      for (let step = 0; step < items.length; step++) {
+        const idx = (this.currentIndex + step) % items.length;
+        const item = items[idx];
+        if (!item || !item.content) continue;
 
-    const currentItem = items[this.currentIndex];
-    const container = document.getElementById('content-container');
+        const prepared = await this.prepare(item, gen);
+        if (gen !== this.playbackGeneration) {
+          prepared?.cleanup();
+          return; // superseded by a newer playlist
+        }
+        if (!prepared) continue; // unrenderable — skip without touching the DOM
 
-    if (!container || !currentItem || !currentItem.content) {
-      this.nextContent();
-      return;
+        this.currentIndex = idx;
+        this.commitItem(container, item, prepared);
+        return;
+      }
+
+      console.warn('[Vizora] No renderable content in playlist — holding');
+      reportEvent('playback_holding', { reason: 'no_renderable_content', playlistId: playlist.id });
+      this.enterHolding('no_renderable_content');
+    } finally {
+      this.advanceInFlight = false;
+      if (this.pendingRestart) {
+        this.pendingRestart = false;
+        void this.advance();
+      }
+    }
+  }
+
+  /**
+   * Build an item's DOM detached from the screen and wait (bounded) for it to
+   * become renderable. Returns null to skip the item — the screen is never
+   * touched on the skip path.
+   */
+  private async prepare(
+    item: PlaylistItem,
+    gen: number,
+  ): Promise<{ el: HTMLElement; cleanup: () => void } | null> {
+    const content = item.content!;
+
+    if (content.type === 'layout') {
+      return this.prepareLayout(item);
     }
 
-    console.log(`[Vizora] Playing content ${this.currentIndex + 1}/${items.length}: ${currentItem.content.name}`);
+    try {
+      const contentDiv = document.createElement('div');
+      contentDiv.className = 'content-item';
+
+      const { ready } = await this.renderContentToDiv(content, contentDiv, {
+        useCache: true,
+        onVideoEnd: () => {
+          if (gen !== this.playbackGeneration) return;
+          if (this.playbackTimer) {
+            clearTimeout(this.playbackTimer);
+            this.playbackTimer = null;
+          }
+          this.completeItem(item);
+        },
+        onError: () => this.handleContentError(gen, content.id),
+      });
+
+      const waitMs = VizoraAndroidTV.READY_WAIT_MS[content.type] ?? 0;
+      const result = await Promise.race([ready, this.timeoutAfter(waitMs)]);
+
+      if (result === 'error') return null;
+      // 'ready' or 'timeout' — commit (timeout = optimistic commit; the asset
+      // may still paint, and post-commit errors advance via onError).
+      return {
+        el: contentDiv,
+        cleanup: () => this.cleanupMediaElements(contentDiv),
+      };
+    } catch (err) {
+      console.warn(`[Vizora] Failed to prepare content ${content.id}:`, err);
+      return null;
+    }
+  }
+
+  private timeoutAfter(ms: number): Promise<'timeout'> {
+    return new Promise(resolve => setTimeout(() => resolve('timeout'), ms));
+  }
+
+  /** Post-commit content failure (e.g. video stream dies mid-play): skip forward. */
+  private handleContentError(gen: number, contentId: string) {
+    if (gen !== this.playbackGeneration) return;
+    if (this.currentContentId !== contentId) return; // pre-commit error — prepare() handles it
+    console.warn(`[Vizora] Content ${contentId} failed after commit — advancing`);
+    if (this.playbackTimer) {
+      clearTimeout(this.playbackTimer);
+      this.playbackTimer = null;
+    }
+    this.completeItem(this.currentPlaylist?.items?.[this.currentIndex] ?? null);
+  }
+
+  /**
+   * The only mutation site for the content container: append the ready
+   * replacement, THEN remove the old frame (never-black by construction),
+   * then run the previous item's cleanup (zone timers, media release — F12).
+   */
+  private commitItem(
+    container: HTMLElement,
+    item: PlaylistItem,
+    prepared: { el: HTMLElement; cleanup: () => void },
+  ) {
+    const content = item.content!;
+    const items = this.currentPlaylist?.items ?? [];
+    console.log(`[Vizora] Playing content ${this.currentIndex + 1}/${items.length}: ${content.name}`);
+
+    const oldChildren = Array.from(container.children) as HTMLElement[];
+    container.appendChild(prepared.el);
+    for (const child of oldChildren) {
+      container.removeChild(child);
+    }
+    const oldCleanup = this.currentItemCleanup;
+    this.currentItemCleanup = prepared.cleanup;
+    oldCleanup?.();
+
+    this.machine.transition('playing', 'content_committed');
 
     // Track current content for heartbeat reporting
-    this.currentContentId = currentItem.content.id;
+    this.currentContentId = content.id;
     this.contentStartTime = Date.now();
 
     // Emit content impression for analytics
     if (this.socket?.connected) {
       this.socket.emit('content:impression', {
-        contentId: currentItem.content.id,
-        playlistId: this.currentPlaylist.id,
+        contentId: content.id,
+        playlistId: this.currentPlaylist?.id,
         timestamp: Date.now(),
       });
     }
 
-    this.cleanupMediaElements(container);
-    container.innerHTML = '';
+    // Schedule advancement. Every type gets a timer (F8 — layout included).
+    // Videos advance on `onended`; their timer is a stall watchdog sized so a
+    // correctly-declared duration never truncates playback.
+    const declaredSec = item.duration || content.duration || 10;
+    const advanceMs =
+      content.type === 'video'
+        ? Math.max(declaredSec * 4, 600) * 1000
+        : declaredSec * 1000;
 
-    const contentDiv = document.createElement('div');
-    contentDiv.className = 'content-item';
-
-    const contentType = currentItem.content.type;
-
-    // Layout is a special case — it manages its own container
-    if (contentType === 'layout') {
-      this.renderLayout(currentItem);
-      return;
-    }
-
-    await this.renderContentToDiv(currentItem.content, contentDiv, {
-      useCache: true,
-      onVideoEnd: () => this.nextContent(),
-      onError: (name) => {
-        this.showContentError(container, name);
-        setTimeout(() => this.nextContent(), 5000);
-      },
-    });
-
-    container.appendChild(contentDiv);
-
-    if (contentType !== 'video') {
-      const expectedDuration = (currentItem.duration || 10) * 1000;
-      this.playbackTimer = setTimeout(() => {
-        // Emit completion impression with duration data
-        if (this.socket?.connected && this.contentStartTime > 0) {
-          const actualDurationMs = Date.now() - this.contentStartTime;
-          const completionPercentage = Math.min(100, Math.round((actualDurationMs / expectedDuration) * 100));
-          this.socket.emit('content:impression', {
-            contentId: currentItem.content!.id,
-            playlistId: this.currentPlaylist?.id,
-            duration: Math.round(actualDurationMs / 1000),
-            completionPercentage,
-            timestamp: Date.now(),
-          });
-        }
-        this.nextContent();
-      }, expectedDuration);
-    }
+    if (this.playbackTimer) clearTimeout(this.playbackTimer);
+    this.playbackTimer = setTimeout(() => {
+      this.playbackTimer = null;
+      this.completeItem(item);
+    }, advanceMs);
   }
 
-  private nextContent() {
-    if (!this.currentPlaylist || !this.currentPlaylist.items) {
-      return;
-    }
+  /** Item finished (timer, video end, or post-commit error): emit completion, move on. */
+  private completeItem(item: PlaylistItem | null) {
+    const playlist = this.currentPlaylist;
 
-    // Log completion for video content
-    const currentItem = this.currentPlaylist.items[this.currentIndex];
-    if (currentItem?.content?.type === 'video' && this.contentStartTime > 0 && this.socket?.connected) {
+    if (item?.content && this.contentStartTime > 0 && this.socket?.connected) {
+      const expectedDuration =
+        (item.duration || item.content.duration || (item.content.type === 'video' ? 30 : 10)) * 1000;
       const actualDurationMs = Date.now() - this.contentStartTime;
-      const expectedDuration = (currentItem.duration || currentItem.content.duration || 30) * 1000;
       const completionPercentage = Math.min(100, Math.round((actualDurationMs / expectedDuration) * 100));
       this.socket.emit('content:impression', {
-        contentId: currentItem.content.id,
-        playlistId: this.currentPlaylist.id,
+        contentId: item.content.id,
+        playlistId: playlist?.id,
         duration: Math.round(actualDurationMs / 1000),
         completionPercentage,
         timestamp: Date.now(),
       });
     }
 
-    this.currentIndex++;
-
-    if (this.currentIndex >= this.currentPlaylist.items.length) {
-      if (this.currentPlaylist.loopPlaylist !== false) {
-        this.currentIndex = 0;
-      } else {
-        console.log('[Vizora] Playlist ended');
-        return;
-      }
+    if (!playlist || !playlist.items || playlist.items.length === 0) {
+      this.enterHolding('playlist_removed');
+      return;
     }
 
-    this.playContent();
+    if (this.currentIndex + 1 >= playlist.items.length && playlist.loopPlaylist === false) {
+      // Explicit park (F35): the last frame stays on screen by design.
+      console.log('[Vizora] Playlist ended — holding last frame (loopPlaylist=false)');
+      this.playbackSource = 'hold-last';
+      return;
+    }
+
+    this.currentIndex = (this.currentIndex + 1) % playlist.items.length;
+    void this.advance();
+  }
+
+  /**
+   * Branded fallback state — the never-black terminal. Self-heals: if a
+   * playlist exists, retry the scan periodically (assets may finish caching).
+   */
+  private enterHolding(reason: string) {
+    if (this.playbackTimer) {
+      clearTimeout(this.playbackTimer);
+      this.playbackTimer = null;
+    }
+    const cleanup = this.currentItemCleanup;
+    this.currentItemCleanup = null;
+    cleanup?.();
+    this.machine.transition('holding', reason);
+    this.setHoldingMessage('Waiting for content…');
+
+    if (this.holdingRetryTimer) clearTimeout(this.holdingRetryTimer);
+    if (this.currentPlaylist?.items?.length) {
+      this.holdingRetryTimer = setTimeout(() => {
+        this.holdingRetryTimer = null;
+        void this.advance();
+      }, 30000);
+    }
   }
 
   private async preloadContent(items: PlaylistItem[]) {
@@ -942,9 +1613,9 @@ class VizoraAndroidTV {
         break;
 
       case 'unpair':
-        await SecureStorage.remove({ key: 'device_token' });
-        await SecureStorage.remove({ key: 'device_id' });
-        window.location.reload();
+        // Confirm-then-purge (contract §3.4); the legacy-backend carve-out
+        // (§7.1a) lives inside confirmRevocation.
+        await this.confirmRevocation('unpair_command');
         break;
 
       case 'update_config':
@@ -992,7 +1663,8 @@ class VizoraAndroidTV {
       };
     }
 
-    // Clear current playback timer
+    // Invalidate any in-flight prepare and clear the playback timer
+    this.playbackGeneration++;
     if (this.playbackTimer) {
       clearTimeout(this.playbackTimer);
       this.playbackTimer = null;
@@ -1020,11 +1692,35 @@ class VizoraAndroidTV {
     const container = document.getElementById('content-container');
     if (!container) return;
 
-    this.cleanupMediaElements(container);
-    while (container.firstChild) container.removeChild(container.firstChild);
-
+    // Build off-DOM; the current frame stays visible until the push is ready.
     const contentDiv = document.createElement('div');
     contentDiv.className = 'content-item';
+
+    const { ready } = await this.renderContentToDiv(content, contentDiv, {
+      useCache: true,
+      onVideoEnd: () => {
+        if (this.temporaryContent) this.resumePlaylist();
+      },
+    });
+
+    const waitMs = VizoraAndroidTV.READY_WAIT_MS[content.type] ?? 0;
+    const result = await Promise.race([ready, this.timeoutAfter(waitMs)]);
+    if (this.temporaryContent !== content) return; // superseded / cancelled
+    if (result === 'error') {
+      console.warn(`[Vizora] Pushed content failed to load: ${content.name} — resuming playlist`);
+      this.resumePlaylist();
+      return;
+    }
+
+    // Commit-swap: append new, then remove old (never-black).
+    const oldChildren = Array.from(container.children) as HTMLElement[];
+    container.appendChild(contentDiv);
+    for (const child of oldChildren) container.removeChild(child);
+    const oldCleanup = this.currentItemCleanup;
+    this.currentItemCleanup = () => this.cleanupMediaElements(contentDiv);
+    oldCleanup?.();
+
+    this.machine.transition('playing', 'content_pushed');
 
     // Track current content for heartbeat reporting
     this.currentContentId = content.id;
@@ -1036,25 +1732,6 @@ class VizoraAndroidTV {
         timestamp: Date.now(),
       });
     }
-
-    await this.renderContentToDiv(content, contentDiv, {
-      useCache: true,
-      onVideoEnd: () => {
-        if (this.temporaryContent) this.resumePlaylist();
-      },
-      onError: (name) => this.showContentError(container, name),
-    });
-
-    container.appendChild(contentDiv);
-    this.showScreen('content');
-  }
-
-  private showContentError(container: HTMLElement, contentName: string) {
-    while (container.firstChild) container.removeChild(container.firstChild);
-    const errorDiv = document.createElement('div');
-    errorDiv.style.cssText = 'display:flex;align-items:center;justify-content:center;width:100%;height:100%;background:#111;color:#888;font-family:sans-serif;font-size:24px;text-align:center;padding:40px;';
-    errorDiv.textContent = `Unable to load: ${contentName}`;
-    container.appendChild(errorDiv);
   }
 
   private resumePlaylist() {
@@ -1072,14 +1749,10 @@ class VizoraAndroidTV {
       this.currentPlaylist = this.savedPlaylistState.playlist;
       this.currentIndex = this.savedPlaylistState.index;
       this.savedPlaylistState = null;
-      this.playContent();
+      void this.advance();
     } else {
-      // No playlist was playing, just clear the screen
-      const container = document.getElementById('content-container');
-      if (container) {
-        this.cleanupMediaElements(container);
-        container.innerHTML = '';
-      }
+      // No playlist was playing — branded holding, never a cleared screen.
+      this.enterHolding('push_ended_no_playlist');
     }
   }
 
@@ -1139,16 +1812,19 @@ class VizoraAndroidTV {
 
   // ==================== MULTI-ZONE LAYOUT ====================
 
-  private renderLayout(content: PlaylistItem) {
-    const container = document.getElementById('content-container');
-    if (!container) return;
-
+  /**
+   * Build a layout item's grid off-DOM. Returns null when the metadata is
+   * invalid — the caller skips the item without touching the screen (F8).
+   * Zone timers are instance-local and torn down by the returned cleanup
+   * closure, which commitItem runs on every departure from the item (F12).
+   */
+  private prepareLayout(content: PlaylistItem): { el: HTMLElement; cleanup: () => void } | null {
     const raw = content as unknown as Record<string, unknown>;
     const contentRecord = content.content as unknown as Record<string, unknown> | null;
     const metadata = (raw.metadata || contentRecord?.metadata) as LayoutMetadata | undefined;
-    if (!metadata || !metadata.zones) return;
+    if (!metadata || !Array.isArray(metadata.zones)) return null;
 
-    this.cleanupLayout();
+    const zoneTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
     const grid = document.createElement('div');
     grid.className = 'layout-grid';
@@ -1165,7 +1841,7 @@ class VizoraAndroidTV {
       zoneDiv.style.gridArea = zone.gridArea;
 
       if (zone.resolvedPlaylist?.items && zone.resolvedPlaylist.items.length > 0) {
-        this.createZonePlayer(zone.id, zone.resolvedPlaylist, zoneDiv);
+        this.createZonePlayer(zone.id, zone.resolvedPlaylist, zoneDiv, zoneTimers);
       } else if (zone.resolvedContent) {
         this.renderZoneContent(zone.resolvedContent, zoneDiv);
       }
@@ -1173,19 +1849,25 @@ class VizoraAndroidTV {
       grid.appendChild(zoneDiv);
     }
 
-    this.cleanupMediaElements(container);
-    container.innerHTML = '';
-    container.appendChild(grid);
+    return {
+      el: grid,
+      cleanup: () => {
+        for (const [, timer] of zoneTimers) clearTimeout(timer);
+        zoneTimers.clear();
+        this.cleanupMediaElements(grid);
+      },
+    };
   }
 
-  private createZonePlayer(zoneId: string, playlist: Playlist, container: HTMLElement) {
-    this.zoneIndices.set(zoneId, 0);
+  private createZonePlayer(
+    zoneId: string,
+    playlist: Playlist,
+    container: HTMLElement,
+    zoneTimers: Map<string, ReturnType<typeof setTimeout>>,
+  ) {
+    let index = 0;
 
     const playZoneItem = () => {
-      // Guard: stop if zone was cleaned up during timer wait
-      if (!this.zoneIndices.has(zoneId)) return;
-
-      const index = this.zoneIndices.get(zoneId) || 0;
       const items = playlist.items;
       if (!items || items.length === 0) return;
       const item = items[index % items.length];
@@ -1194,10 +1876,10 @@ class VizoraAndroidTV {
       this.renderZoneContent(item.content, container);
       const duration = (item.duration || item.content.duration || 10) * 1000;
       const timer = setTimeout(() => {
-        this.zoneIndices.set(zoneId, (index + 1) % items.length);
+        index = (index + 1) % items.length;
         playZoneItem();
       }, duration);
-      this.zoneTimers.set(zoneId, timer);
+      zoneTimers.set(zoneId, timer);
     };
 
     playZoneItem();
@@ -1210,19 +1892,13 @@ class VizoraAndroidTV {
     contentDiv.className = 'content-item';
 
     // Zone content uses cache and plays video muted+looping
-    this.renderContentToDiv(content, contentDiv, {
+    void this.renderContentToDiv(content, contentDiv, {
       useCache: true,
       muteVideo: true,
       loopVideo: true,
     });
 
     container.appendChild(contentDiv);
-  }
-
-  private cleanupLayout() {
-    for (const [, timer] of this.zoneTimers) clearTimeout(timer);
-    this.zoneTimers.clear();
-    this.zoneIndices.clear();
   }
 
   // ==================== HTML CONTENT SECURITY ====================
@@ -1242,6 +1918,10 @@ class VizoraAndroidTV {
   /**
    * Renders a content element into a container. Used by playlist playback,
    * temporary push content, and multi-zone layout to avoid triplicated logic.
+   *
+   * Returns a `ready` promise the playback engine races against a deadline:
+   * 'ready' once the asset is renderable, 'error' if it failed. Types without
+   * reliable readiness signals (webpage/html/template) resolve immediately.
    */
   private async renderContentToDiv(
     content: { id: string; name: string; type: string; url: string; mimeType?: string },
@@ -1253,9 +1933,10 @@ class VizoraAndroidTV {
       muteVideo?: boolean;
       loopVideo?: boolean;
     },
-  ): Promise<void> {
+  ): Promise<{ ready: Promise<'ready' | 'error'> }> {
     const contentType = content.type;
     const useCache = options?.useCache ?? true;
+    let ready: Promise<'ready' | 'error'> = Promise.resolve('ready');
 
     // Transform URL (skip for HTML/template which contain raw markup)
     const contentUrl = (contentType === 'html' || contentType === 'template')
@@ -1291,14 +1972,27 @@ class VizoraAndroidTV {
     switch (contentType) {
       case 'image': {
         const img = document.createElement('img');
+        ready = new Promise(resolve => {
+          img.onload = () => resolve('ready');
+          img.onerror = () => {
+            handleError();
+            resolve('error');
+          };
+        });
         img.src = resolvedUrl;
         img.alt = content.name;
-        img.onerror = handleError;
         contentDiv.appendChild(img);
         break;
       }
       case 'video': {
         const video = document.createElement('video');
+        ready = new Promise(resolve => {
+          video.onloadeddata = () => resolve('ready');
+          video.onerror = () => {
+            handleError();
+            resolve('error');
+          };
+        });
         video.src = resolvedUrl;
         video.autoplay = true;
         video.muted = options?.muteVideo ?? false;
@@ -1306,7 +2000,6 @@ class VizoraAndroidTV {
         if (options?.loopVideo) video.loop = true;
         video.setAttribute('x5-video-player-type', 'h5');
         video.setAttribute('x5-video-player-fullscreen', 'true');
-        video.onerror = handleError;
         if (options?.onVideoEnd) video.onended = options.onVideoEnd;
         contentDiv.appendChild(video);
         break;
@@ -1338,7 +2031,10 @@ class VizoraAndroidTV {
       }
       default:
         console.warn('[Vizora] Unknown content type:', contentType);
+        ready = Promise.resolve('error');
     }
+
+    return { ready };
   }
 
   // ==================== MEDIA CLEANUP ====================
@@ -1353,23 +2049,15 @@ class VizoraAndroidTV {
   }
 
   // ==================== UI HELPERS ====================
+  //
+  // Screen visibility is owned exclusively by the ScreenStateMachine
+  // (src/screen-state.ts). There is deliberately no showScreen/showError
+  // helper here — an arbitrary code path must not be able to blank the
+  // display or surface a raw error while renderable content exists.
 
-  private showScreen(screen: 'loading' | 'pairing' | 'content' | 'error') {
-    const screens = ['loading-screen', 'pairing-screen', 'content-screen', 'error-screen'];
-    screens.forEach((id) => {
-      const el = document.getElementById(id);
-      if (el) {
-        el.classList.toggle('hidden', id !== `${screen}-screen`);
-      }
-    });
-  }
-
-  private showError(message: string) {
-    const errorMessage = document.getElementById('error-message');
-    if (errorMessage) {
-      errorMessage.textContent = message;
-    }
-    this.showScreen('error');
+  private setHoldingMessage(message: string) {
+    const el = document.getElementById('holding-message');
+    if (el) el.textContent = message;
   }
 
   private showOfflineOverlay() {
