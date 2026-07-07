@@ -5,6 +5,12 @@
 machine), P0-2 (revocation contract), and P0-3 (boot survivability) are merged —
 Play approval of the current build would ship the fleet de-pair bomb (F3).
 
+**Backend-contract gate (audit 2026-07-06):** four server-contract questions must be answered
+before submission — JWT `exp`/refresh policy, in-place-edit `version` bump, heartbeat-ack `.data`
+wrapping of `commands`/`revoked`, and any residual versionless `playlist:update`. They are owned in
+`tasks/vizora-tv-review.md` §1.10 (not restated here); the 2026-07-06 clear-path disposition is in
+that register's §5.1.
+
 ## 1. Technical requirements
 
 | Item | Status | Evidence |

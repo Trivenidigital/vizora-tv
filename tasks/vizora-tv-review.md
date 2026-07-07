@@ -5,6 +5,8 @@
 **Scope:** Entire device-side app (6 TS + 4 Java files, manifest, gradle, docs), judged against the north-star invariant: *the screen never shows wrong/expired/unapproved content, and never goes black or shows an error surface while valid cached content exists.*
 **Method:** Every claim below was verified by reading the cited code. No fixes have been applied — this is the Phase 2 checkpoint deliverable.
 
+> **STATUS UPDATE (2026-07-07).** The "no fixes applied" framing reflects the 2026-07-02 checkpoint. Since then **P0-1** (playback state machine / never-black — `422f194`; closes F5–F9, F11, F12, F19, F35), **P0-2** (confirmed revocation + transport fail-open + tenant binding — `e6a6726`; closes F3, F4), and **P0-4** (Play readiness — `dcec659`; closes F10/F10b, F29) are MERGED, plus the T2 delivery layer (pull-on-connect / heartbeat-reconcile / version-wins / PD-1 `b0a7aaa` / PD-7 `9fec12f`). **P0-3** (survivability — F1, F2, F18-part) remains OPEN and is where the 2026-07-06 audit's **F36/F37** land. Read this register alongside git history; the 2026-07-06 disposition and clear-path split are in **§5.1**, and the new backend open questions are in **§1.10**.
+
 ---
 
 ## 1. Current-State Map (Phase 0)
@@ -83,7 +85,7 @@ There is **no explicit playback state machine**. Screen state is the union of fo
 ### 1.7 Survivability inventory
 
 - Crash handling: `CrashRecoveryHandler` schedules an exact alarm +3s with `PendingIntent.getActivity` (`CrashRecoveryHandler.java:31-63`). **Empirically failed** the only test ever run against it (E2E S-19, native crash — `docs/e2e-test-results-2026-03-27.md`), was never retested, and is architecturally suspect on Android 10+ (background activity-launch restrictions apply to alarm PendingIntents from a dead process) [F2]. No crash counter / loop back-off — a crash-on-startup bug means a 3-second restart loop forever (if restart works at all).
-- Watchdog: **none.** If the WebView JS context dies or playback halts (F7/F17), nothing notices. (Renderer-process death does propagate to an app crash by framework default, which then depends on the unproven F2 path.)
+- Watchdog: **none.** If the WebView JS context dies or playback halts (F7/F17), nothing notices. (Renderer-process death terminates the hosting app process by framework default, but WITHOUT raising a catchable Java exception — so it bypasses `CrashRecoveryHandler` (F2's handler) entirely, and post-kill auto-restart is unproven, not guaranteed. There is no `onRenderProcessGone` override to recover in-process. **Corrected 2026-07-06 — see F36.**)
 - ANR exposure: low (network on native threads via CapacitorHttp).
 - Memory: 88–106MB measured over 15 min (prior report) — but zone-timer leak on layout→other transitions is unmeasured [F12]; no multi-day soak has ever been run.
 - Wake/screen-on: `android:keepScreenOn="true"` (`AndroidManifest.xml:34`) + immersive flags; prior test confirmed `mWakefulness=Awake`. HOME button on a remote exits to launcher with **no recovery mechanism** (app is not the HOME app, no kiosk/device-owner mode) — anyone with the remote can take the screen down until human relaunch.
@@ -113,6 +115,13 @@ There is **no explicit playback state machine**. Screen state is the union of fo
 | c. Backend contract matches server audit | **UNVERIFIABLE HERE** | This repo is standalone; the server audit is not in-tree. Client-side facts documented in §1.2 for cross-checking; open questions flagged: JWT expiry policy, pairing-code entropy/single-use, whether `playlist:update` is re-sent on every reconnect (drives F15 severity), entitlement-lapse push semantics. |
 | d. Known device bugs root-caused & regression-tested | **PARTIAL** | BUG-1 (black on restart) fixed at `main.ts:177-186` with unit coverage. BUG-2 (crash recovery FAIL, E2E S-19) was deferred to "retest on physical device" and then **silently dropped** — the 2026-03-31 report's Suite 7 "PASS" tested token persistence, not crash restart or boot restart (P-08 was skipped). Explicit disagreement: the READY verdict rests on two never-verified survivability mechanisms. |
 
+**Backend open questions — gate store submission (owner: this section; the Play checklist points here, does not restate).** The 2026-07-06 T2 delivery-layer audit adds four server-contract questions to the JWT-expiry item in row (c) above. Each is answerable only against the backend repo, not this standalone tree:
+
+1. **Do device JWTs carry an `exp` claim (and is there refresh/re-issue)?** If yes, an expired-but-not-revoked token leaves a device playing cached content forever but never reconnecting — the F3 fail-open is CORRECT and there is no client recovery path (see the F38 disposition, §5.1). Ties to F22. Server must state token lifetime + refresh policy.
+2. **Does the server bump effective-content `version` on an in-place content edit?** PD-7 (`9fec12f`) added `content.updatedAt` to the client signature so edits re-render, but `applyPulledContent` gates on the version-only `shouldApplyContent` BEFORE the `updatedAt`-aware signature check (`main.ts:835`). If `version` does NOT change on an in-place edit, versioned pushes/pulls of an edited playlist no-op and the edit never reaches the screen.
+3. **Does the server ever deliver a `command`/`revoked` ONLY via the heartbeat-ack `.data` envelope (no separate event)?** The client reads `reconcileContent` from the unwrapped `ack` (`main.ts:783`) but `revoked`/`commands` from top-level `response` (`main.ts:775,778`); the code's own comment says the server wraps in `.data` (`main.ts:768-771`). If so, ack-piggybacked commands are silently dropped TODAY — a live client bug. Client fix (read `ack.` for all three) is do-now (§5.1, P1-1); revocation has a redundant `device:revoked` path so only commands are at risk.
+4. **Is any production `playlist:update` still emitted without a `version`?** If not, the legacy versionless branch (`main.ts:994-996`) is dead code and can be deleted. This is cleanup gated on a server fact, NOT a live hazard — the branch already handles versionless safely via the PD-1 signature no-op.
+
 ---
 
 ## 2. Findings Register
@@ -133,6 +142,10 @@ Severity: **S1** = violates north-star invariant or blocks ship; **S2** = degrad
 | **F8** | Layout content is a terminal state: the `layout` branch returns **without scheduling any advance timer**, so a playlist `[image, layout, image]` never advances past the layout. Worse: `renderLayout` early-returns on missing metadata **after** the container was cleared → permanent black. | `main.ts:842-845` (no timer), `main.ts:1148-1149` (early return), `main.ts:834-835` (pre-clear) | PD/FW, RR | Schedule duration timer for layout items like any other; on invalid metadata, skip item (never clear-then-return). | S |
 | **F9** | Black gap on every transition: container is emptied, *then* the next asset is awaited (cache stat, or full download for uncached items — items 6+ are never preloaded, `main.ts:797`). On slow networks an uncached video = black screen for the whole download. Even cached = visible flash every rotation. | `main.ts:834-835` → `848-857`, `1267-1285` | FW, RR | Double-buffer: build next element off-DOM, swap on ready; old frame persists until replacement is renderable. Negative test: "no frame where container is empty during swap". | M |
 | **F10** | Play submission blockers: `targetSdkVersion 34` (API 35 required for new apps since 2025-08-31); **F10b** `USE_EXACT_ALARM` is policy-restricted to alarm/clock/calendar apps — rejection risk; release artifact plan says APK (`capacitor.config.ts:36`) where Play requires AAB. | `android/variables.gradle:4`; `AndroidManifest.xml:9-10` | n/a (submission) | Bump target/compile SDK to 35 (includes migrating deprecated `setSystemUiVisibility` → `WindowInsetsController`, flagged in the project's own report); drop `USE_EXACT_ALARM` (crash restart shouldn't depend on exact alarms anyway — see F2 redesign); submit AAB. | M |
+| **F36** | Renderer-process death is not recovered in-process: no `WebViewClient.onRenderProcessGone` override exists, so a WebView renderer OOM/SIGSEGV terminates the app process WITHOUT a catchable Java exception → `CrashRecoveryHandler` (F2) never fires, and restart falls to the BAL-gated boot/alarm paths (unproven on API 29+). Corrects the §1.7 assumption at line 86. Common on 24/7 boxes decoding large media. | `MainActivity.java:12-53` (no override); refutes `:86` | FW, TR | Override `onRenderProcessGone` → recreate/reload the WebView in-process (needs NO SAW/BAL → the FIX lands independently of the P0-3 posture gate); VERIFY on hardware via new P0-3 test **S-19d**. | S fix / hw verify |
+| **F37** | Keystore read-rejection wedges init in an infinite RECOVERING loop, never reaching the pairing fallback: `SecureStorage.get` REJECTS (not null) on EncryptedSharedPreferences keystore corruption (documented post-OS-update key invalidation); `init()` credential reads are unguarded → throw → `startInit` catch → RECOVERING → retry `init()` forever (5-min cap). Rides the F19 retry loop; brick until adb/clear-data. | `main.ts:221-222`, `199-208`; `SecureStoragePlugin.java:81-89` | PD, TR (brick) | Guard credential reads; on read failure after a bounded retry, route to `startPairing()` instead of the generic init-retry. vitest-testable (mock reject: persistent→pairing, transient→recovers). | S |
+
+**2026-07-06 audit note:** the T2/delivery-layer audit confirmed **F2** (crash-restart still fixed-3s, pre-P0-3) and **F34** (manifest-orphan) unchanged; its manifest and never-black findings map to existing F-numbers, not new ones. F36/F37 are the only net-new S1s. **F38** (401→"limbo") was investigated and **REJECTED** as a finding — the 401 fail-open is correct by design (P0-2/F3); a 401→re-pair "fix" would reopen the fleet de-pair bomb. See §5.1 for the clear-path disposition.
 
 ### S2 — unattended operation & fleet ops
 
@@ -217,6 +230,25 @@ F24 (signed URLs, backend), F26–F34, stable device identity (F30), version uni
 ### Minimal slice set to fleet grade
 P0-1 → P0-2 → P0-3 → P1-1 → P1-2. P0-4 runs in parallel (independent of the code slices except SDK bump touching MainActivity).
 
+### 5.1 Disposition of the 2026-07-06 audit (clear-path split)
+
+Actionable findings split by **who can clear them** — this ordering IS the priority:
+
+**Keyboard-clearable now (client code + vitest; no hardware, no backend):**
+- **F37** — guard init credential reads → bounded retry → pairing fallback. Home: P0-1 (the F19 init-retry logic) + P0-2 cross-ref for the credential-read guard.
+- **Ack-unwrap client fix** (backend Q#3) — read `ack.` for `reconcileContent`/`revoked`/`commands` alike (`main.ts:775,778`). Home: P1-1 observability.
+- **F38 safe half** — add an explicit `status===401` branch to `scheduleAuthProbe` that KEEPS fail-open (stay degraded, keep cached playback, keep probing) and only promotes the 24h operator badge (`main.ts:1130-1131`) to "needs re-pairing — contact admin" on sustained 401. NO purge, NO auto-re-pair.
+- **Socket Manager construct-once** (soak item) — construct the socket once, use `.connect()`/`.disconnect()` instead of a fresh `io()` per reconnect (`main.ts:876`); node-harness regression with the REAL client (current tests mock socket.io-client at `vizora-app.spec.ts:358` → prove nothing about Manager teardown). Home: P1-4.
+
+**REJECTED — do not implement (recorded so it is not re-proposed):**
+- **F38 "401 → re-pair/purge".** Reverses the P0-2/F3 fail-open and reintroduces the fleet de-pair bomb — a transient/rotation 401 (any gateway/proxy/validator hiccup) drops every probing device to a pairing code. Only 410 purges by contract (`main.ts:1013-1014,1056,1114`); a locked regression test forbids credential-wipe on unauthorized (`vizora-app.spec.ts:1174-1185`). Real token recovery is server-gated (backend Q#1), not a client fix.
+
+**Hardware-gated by nature (fix may be writable now; acceptance is silicon-only → P0-3 sitting):**
+- **F36** — write the `onRenderProcessGone` override now (no SAW → lands independently of the posture gate), PROVE recovery on hardware via new test **S-19d**. The §86-vs-F36 dispute (does the framework auto-restart after a renderer kill?) is itself an empirical silicon question.
+- **F2** — crash-loop backoff + safe-mode is the P0-3 implementation slice, gated by **S-19c**; add clearing/skipping poison persisted state to the design (boot-survivability §4 bullet 2).
+
+**Server-answerable (no code here):** the four backend open questions in §1.10 — they gate store submission.
+
 ---
 
 ## 6. Hardware-only verification protocols (cannot be proven on emulator)
@@ -231,4 +263,4 @@ P0-1 → P0-2 → P0-3 → P1-1 → P1-2. P0-4 runs in parallel (independent of 
 
 ## CHECKPOINT
 
-No code has been changed. Awaiting slice approval. Per the ground rules, P0-2 (pairing/trust), P0-3 (update/survivability), and P0-1 (playback state machine) all fall under the approval-required categories.
+*(Historical — 2026-07-02.)* No code had been changed at the time of this checkpoint. **As of 2026-07-07, P0-1 / P0-2 / P0-4 + the T2 delivery layer are merged; P0-3 remains open** — see the STATUS UPDATE at the top and the §5.1 disposition of the 2026-07-06 audit. Per the original ground rules, P0-1/P0-2/P0-3 all fell under approval-required categories.

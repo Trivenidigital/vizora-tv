@@ -72,8 +72,21 @@ On each device (SAW state as decided in §1–2):
   the posture decision).
 - **S-19c crash loop:** build a variant that throws in `MainActivity.onCreate` (one-line
   temporary patch), install, observe 15 min → PASS: restart back-off escalates (3s → 30s →
-  5min per the P0-3 implementation) and the device does not thermal-runaway. *(Runnable only
-  after the P0-3 implementation lands — the current code restarts at a fixed 3s.)*
+  5min per the P0-3 implementation) and the device does not thermal-runaway. **PASS also requires
+  the device to STOP re-restoring the crash-inducing persisted state** — after the back-off cap it
+  must skip/clear `last_playlist` and boot a branded holding screen rather than replaying the
+  poison pill (audit 2026-07-06, F2/F37 adjacency; design in boot-survivability §4 bullet 2).
+  *(Runnable only after the P0-3 implementation lands — the current code restarts at a fixed 3s.)*
+- **S-19d renderer-process crash (WebView subprocess — audit 2026-07-06, F36):** with content
+  playing, force a WebView **renderer** termination (NOT an app-process crash): either a debug-only
+  test hook that terminates the renderer, or a memory-bomb content item that drives the renderer to
+  OOM. (Exact trigger finalized on-device — the renderer is a separate subprocess and cannot be hit
+  by `am crash`/`kill -11` on the app pid, which is S-19b.) → PASS: the app recovers the WebView and
+  resumes rendering ≤ 30s **without** a full app relaunch, via the `onRenderProcessGone` override
+  (F36); FAIL: screen stays blank with the app process alive, OR recovery relies on the unproven
+  BAL-gated full restart. This test settles the §86-vs-F36 dispute empirically (does the framework
+  auto-restart after a renderer kill?). *(Runnable after the F36 override lands; the override needs
+  no SAW and can ship independently of the posture decision.)*
 
 ## 4. UPD-1 — package-replaced relaunch
 
@@ -104,6 +117,7 @@ Fill the table and commit as `docs/p0-3-hardware-results.md`:
 | S-19a JVM crash | | | | |
 | S-19b native crash | | | | |
 | S-19c crash loop | | | | |
+| S-19d renderer crash | | | | |
 | UPD-1 pkg replaced | | | | |
 | HOME-1 | | | | |
 | SAW grantable (§1) | n/a | | n/a | posture: B / C |

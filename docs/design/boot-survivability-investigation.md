@@ -64,11 +64,24 @@ never run. Nothing in the repo has ever observed either mechanism working on API
    back-off 3s → 30s → 5min; after 3 crashes in 10 min, stop auto-restarting *the same session*
    and rely on the next boot/alarm window (prevents the infinite 3s loop); every scheduled
    restart writes a breadcrumb so the next launch can report `recovered_from_crash` telemetry.
+   **(Audit 2026-07-06):** on repeated crashes, ALSO stop re-restoring the persisted
+   `last_playlist`/prefs that may be the poison pill — boot a branded holding screen and skip
+   auto-restore until a fresh `playlist:update`/pull, so a corrupt stored value cannot drive a
+   deterministic crash loop. This closes the F37/F2 adjacency (a keystore- or playlist-corruption
+   event otherwise re-triggers the same crash every restart). Verified by test **S-19c**.
 3. **Add `ACTION_MY_PACKAGE_REPLACED` receiver** (same BAL rules — works once SAW is granted):
    closes the Play-update-leaves-app-dead hole (F18-part).
 4. **Document C (AOSP launcher mode) and D (device-owner kiosk)** in the deployment guide as the
    recommended postures for unattended fleets; D additionally solves the HOME-button exposure
    (§1.7 of the review) which B only mitigates.
+5. **Renderer-process-gone recovery (audit 2026-07-06, F36) — orthogonal to the posture decision:**
+   override `WebViewClient.onRenderProcessGone` in `MainActivity` to recreate/reload the WebView
+   in-process when the renderer subprocess is killed (OOM/crash on a 24/7 box decoding large media).
+   This needs NO `SYSTEM_ALERT_WINDOW` and performs NO background activity launch — it fires inside
+   the still-alive app process — so it is **INDEPENDENT of the §7 posture (B/C/D) decision and can
+   land without waiting on the hardware posture gate.** Without it, a renderer kill bypasses
+   `CrashRecoveryHandler` (it raises no catchable Java exception) and depends on the unproven
+   BAL-gated restart, leaving a blank screen. Hardware acceptance: new P0-3 test **S-19d**.
 
 Not recommended: E (policy-dead), or betting on A (empirically dead).
 
