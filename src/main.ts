@@ -1152,6 +1152,21 @@ class VizoraAndroidTV {
         console.log('[Vizora] Auth-check endpoint absent (legacy backend) — probe loop stopped');
         return;
       }
+      if (status === 401) {
+        // Fail-open by contract (§1.5a / F3): a 401 is the generic auth-hiccup
+        // status any gateway/proxy/token-validator emits — treating it as
+        // revocation would de-pair the whole fleet on a transient blip. ONLY a
+        // 410 (confirmed revocation) purges. NEVER purge or re-pair here. The
+        // one thing we add is observability: distinct telemetry so an operator
+        // can tell a rejected token from a transport blip; recovery is a human
+        // re-pair or a server-side re-issue, not an auto-wipe. Fall through to
+        // the shared degraded tail (24h badge + reschedule).
+        reportEvent('auth_check_401', {
+          degradedForSeconds: this.authDegradedSince
+            ? Math.round((Date.now() - this.authDegradedSince) / 1000)
+            : 0,
+        });
+      }
 
       // 24h continuously degraded: unobtrusive badge, cached loop continues (§5)
       if (this.authDegradedSince && Date.now() - this.authDegradedSince > 24 * 3600_000) {

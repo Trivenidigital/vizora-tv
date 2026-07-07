@@ -268,6 +268,12 @@ vi.mock('./secure-storage', () => ({
   },
 }));
 
+vi.mock('./crash-reporting', () => ({
+  initCrashReporting: vi.fn(),
+  setCrashReportingDevice: vi.fn(),
+  reportEvent: vi.fn(),
+}));
+
 vi.mock('@capacitor/core', () => ({
   CapacitorHttp: {
     get: vi.fn(async (opts: { url: string }) => httpGetHandler(opts)),
@@ -3038,6 +3044,31 @@ describe('VizoraAndroidTV', () => {
       expect((await authCheckCalls()).length).toBeGreaterThanOrEqual(1);
       // Legacy 404 answer → probing stops, still no wipe
       expect(secureStorageStore.has('device_token')).toBe(true);
+    });
+
+    it('auth-check 401 stays fail-open: no purge, no pairing, keeps the cached loop (F38 — never reopens F3)', async () => {
+      httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+        ? { status: 401, data: {} }
+        : { status: 200, data: { data: { status: 'pending' } } };
+      await connectAndCommit();
+      triggerSocketEvent('connect_error', { message: 'expired', data: { code: 'AUTH_EXPIRED' } });
+      await vi.advanceTimersByTimeAsync(40_000);
+      // NEGATIVE: a 401 is not a 410 — credentials intact, still on content, still probing
+      expect(secureStorageStore.has('device_token')).toBe(true);
+      expect(visibleScreens()).toEqual(['content-screen']);
+      expect((await authCheckCalls()).length).toBeGreaterThanOrEqual(1);
+    });
+
+    it('auth-check 401 emits distinct auth_check_401 telemetry so operators can see token rejection (F38)', async () => {
+      const { reportEvent } = await import('./crash-reporting');
+      httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+        ? { status: 401, data: {} }
+        : { status: 200, data: { data: { status: 'pending' } } };
+      await connectAndCommit();
+      (reportEvent as Mock).mockClear();
+      triggerSocketEvent('connect_error', { message: 'expired', data: { code: 'AUTH_EXPIRED' } });
+      await vi.advanceTimersByTimeAsync(40_000);
+      expect((reportEvent as Mock).mock.calls.some((c: unknown[]) => c[0] === 'auth_check_401')).toBe(true);
     });
 
     it('device:revoked + auth-check 410: full purge, pairing shown, no further content renders', async () => {
