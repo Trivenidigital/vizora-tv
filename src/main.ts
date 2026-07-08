@@ -147,6 +147,8 @@ class VizoraAndroidTV {
   private pendingRestart = false;
   private currentItemCleanup: (() => void) | null = null;
   private holdingRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  // T2 Finding-2 enhancement: track pull retry to avoid thundering herd on transient failure
+  private pullRetryPending = false;
   private playbackSource: 'live' | 'cached' | 'hold-last' = 'cached';
   private initRetryCount = 0;
   private capacitorSetupDone = false;
@@ -306,6 +308,19 @@ class VizoraAndroidTV {
         console.warn('[Vizora] Failed to restore last playlist:', err);
       }
 
+      // Restore content version state for version-wins coherence (T2 Finding-2 enhancement)
+      try {
+        const vers = await Preferences.get({ key: 'last_content_version' });
+        const pid = await Preferences.get({ key: 'last_content_playlist_id' });
+        if (vers.value) this.currentContentVersion = vers.value;
+        if (pid.value) this.currentContentPlaylistId = pid.value;
+        if (vers.value || pid.value) {
+          console.log('[Vizora] Restored content version state: version=' + vers.value + ', playlistId=' + pid.value);
+        }
+      } catch (err) {
+        console.warn('[Vizora] Failed to restore content version state:', err);
+      }
+
       // Start playback immediately from the restored playlist (don't wait for
       // the WebSocket — BUG #7). The loading screen stays up until the first
       // frame commits; the machine enters PLAYING at commit time, so there is
@@ -364,6 +379,13 @@ class VizoraAndroidTV {
       if (status.connected && this.deviceToken && !this.socket?.connected) {
         console.log('[Vizora] Network restored, reconnecting...');
         this.connectToRealtime();
+      }
+
+      // T2 Finding-2 enhancement: also pull content when network stabilizes (not just on socket reconnect)
+      // Ensures device fetches latest content immediately upon network restoration
+      if (status.connected && this.deviceToken && this.socket?.connected) {
+        console.log('[Vizora] Network restored, pulling latest content...');
+        void this.pullContent();
       }
     });
 
@@ -850,6 +872,10 @@ class VizoraAndroidTV {
    */
   private async pullContent(): Promise<void> {
     if (!this.deviceToken || !this.isOnline) return;
+
+    // T2 Finding-2 enhancement: detailed logging for field diagnosis
+    console.log('[Vizora] Pulling authoritative content: version=' + this.currentContentVersion + ', playlistId=' + this.currentContentPlaylistId);
+
     try {
       const response: HttpResponse = await CapacitorHttp.get({
         url: `${this.config.apiUrl}/api/v1/devices/me/content`,
@@ -863,10 +889,26 @@ class VizoraAndroidTV {
       }
       const body = response.data;
       const payload = body?.data ?? body; // unwrap { success, data } envelope
+
+      // Log pull result for diagnostics
+      const incoming = { playlistId: payload?.playlist?.id ?? null, version: payload?.version ?? '' };
+      console.log('[Vizora] Pull succeeded: status=200, incomingVersion=' + incoming.version + ', incomingPlaylistId=' + incoming.playlistId);
+
       this.applyPulledContent(payload);
     } catch (error) {
       // Fail safe: a reconcile/pull failure NEVER blanks the screen — keep last-known-good.
       console.warn('[Vizora] pullContent failed — keeping last-known-good:', error);
+
+      // T2 Finding-2 enhancement: retry once on transient network errors (429, timeout, etc.)
+      // Avoids device getting stuck "Waiting for content" on a single blip.
+      if (!this.pullRetryPending) {
+        this.pullRetryPending = true;
+        console.log('[Vizora] Scheduling pull retry in 5s (transient error recovery)');
+        setTimeout(() => {
+          this.pullRetryPending = false;
+          void this.pullContent();
+        }, 5000);
+      }
     }
   }
 
@@ -883,9 +925,27 @@ class VizoraAndroidTV {
     if (!payload) return;
     const incoming = { playlistId: payload.playlist?.id ?? null, version: payload.version ?? '' };
     const current = { playlistId: this.currentContentPlaylistId, version: this.currentContentVersion };
-    if (!shouldApplyContent(incoming, current)) return; // stale/duplicate → no-op, no re-flash
+
+    // T2 Finding-2 enhancement: diagnostic logging for version-wins decision
+    const shouldApply = shouldApplyContent(incoming, current);
+    if (shouldApply) {
+      console.log('[Vizora] Applying pulled content via version-wins (apply=true): incoming=' + JSON.stringify(incoming) + ', current=' + JSON.stringify(current));
+    } else {
+      console.log('[Vizora] Rejecting pulled content via version-wins (stale/duplicate): incoming=' + JSON.stringify(incoming) + ', current=' + JSON.stringify(current));
+    }
+
+    if (!shouldApply) return; // stale/duplicate → no-op, no re-flash
     this.currentContentVersion = incoming.version;
     this.currentContentPlaylistId = incoming.playlistId;
+
+    // Persist version state so it survives app restart (Finding-2 enhancement: T2 version-wins consistency)
+    try {
+      Preferences.set({ key: 'last_content_version', value: incoming.version }).catch(() => {});
+      Preferences.set({ key: 'last_content_playlist_id', value: incoming.playlistId ?? '' }).catch(() => {});
+    } catch (e) {
+      console.warn('[Vizora] Failed to persist content version:', e);
+    }
+
     if (payload.playlist) {
       this.updatePlaylist(payload.playlist);
     }
