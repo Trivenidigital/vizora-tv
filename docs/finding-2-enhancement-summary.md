@@ -5,6 +5,30 @@
 
 ---
 
+## Update — 2026-07-10 (review reconciliation)
+
+PR #9 review reconciliation superseded parts of the original write-up below:
+
+- **Retry is now capped exponential backoff + jitter**, not "retry once": on a thrown
+  pull (transport timeout/connection failure) the delay is `min(5000·2^attempt, 300000)`
+  plus up to ~20% jitter, reset to attempt 0 on the next successful pull. (A 429/non-2xx
+  still returns early and never reaches this retry path.)
+- **The content-version tracker is now persisted INSIDE the tenant-bound `last_playlist`
+  envelope** (`contentVersion` + `contentPlaylistId` fields), not as the separate
+  `last_content_version` / `last_content_playlist_id` keys described below. One atomic,
+  logged write; it is cleared automatically by BOTH purge sites (tenant-mismatch boot and
+  the credential wipe) because it shares the single `last_playlist` key, and the credential
+  wipe also resets the in-memory tracker fields.
+- **Version-wins never strands an empty device**: if the screen is empty (holding, no
+  rendered playlist) a pull carrying a playlist is force-applied even when version-wins
+  would reject it (e.g. same id+version after a re-pair) — there is nothing to re-flash.
+- **The network-recovery pull branch was removed** as redundant/unreachable: on a real
+  loss→restore the socket is still reconnecting, so pull-on-(re)connect already covers it.
+- **Unit tests added** for the above (persist→restore round-trip, retry backoff + reset,
+  both purge sites, stranded force-apply, and never-black on a throwing pull).
+
+---
+
 ## What Was Done
 
 Implemented four defensive enhancements to the pull-on-connect mechanism to ensure devices autonomously fetch and play assigned playlists on reconnect/restart, addressing Finding-2 from the E2E test (2026-07-03).

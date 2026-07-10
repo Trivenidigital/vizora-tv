@@ -3249,4 +3249,219 @@ describe('VizoraAndroidTV', () => {
       expect(visibleScreens()).toEqual(['pairing-screen']);
     });
   });
+
+  // ==================== 24. PULL-ON-CONNECT CONTENT TRACKER (T2 Finding-2 review fixes) ====================
+
+  describe('Pull-on-connect content tracker (T2 Finding-2 review fixes)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      resetCapacitorFakes();
+      resetDOM();
+      (window.location as { search: string }).search = '';
+      (window.location.reload as Mock).mockClear();
+      ioFactory.mockClear();
+      currentMockSocket = createMockSocket();
+      ioFactory.mockReturnValue(currentMockSocket);
+      mockCacheManager.getCachedUri.mockReset().mockResolvedValue(null);
+      mockCacheManager.downloadContent.mockReset().mockResolvedValue(null);
+      mockCacheManager.clearCache.mockClear();
+      qrToCanvasMock.mockReset().mockResolvedValue(undefined);
+      secureStorageStore.set('device_token', 'tok-123');
+      secureStorageStore.set('device_id', 'dev-123');
+      vi.spyOn(console, 'log').mockImplementation(() => {});
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    const visibleScreens = () =>
+      ['loading-screen', 'pairing-screen', 'content-screen', 'holding-screen', 'error-screen']
+        .filter(id => {
+          const el = domElements.get(id);
+          return el && !el._classListSet.has('hidden');
+        });
+
+    const mkContent = (playlistId: string, version: string) => ({
+      version,
+      playlist: {
+        id: playlistId, name: 'PL', items: [
+          { id: 'it-1', contentId: 'c1', duration: 10, order: 0, content: { id: 'c1', name: 'C', type: 'image', url: '/c1.jpg' } },
+        ], loopPlaylist: true,
+      },
+    });
+
+    // Fix B — persist→restore round-trip, consolidated into the last_playlist envelope.
+    it('persists the content tracker inside the last_playlist envelope and restores it — a same-version re-pull is a no-op', async () => {
+      const content = mkContent('pl-pull', '2026-07-10T00:00:00.000Z');
+      httpGetHandler = (opts) => opts.url.includes('/devices/me/content')
+        ? { status: 200, data: { data: content } }
+        : { status: 200, data: { data: { status: 'pending' } } };
+
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+      await vi.advanceTimersByTimeAsync(1600);
+
+      // Consolidated into the single last_playlist key — no separate tracker keys
+      const envelope = JSON.parse(preferencesStore.get('last_playlist')!);
+      expect(envelope.contentVersion).toBe(content.version);
+      expect(envelope.contentPlaylistId).toBe('pl-pull');
+      expect(preferencesStore.has('last_content_version')).toBe(false);
+      expect(preferencesStore.has('last_content_playlist_id')).toBe(false);
+
+      // A fresh instance restores the tracker from the envelope; a same-version re-pull
+      // is rejected by version-wins (no re-apply, no re-flash).
+      currentMockSocket._handlers.clear(); // drop the prior instance's socket handlers
+      await importFresh();
+      currentMockSocket.connected = true;
+      (console.log as Mock).mockClear();
+      triggerSocketEvent('connect');
+      await vi.advanceTimersByTimeAsync(1600);
+      const applied = (console.log as Mock).mock.calls.some(c =>
+        String(c[0]).includes('Applying pulled content via version-wins (apply=true)') ||
+        String(c[0]).includes('Force-applying pulled content'));
+      const rejected = (console.log as Mock).mock.calls.some(c =>
+        String(c[0]).includes('Rejecting pulled content via version-wins'));
+      expect(applied).toBe(false);
+      expect(rejected).toBe(true);
+    });
+
+    // Fix A — capped exponential backoff + jitter with attempt-counter reset on success.
+    it('schedules a capped-backoff retry when a pull throws and resets the attempt counter on a later success', async () => {
+      let mode: 'throw' | 'ok' = 'throw';
+      const content = mkContent('pl-retry', 'v-ok');
+      httpGetHandler = (opts) => {
+        if (opts.url.includes('/devices/me/content')) {
+          if (mode === 'throw') throw new Error('transient transport error');
+          return { status: 200, data: { data: content } };
+        }
+        return { status: 200, data: { data: { status: 'pending' } } };
+      };
+
+      await importFresh();
+      currentMockSocket.connected = true;
+      (console.log as Mock).mockClear();
+      triggerSocketEvent('connect'); // pull #1 throws → schedules retry (attempt 1)
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+
+      const retryDelay = (idx: number): number => {
+        const logs = (console.log as Mock).mock.calls.filter(c => String(c[0]).includes('Scheduling pull retry'));
+        return Number(String(logs[idx][0]).match(/in (\d+)ms/)![1]);
+      };
+
+      const delay1 = retryDelay(0);
+      expect(delay1).toBeGreaterThanOrEqual(5000);
+      expect(delay1).toBeLessThanOrEqual(6000); // 5000 + up to ~20% jitter
+
+      // Fire the attempt-1 retry (still throwing) → schedules attempt 2 with a larger delay
+      await vi.advanceTimersByTimeAsync(6100);
+      const delay2 = retryDelay(1);
+      expect(delay2).toBeGreaterThan(delay1);
+      expect(delay2).toBeGreaterThanOrEqual(10000); // 5000 * 2^1
+      expect(delay2).toBeLessThanOrEqual(12000);
+
+      // Recover: the next retry succeeds, resetting the attempt counter
+      mode = 'ok';
+      await vi.advanceTimersByTimeAsync(12100);
+
+      // A later failure restarts backoff at attempt 1 (~5000ms) — proving the reset
+      mode = 'throw';
+      (console.log as Mock).mockClear();
+      triggerSocketEvent('connect');
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      const delay3 = retryDelay(0);
+      expect(delay3).toBeGreaterThanOrEqual(5000);
+      expect(delay3).toBeLessThanOrEqual(6000);
+    });
+
+    // Fix B (step 4) — tenant-mismatch boot purges the consolidated tracker with the envelope.
+    it('tenant-mismatch boot purges the consolidated tracker (it lives inside last_playlist)', async () => {
+      secureStorageStore.set('tenant_id', 'tenant-B');
+      preferencesStore.set('last_playlist', JSON.stringify({
+        tenantId: 'tenant-A', deviceId: 'dev-old', savedAt: 1,
+        playlist: { id: 'pl-A', name: 'A', items: [{ id: 'i1', contentId: 'cA', duration: 10, order: 0,
+          content: { id: 'cA', name: 'A', type: 'image', url: '/a.jpg' } }], loopPlaylist: true },
+        contentVersion: 'vA', contentPlaylistId: 'pl-A',
+      }));
+      await importFresh();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(preferencesStore.has('last_playlist')).toBe(false);
+    });
+
+    // Fix B (step 4) — the credential wipe purges the consolidated tracker.
+    it('the credential wipe (device:revoked + confirmed 410) purges the consolidated tracker', async () => {
+      preferencesStore.set('last_playlist', JSON.stringify({
+        tenantId: undefined, deviceId: 'dev-123', savedAt: 1,
+        playlist: { id: 'pl-K', name: 'K', items: [{ id: 'i1', contentId: 'c1', duration: 10, order: 0,
+          content: { id: 'c1', name: 'C', type: 'image', url: '/c1.jpg' } }], loopPlaylist: true },
+        contentVersion: 'v1', contentPlaylistId: 'pl-K',
+      }));
+      httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+        ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
+        : { status: 200, data: { data: { status: 'pending' } } };
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+      await vi.advanceTimersByTimeAsync(200);
+      triggerSocketEvent('device:revoked', { reason: 'operator' });
+      for (let i = 0; i < 30; i++) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(preferencesStore.has('last_playlist')).toBe(false);
+      expect(secureStorageStore.has('device_token')).toBe(false);
+    });
+
+    // Fix C — a stranded (empty) device force-applies a same id+version pull (never stays black).
+    it('force-applies a same-version pull when the device is stranded (empty screen) — Fix C never-black', async () => {
+      // Boot state: tracker restored (v1 / pl-X) but the cached playlist is EMPTY → stranded.
+      // This is the post-re-pair "same id+version" case: version-wins would reject, but there
+      // is nothing on glass to re-flash, so the pull must apply.
+      preferencesStore.set('last_playlist', JSON.stringify({
+        tenantId: undefined, deviceId: 'dev-123', savedAt: 1,
+        playlist: { id: 'pl-X', name: 'X', items: [] },
+        contentVersion: 'v1', contentPlaylistId: 'pl-X',
+      }));
+      const content = mkContent('pl-X', 'v1'); // SAME id + version as the restored tracker
+      httpGetHandler = (opts) => opts.url.includes('/devices/me/content')
+        ? { status: 200, data: { data: content } }
+        : { status: 200, data: { data: { status: 'pending' } } };
+
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+      await vi.advanceTimersByTimeAsync(1600);
+
+      expect((console.log as Mock).mock.calls.some(c => String(c[0]).includes('Force-applying pulled content'))).toBe(true);
+      // NEGATIVE: the device is on content, not stranded/black
+      expect(visibleScreens()).toEqual(['content-screen']);
+    });
+
+    // Fix A / fail-safe — a throwing pull keeps last-known-good and never blacks the screen.
+    it('a pull that throws keeps last-known-good and never blacks the screen', async () => {
+      preferencesStore.set('last_playlist', JSON.stringify({
+        tenantId: undefined, deviceId: 'dev-123', savedAt: 1,
+        playlist: { id: 'pl-known', name: 'K', items: [{ id: 'i1', contentId: 'c1', duration: 10, order: 0,
+          content: { id: 'c1', name: 'C', type: 'image', url: '/c1.jpg' } }], loopPlaylist: true },
+        contentVersion: 'v1', contentPlaylistId: 'pl-known',
+      }));
+      httpGetHandler = (opts) => {
+        if (opts.url.includes('/devices/me/content')) throw new Error('pull transport failure');
+        return { status: 200, data: { data: { status: 'pending' } } };
+      };
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect'); // pull throws
+      await vi.advanceTimersByTimeAsync(1600);
+
+      // Last-known-good is on glass; never black
+      expect(visibleScreens()).toEqual(['content-screen']);
+      // Last-known-good persisted playlist is intact (not purged by a failed pull)
+      expect(preferencesStore.has('last_playlist')).toBe(true);
+      // Fail-safe path logged
+      expect((console.warn as Mock).mock.calls.some(c => String(c[0]).includes('pullContent failed — keeping last-known-good'))).toBe(true);
+    });
+  });
 });
