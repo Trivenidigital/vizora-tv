@@ -242,6 +242,23 @@ class VizoraAndroidTV {
       storedToken = await SecureStorage.get({ key: 'device_token' });
       storedDeviceId = await SecureStorage.get({ key: 'device_id' });
     } catch (err) {
+      const errCode = (err as { code?: string } | null)?.code;
+      const errText = String((err as { message?: string } | null)?.message ?? err ?? '');
+      if (errCode === 'SECURE_STORAGE_UNAVAILABLE' || errText.includes('SECURE_STORAGE_UNAVAILABLE')) {
+        // F39: the keystore-backed store failed to initialize and the plugin fails
+        // CLOSED (no plaintext fallback). The device can neither read nor store
+        // credentials, so it cannot resume OR pair safely — surface a loud, visible
+        // state + telemetry instead of a silent plaintext downgrade or a pairing
+        // screen that would just fail on write. NOT retried here (the native side
+        // already retried keystore init); recovery is device service / re-launch.
+        console.error('[Vizora] Secure storage unavailable — failing closed (F39):', err);
+        reportEvent('secure_storage_unavailable', {});
+        await SplashScreen.hide();
+        this.initRetryCount = 0;
+        this.machine.transition('holding', 'secure_storage_unavailable');
+        this.setHoldingMessage('Device error: secure storage unavailable. Please contact support.');
+        return;
+      }
       if (this.initRetryCount < CRED_READ_MAX_RETRIES) {
         throw err; // transient — let startInit retry init()
       }
