@@ -277,8 +277,24 @@ class VizoraAndroidTV {
     if (this.deviceToken && this.deviceId) {
       console.log('[Vizora] Found existing device credentials, connecting...');
 
-      const storedTenant = await SecureStorage.get({ key: 'tenant_id' });
-      this.tenantId = storedTenant.value;
+      // A per-value AEAD decrypt failure on tenant_id alone (token/deviceId read
+      // fine) must NOT be fatal — an unguarded throw here re-opens the F37 brick
+      // via the sibling read P0-2 added (infinite RECOVERING). Degrade to grace
+      // mode (tenantId=null, which the load-time tenant check already supports)
+      // and keep booting cached content (F42). But track WHY tenantId is null:
+      // a READ FAILURE means our tenant is unverifiable, so a tenant-bound cache
+      // must fail closed (F4) — distinct from a legacy device that never had a
+      // tenant, where rendering is correct grace.
+      let tenantReadFailed = false;
+      try {
+        const storedTenant = await SecureStorage.get({ key: 'tenant_id' });
+        this.tenantId = storedTenant.value;
+      } catch (err) {
+        console.warn('[Vizora] tenant_id read failed — booting in grace mode (F42):', err);
+        reportEvent('tenant_read_failed', {});
+        this.tenantId = null;
+        tenantReadFailed = true;
+      }
       this.cacheManager.setExpectedTenant(this.tenantId);
 
       // Restore last playlist for offline resilience — tenant-bound (F4):
@@ -296,7 +312,17 @@ class VizoraAndroidTV {
             reportEvent('tenant_mismatch_purge', { cachedTenant: envelope.tenantId });
             await Preferences.remove({ key: 'last_playlist' });
             await this.cacheManager.clearCache();
+          } else if (envelope.tenantId && tenantReadFailed) {
+            // The cache is tenant-BOUND but our tenant is UNVERIFIABLE (read
+            // failed) — fail closed (F4): do NOT render it. Leave currentPlaylist
+            // unset so boot enters holding and connectToRealtime()'s pull delivers
+            // authoritative content. Do NOT purge — the read failure may be
+            // transient and the content may legitimately be ours; preserve it for
+            // a future verified boot. Never-black (holds) AND never-wrong-tenant.
+            console.warn('[Vizora] tenant unverifiable + tenant-bound cache — holding, not rendering (F4/F42)');
+            reportEvent('tenant_unverifiable_hold', { cachedTenant: envelope.tenantId });
           } else {
+            // Verified match OR legacy no-tenant-binding (envelope.tenantId absent) — grace.
             this.currentPlaylist = this.validatePlaylist(envelope.playlist);
             this.playbackSource = 'cached';
             console.log('[Vizora] Restored last playlist from storage');
@@ -350,6 +376,69 @@ class VizoraAndroidTV {
     if (storedDashboardUrl.value && !dashboardUrl) this.config.dashboardUrl = storedDashboardUrl.value;
 
     console.log('[Vizora] Config loaded:', this.config);
+  }
+
+  /**
+   * Allowlist gate for update_config URLs (F43). Anchored to the COMPILED-IN
+   * DEFAULT_CONFIG (import.meta.env.VITE_* resolved at build), NEVER the mutable
+   * runtime config, so a hostile config push cannot bootstrap a wider allowlist.
+   * Accepts: an exact match to a compiled-in default origin (covers localhost/IP
+   * dev + smoke, where the shipped scheme may be http), OR — for public hosts —
+   * a candidate whose registrable domain matches one of the defaults', over
+   * https (api/dashboard) or wss/https (realtime). A literal host (localhost/IP)
+   * that is not an exact default-origin match is refused. This keeps the device
+   * JWT from ever being redirected to an attacker origin (defeats F24 bypass).
+   */
+  private isAllowedConfigUrl(candidate: string, kind: 'api' | 'realtime' | 'dashboard'): boolean {
+    let url: URL;
+    try {
+      url = new URL(candidate);
+    } catch {
+      return false;
+    }
+
+    const defaultRaw: Record<'api' | 'realtime' | 'dashboard', string> = {
+      api: DEFAULT_CONFIG.apiUrl,
+      realtime: DEFAULT_CONFIG.realtimeUrl,
+      dashboard: DEFAULT_CONFIG.dashboardUrl,
+    };
+    const defaultOrigins = new Set<string>();
+    const defaultDomains = new Set<string>();
+    for (const raw of Object.values(defaultRaw)) {
+      try {
+        const u = new URL(raw);
+        defaultOrigins.add(u.origin);
+        defaultDomains.add(VizoraAndroidTV.registrableDomain(u.hostname));
+      } catch { /* skip a malformed default */ }
+    }
+
+    // Exact match to a compiled-in default origin is inherently trusted.
+    if (defaultOrigins.has(url.origin)) return true;
+
+    // Public-host path: enforce a safe scheme (no wss→ws / https→http downgrade).
+    const schemeOk = kind === 'realtime'
+      ? url.protocol === 'wss:' || url.protocol === 'https:'
+      : url.protocol === 'https:';
+    if (!schemeOk) return false;
+
+    let defaultHost: string;
+    try {
+      defaultHost = new URL(defaultRaw[kind]).hostname;
+    } catch {
+      return false;
+    }
+    const isLiteral = (host: string) =>
+      host === 'localhost' || host.includes(':') || /^\d{1,3}(\.\d{1,3}){3}$/.test(host);
+    if (isLiteral(defaultHost) || isLiteral(url.hostname)) {
+      // A literal is involved but the origin didn't exactly match a default — refuse.
+      return false;
+    }
+    return defaultDomains.has(VizoraAndroidTV.registrableDomain(url.hostname));
+  }
+
+  /** Coarse registrable-domain heuristic: the last two dot-labels, lowercased. */
+  private static registrableDomain(hostname: string): string {
+    return hostname.toLowerCase().split('.').slice(-2).join('.');
   }
 
   private async setupCapacitor() {
@@ -482,7 +571,15 @@ class VizoraAndroidTV {
   private async migrateCredentialsToSecureStorage() {
     try {
       const secureToken = await SecureStorage.get({ key: 'device_token' });
-      if (secureToken.value) return; // Already migrated
+      if (secureToken.value) {
+        // F52: a prior crash between the secure write and the plaintext removal
+        // can strand plaintext credentials forever. Idempotently clean up any
+        // lingering plaintext keys on every boot, even when already migrated
+        // (Preferences.remove is a no-op when the key is absent).
+        await Preferences.remove({ key: 'device_token' });
+        await Preferences.remove({ key: 'device_id' });
+        return;
+      }
 
       const plainToken = await Preferences.get({ key: 'device_token' });
       const plainDeviceId = await Preferences.get({ key: 'device_id' });
@@ -672,7 +769,13 @@ class VizoraAndroidTV {
       container.appendChild(canvas);
     } catch (error) {
       console.error('[Vizora] Failed to generate QR code:', error);
-      container.innerHTML = `<div style="color: #888; font-size: 0.8rem; padding: 2rem;">QR unavailable<br>${pairUrl}</div>`;
+      // Render as text, never interpolated HTML — pairUrl carries a server-issued
+      // code and must not be injected as markup (F45).
+      container.innerHTML = '';
+      const fallback = document.createElement('div');
+      fallback.style.cssText = 'color: #888; font-size: 0.8rem; padding: 2rem; word-break: break-all;';
+      fallback.textContent = `QR unavailable — ${pairUrl}`;
+      container.appendChild(fallback);
     }
   }
 
@@ -953,14 +1056,25 @@ class VizoraAndroidTV {
       // push remains the low-latency fast-path. Fails safe — keeps last-known-good.
       void this.pullContent();
 
-      if (this.currentPlaylist && this.currentPlaylist.items?.length > 0) {
-        // Restored/ongoing playlist — keep or start playing while waiting for
-        // a server update. The machine enters PLAYING when a frame commits.
-        this.ensurePlaying();
-      } else if (!this.temporaryContent) {
-        // Paired but nothing assigned: branded holding, never a bare black
-        // content screen (F11).
-        this.enterHolding('paired_no_playlist');
+      // A successful handshake means the tenant is active — clear any stale
+      // suspension latch so playback can resume (F41). The block below owns the
+      // actual resume; do not double-render here.
+      if (this.tenantSuspended) {
+        this.exitTenantSuspended('reconnect_active');
+      }
+
+      // An active temporary push owns the screen — a reconnect must never cut it
+      // short (F47). Only touch playback when no push is showing.
+      if (!this.temporaryContent) {
+        if (this.currentPlaylist && this.currentPlaylist.items?.length > 0) {
+          // Restored/ongoing playlist — keep or start playing while waiting for
+          // a server update. The machine enters PLAYING when a frame commits.
+          this.ensurePlaying();
+        } else {
+          // Paired but nothing assigned: branded holding, never a bare black
+          // content screen (F11).
+          this.enterHolding('paired_no_playlist');
+        }
       }
     });
 
@@ -1012,8 +1126,8 @@ class VizoraAndroidTV {
 
     this.socket.on('tenant:resumed', () => {
       console.log('[Vizora] Tenant resumed');
-      reportEvent('tenant_resumed', {});
-      this.tenantSuspended = false;
+      // Dedupe the latch-clear through the shared helper (F41).
+      this.exitTenantSuspended('tenant_resumed_event');
       if (this.currentPlaylist?.items?.length) {
         void this.advance();
       } else {
@@ -1096,7 +1210,9 @@ class VizoraAndroidTV {
    */
   private async confirmRevocation(source: string): Promise<void> {
     const now = Date.now();
-    if (now - this.lastConfirmProbeAt < 5 * 60_000) {
+    // Operator unpair is a deliberate, human-initiated action — it must never be
+    // swallowed by revocation-signal noise inside the 5-min window (F46).
+    if (source !== 'unpair_command' && now - this.lastConfirmProbeAt < 5 * 60_000) {
       console.warn(`[Vizora] Revocation signal (${source}) dropped — confirmation rate limit`);
       return;
     }
@@ -1159,7 +1275,18 @@ class VizoraAndroidTV {
 
       if (status === 200) {
         this.exitAuthDegraded();
-        if (!this.socket?.connected) this.connectToRealtime();
+        // A 200 means the tenant is active again — clear the suspension latch
+        // (F41) so playback resumes instead of stranding forever on holding.
+        this.exitTenantSuspended('auth_check_active');
+        if (!this.socket?.connected) {
+          this.connectToRealtime();
+        } else if (!this.temporaryContent) {
+          if (this.currentPlaylist?.items?.length) {
+            this.ensurePlaying();
+          } else {
+            this.enterHolding('paired_no_playlist');
+          }
+        }
         return;
       }
       if (status === 410) {
@@ -1222,6 +1349,19 @@ class VizoraAndroidTV {
     this.tenantSuspended = true;
     this.enterHolding('tenant_suspended');
     this.setHoldingMessage('Display paused — contact your administrator');
+  }
+
+  /**
+   * Clear the tenant-suspension latch (F41). Idempotent: only fires telemetry on
+   * a real suspended→active transition. Callers own the actual playback resume,
+   * so this never double-renders. Without this, a device suspended via the
+   * auth-probe 403 path stays latched through a resume + reconnect and advance()'s
+   * gate (:1383) strands it on holding forever with valid cached content.
+   */
+  private exitTenantSuspended(source: string) {
+    if (!this.tenantSuspended) return;
+    this.tenantSuspended = false;
+    reportEvent('tenant_unsuspended', { source });
   }
 
   /**
@@ -1319,7 +1459,9 @@ class VizoraAndroidTV {
       // Keep the running rotation; only nudge the engine if it somehow parked
       // (ensurePlaying resumes from the current index — it does NOT reset to 0).
       this.playbackSource = 'live';
-      this.ensurePlaying();
+      // An active temporary push owns the screen — don't nudge the engine over
+      // it (F47); the push resumes into the running rotation on its own.
+      if (!this.temporaryContent) this.ensurePlaying();
       return;
     }
 
@@ -1347,6 +1489,16 @@ class VizoraAndroidTV {
     if (this.playbackTimer) {
       clearTimeout(this.playbackTimer);
       this.playbackTimer = null;
+    }
+
+    // F47: an active temporary push owns the screen. The new playlist is already
+    // stored + persisted above (so the latest content is ready); stage it for
+    // resume and preload its assets, but do NOT render over the push —
+    // resumePlaylist shows it when the push timer ends.
+    if (this.temporaryContent) {
+      this.savedPlaylistState = playlist.items?.length ? { playlist, index: 0 } : null;
+      this.preloadContent(playlist.items?.slice(0, 5) ?? []);
+      return;
     }
 
     if (playlist.items && playlist.items.length > 0) {
@@ -1635,18 +1787,35 @@ class VizoraAndroidTV {
         await this.confirmRevocation('unpair_command');
         break;
 
-      case 'update_config':
-        if (command.apiUrl) {
-          await Preferences.set({ key: 'config_api_url', value: command.apiUrl as string });
+      case 'update_config': {
+        // Validate each URL against a self-maintaining allowlist anchored to the
+        // COMPILED-IN defaults before persisting (F43). Without this, a malicious
+        // control-plane could point apiUrl at an attacker host; a follow-up media
+        // URL there would then be judged same-origin and receive the device JWT
+        // (defeating F24). Only accepted-and-changed fields trigger a reload.
+        const fields: Array<{ value: unknown; kind: 'api' | 'realtime' | 'dashboard'; prefKey: string; current: string }> = [
+          { value: command.apiUrl, kind: 'api', prefKey: 'config_api_url', current: this.config.apiUrl },
+          { value: command.realtimeUrl, kind: 'realtime', prefKey: 'config_realtime_url', current: this.config.realtimeUrl },
+          { value: command.dashboardUrl, kind: 'dashboard', prefKey: 'config_dashboard_url', current: this.config.dashboardUrl },
+        ];
+        let changed = false;
+        for (const field of fields) {
+          if (typeof field.value !== 'string' || !field.value) continue;
+          if (!this.isAllowedConfigUrl(field.value, field.kind)) {
+            let host = 'unparseable';
+            try { host = new URL(field.value).host; } catch { /* keep default */ }
+            console.warn(`[Vizora] update_config rejected ${field.kind} → ${host} (outside allowlist)`);
+            reportEvent('config_rejected', { kind: field.kind, host });
+            continue;
+          }
+          await Preferences.set({ key: field.prefKey, value: field.value });
+          if (field.value !== field.current) changed = true;
         }
-        if (command.realtimeUrl) {
-          await Preferences.set({ key: 'config_realtime_url', value: command.realtimeUrl as string });
+        if (changed) {
+          window.location.reload();
         }
-        if (command.dashboardUrl) {
-          await Preferences.set({ key: 'config_dashboard_url', value: command.dashboardUrl as string });
-        }
-        window.location.reload();
         break;
+      }
 
       case 'push_content':
         if (command.payload?.content != null) {
@@ -1670,6 +1839,13 @@ class VizoraAndroidTV {
   // ==================== TEMPORARY CONTENT PUSH ====================
 
   private handleContentPush(content: PushContent, duration: number = 5) {
+    // Tenant suspension fails closed for ALL rendering paths, including pushes
+    // (F50) — advance()'s suspend gate does not cover the temp-push path.
+    if (this.tenantSuspended) {
+      console.warn('[Vizora] push_content suppressed — tenant suspended (F50)');
+      reportEvent('push_suppressed_tenant_suspended', {});
+      return;
+    }
     console.log(`[Vizora] Pushing content: ${content.name} for ${duration} min`);
 
     // Save current playlist state if playing

@@ -25,6 +25,13 @@ public class MainActivity extends BridgeActivity {
     // always recovers.
     private static long lastRendererRecoveryAt = RendererRecoveryGuard.SENTINEL;
 
+    // F48: install the uncaught-exception handler exactly once per process. onCreate runs
+    // again on every in-process renderer-recovery relaunch (recoverFromRendererGone); each
+    // CrashRecoveryHandler captures the prior default as its delegate, so re-installing per
+    // onCreate grows an unbounded handler chain across relaunches. static → survives the
+    // relaunch in the same process.
+    private static boolean crashHandlerInstalled = false;
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         // Register SecureStorage plugin before super.onCreate (which initializes the bridge)
@@ -34,8 +41,12 @@ public class MainActivity extends BridgeActivity {
 
         enterImmersiveMode();
 
-        // C5: Register crash recovery handler for auto-restart
-        Thread.setDefaultUncaughtExceptionHandler(new CrashRecoveryHandler(this));
+        // C5: Register crash recovery handler for auto-restart. F48: install once per
+        // process — re-installing on every relaunch would chain handlers unboundedly.
+        if (!crashHandlerInstalled) {
+            Thread.setDefaultUncaughtExceptionHandler(new CrashRecoveryHandler(this));
+            crashHandlerInstalled = true;
+        }
 
         // C9: Only allow mixed content in debug builds (needed for local dev with MinIO)
         if (BuildConfig.DEBUG) {
