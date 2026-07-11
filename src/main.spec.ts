@@ -4,6 +4,40 @@
 
 import { describe, it, expect } from 'vitest';
 import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature, shouldApplyContent } from './utils';
+import { scrubUrl } from './crash-reporting';
+
+describe('scrubUrl (F51 — Sentry credential scrubbing)', () => {
+  it('strips a token query param entirely', () => {
+    expect(scrubUrl('https://api.vizora.io/dev-content/1/file?token=secret-jwt')).toBe(
+      'https://api.vizora.io/dev-content/1/file',
+    );
+  });
+
+  it('strips token but preserves other query params', () => {
+    const out = scrubUrl('https://api.vizora.io/file?w=100&token=secret-jwt&h=50');
+    expect(out).not.toContain('secret-jwt');
+    expect(out).toContain('w=100');
+    expect(out).toContain('h=50');
+  });
+
+  it('strips a capital-case token param (case-insensitive)', () => {
+    expect(scrubUrl('https://api.vizora.io/file?Token=secret-jwt')).not.toContain('secret-jwt');
+    expect(scrubUrl('https://api.vizora.io/file?TOKEN=secret-jwt')).not.toContain('secret-jwt');
+    expect(scrubUrl('https://api.vizora.io/file?w=1&Token=secret-jwt')).toContain('w=1');
+  });
+
+  it('is a no-op for URLs without a token', () => {
+    expect(scrubUrl('https://api.vizora.io/file?w=100')).toBe('https://api.vizora.io/file?w=100');
+  });
+
+  it('does not throw on a non-URL string', () => {
+    expect(() => scrubUrl('not-a-url token=secret')).not.toThrow();
+  });
+
+  it('handles empty input', () => {
+    expect(scrubUrl('')).toBe('');
+  });
+});
 
 describe('computePlaylistSignature (PD-1 playback idempotency)', () => {
   const P = (id: string, items: Array<{ contentId: string; order: number; duration: number }>) => ({ id, items });

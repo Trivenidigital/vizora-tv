@@ -2,6 +2,13 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  <!--
+    Host-document CSP intentionally deferred: srcdoc template iframes inherit and
+    enforce the intersection of the parent CSP, so a strict script-src here breaks
+    inline-JS templates (utils.ts injectContentSecurityPolicy). Revisit only with a
+    template-rendering change (real cross-origin iframe / blob URL instead of
+    srcdoc) so templates don't inherit it — validate on-device.
+  -->
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <meta name="format-detection" content="telephone=no">
   <meta name="msapplication-tap-highlight" content="no">

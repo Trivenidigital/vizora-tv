@@ -5,7 +5,6 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Exact alarms: auto-granted on API 31-32. USE_EXACT_ALARM is deliberately
          NOT declared — Play policy restricts it to alarm/clock/calendar apps.
          On API 33+ CrashRecoveryHandler falls back to a windowed inexact alarm. -->
@@ -51,6 +50,11 @@
             android:permission="android.permission.RECEIVE_BOOT_COMPLETED">
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- F55: OEM quick-boot / fast-boot broadcasts (some TV boxes send these
+                     instead of BOOT_COMPLETED). No directBootAware — the receiver needs
+                     credential-encrypted storage, unavailable during direct boot. -->
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
         </receiver>
 
