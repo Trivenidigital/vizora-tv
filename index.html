@@ -241,13 +241,6 @@
       right: 1rem;
       display: flex;
       align-items: center;
-      /* margins, not flex `gap` (Chromium 84+): TV engines up to webOS 5 /
-         Tizen 5.5 ignore flex gap, and @supports can't feature-detect it
-         separately from grid gap */
-    }
-
-    .status-bar > * + * {
-      margin-left: 0.5rem;
       background: rgba(0, 0, 0, 0.5);
       padding: 0.5rem 1rem;
       border-radius: 2rem;
@@ -255,6 +248,13 @@
       z-index: 1000;
       opacity: 0.7;
       transition: opacity 0.3s;
+    }
+
+    /* margins, not flex `gap` (Chromium 84+): TV engines up to webOS 5 /
+       Tizen 5.5 ignore flex gap, and @supports can't feature-detect it
+       separately from grid gap */
+    .status-bar > * + * {
+      margin-left: 0.5rem;
     }
 
     .status-bar:hover {

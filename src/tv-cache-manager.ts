@@ -180,6 +180,13 @@ export class TvCacheManager {
   // maintained on put/evict/clear).
   private statsItemCount = 0;
   private statsTotalBytes = 0;
+  /**
+   * Bumped by clearCache. An async cache operation that was in flight when a
+   * clear ran (revocation purge §3.4) must NOT write its entry back or mint a
+   * fresh object URL afterward — that would resurrect purged-tenant content
+   * into a cleared, unstamped store.
+   */
+  private clearGeneration = 0;
 
   // Default is lower than AndroidCacheManager's 500 MB: real TV IndexedDB
   // quotas are typically well under that, and it's better for the LRU
@@ -241,12 +248,14 @@ export class TvCacheManager {
     // this download while we awaited init/getCachedUri.
     if (this.downloadingSet.has(id)) return null;
     this.downloadingSet.add(id);
+    const gen = this.clearGeneration;
     try {
       const response = await fetch(url);
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
       const blob = await response.blob();
+      if (gen !== this.clearGeneration) return null; // cache was purged mid-download
 
       const entry: TvCacheEntry = {
         contentId: id,
@@ -269,6 +278,10 @@ export class TvCacheManager {
       this.statsTotalBytes += entry.size;
       this.lastAccessOverlay.set(id, entry.lastAccessed);
       await this.enforceMaxCacheSize();
+      // Re-check after the persist awaits: IDB transaction ordering means a
+      // concurrent clear wipes the rows we just wrote, but we must not hand
+      // out a live URL for purged content either.
+      if (gen !== this.clearGeneration) return null;
 
       const objectUrl = this.trackObjectUrl(id, blob);
       console.log(`[TvCache] Cached: ${id} (${blob.size} bytes)`);
@@ -285,8 +298,10 @@ export class TvCacheManager {
     await this.init();
     if (!this.initialized) return null;
 
+    const gen = this.clearGeneration;
     try {
       const entry = await this.store.getEntry(id);
+      if (gen !== this.clearGeneration) return null; // cache was purged mid-read
       if (!entry) {
         this.revokeObjectUrl(id);
         return null;
@@ -299,6 +314,7 @@ export class TvCacheManager {
       if (Date.now() - entry.lastAccessed > TvCacheManager.ACCESS_WRITE_INTERVAL_MS) {
         entry.lastAccessed = Date.now();
         await this.store.putEntry(entry);
+        if (gen !== this.clearGeneration) return null; // purged during the write
       }
       return this.trackObjectUrl(id, entry.blob);
     } catch (err) {
@@ -335,6 +351,7 @@ export class TvCacheManager {
   }
 
   async clearCache(): Promise<void> {
+    this.clearGeneration++;
     // Revoke first: clearCache is on the confirmed-revocation purge path
     // (purgeDeviceState §3.4) — live blob: URLs of the purged tenant's content
     // must die even if the IDB clear below throws.

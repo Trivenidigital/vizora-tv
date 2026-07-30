@@ -198,6 +198,27 @@ describe('clearCache', () => {
   });
 });
 
+describe('purge race', () => {
+  it('an in-flight getCachedUri across clearCache never resurrects purged content', async () => {
+    const entry = {
+      contentId: 'c1', blob: new Blob(['zzzz']), size: 4, mimeType: 'image/jpeg',
+      lastAccessed: Date.now(), downloadedAt: Date.now(),
+    };
+    store.entries.set('c1', entry);
+    let releaseGet!: () => void;
+    const gate = new Promise<void>(resolve => { releaseGet = resolve; });
+    const originalGetEntry = store.getEntry.bind(store);
+    store.getEntry = async (id: string) => { await gate; return originalGetEntry(id); };
+
+    const m = manager();
+    await m.init();
+    const pending = m.getCachedUri('c1'); // suspends inside store.getEntry
+    await m.clearCache();                 // revocation purge lands mid-read
+    releaseGet();
+    expect(await pending).toBeNull();     // no URL minted for purged content
+  });
+});
+
 describe('init degradation', () => {
   it('disables the cache when the store fails at init, without throwing', async () => {
     const failing: TvCacheStore = {
