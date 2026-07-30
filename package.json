@@ -18,6 +18,11 @@
     "android:build": "npm run build && cap sync android",
     "android:run": "npm run build && cap sync android && cap run android",
     "android:run:device": "npm run build && cap sync android && cap run android --target",
+    "build:tv": "vite build --mode tv",
+    "tizen:build": "npm run build:tv && node scripts/package-tv.mjs tizen",
+    "webos:build": "npm run build:tv && node scripts/package-tv.mjs webos",
+    "tv:build": "npm run build:tv && node scripts/package-tv.mjs all",
+    "tv:icons": "node scripts/generate-tv-icons.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "postinstall": "echo Run: npm run cap:init then npm run cap:add:android"
@@ -38,6 +43,7 @@
   "devDependencies": {
     "@capacitor/cli": "^6.0.0",
     "@resvg/resvg-js": "^2.6.2",
+    "@vitejs/plugin-legacy": "^5.4.3",
     "socket.io": "^4.8.3",
     "terser": "^5.46.0",
     "typescript": "^5.3.3",

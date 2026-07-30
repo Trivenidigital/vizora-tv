@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Samsung Tizen TV packaging manifest for the Vizora display client.
+
+  Packaged by scripts/package-tv.mjs into build/tizen/ together with the
+  dist-tv web build; see docs/SAMSUNG_LG_TV.md for signing + install steps
+  (requires Tizen Studio / tizen CLI with a Samsung certificate profile).
+
+  Notes:
+  - <access origin="*"> grants cross-origin network access (WARP) — the app
+    calls the Vizora API/realtime endpoints from a packaged (file://) origin.
+  - privilege/power backs tizen.power.request('SCREEN','SCREEN_NORMAL')
+    (screen keep-awake in src/platform.ts).
+  - required_version 4.0 = 2018+ Samsung TVs (Chromium 56); the dist-tv build
+    is transpiled/polyfilled for that floor via @vitejs/plugin-legacy.
+-->
+<widget xmlns="http://www.w3.org/ns/widgets"
+        xmlns:tizen="http://tizen.org/ns/widgets"
+        id="http://vizora.io/vizora-display"
+        version="1.0.1"
+        viewmodes="maximized">
+  <access origin="*" subdomains="true"/>
+  <tizen:application id="VizoraDsp0.VizoraDisplay" package="VizoraDsp0" required_version="4.0"/>
+  <content src="index.html"/>
+  <feature name="http://tizen.org/feature/screen.size.all"/>
+  <icon src="icon.png"/>
+  <name>Vizora Display</name>
+  <tizen:privilege name="http://tizen.org/privilege/internet"/>
+  <tizen:privilege name="http://tizen.org/privilege/power"/>
+  <tizen:profile name="tv-samsung"/>
+  <tizen:setting screen-orientation="landscape"
+                 context-menu="disable"
+                 background-support="disable"
+                 encryption="disable"
+                 install-location="auto"
+                 hwkey-event="enable"/>
+</widget>

@@ -3,6 +3,12 @@ node_modules/
 
 # Build output
 dist/
+dist-tv/
+build/
+
+# TV packages
+*.wgt
+*.ipk
 
 # Capacitor generated files (track android/ since we have custom native code)
 # android/  -- DO NOT gitignore: contains BootReceiver, SecureStoragePlugin, CrashRecoveryHandler

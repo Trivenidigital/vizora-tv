@@ -73,19 +73,27 @@ export function injectContentSecurityPolicy(html: string): string {
 }
 
 /**
- * Transforms content URLs for the Android TV environment:
+ * Transforms content URLs for the TV display environment:
  * - Relative URLs are prepended with apiUrl
- * - localhost/127.0.0.1 are rewritten to 10.0.2.2 (Android emulator host alias)
+ * - localhost/127.0.0.1 are rewritten to 10.0.2.2 — the ANDROID EMULATOR host
+ *   alias only, so callers on other platforms (Tizen/webOS/browser) disable it
+ *   via `rewriteLocalhostForEmulator: false` (10.0.2.2 resolves nowhere there)
  * - Device JWT token is appended only for same-origin URLs (never leaked to third parties)
  */
-export function transformContentUrl(url: string, apiUrl: string, deviceToken?: string | null): string {
+export function transformContentUrl(
+  url: string,
+  apiUrl: string,
+  deviceToken?: string | null,
+  options?: { rewriteLocalhostForEmulator?: boolean },
+): string {
   if (!url) return url;
+  const rewriteForEmulator = options?.rewriteLocalhostForEmulator ?? true;
   let result: string;
 
   // Handle relative URLs (e.g. /api/v1/...) by prepending apiUrl
   if (url.startsWith('/') && apiUrl) {
     result = apiUrl.replace(/\/$/, '') + url;
-  } else if (apiUrl.includes('localhost') || apiUrl.includes('127.0.0.1')) {
+  } else if (rewriteForEmulator && (apiUrl.includes('localhost') || apiUrl.includes('127.0.0.1'))) {
     result = url.replace(/http:\/\/localhost/g, 'http://10.0.2.2')
                 .replace(/http:\/\/127\.0\.0\.1/g, 'http://10.0.2.2');
   } else {
