@@ -15,11 +15,18 @@ export default defineConfig(({ mode }) => {
 
   return {
     root: '.',
+    // Packaged TV apps load index.html from file:// — asset URLs must be
+    // relative, root-absolute /assets/... resolves to the filesystem root.
+    base: isTvBuild ? './' : '/',
     plugins: isTvBuild
       ? [
           legacy({
             targets: ['chrome >= 53'],
-            modernPolyfills: true,
+            // Legacy-only output: <script type="module"> is blocked from a
+            // file:// origin on Chromium (opaque-origin CORS), so a modern
+            // TV would skip the nomodule path AND fail the module path —
+            // nothing would run. Classic-script SystemJS works everywhere.
+            renderModernChunks: false,
           }),
         ]
       : [],

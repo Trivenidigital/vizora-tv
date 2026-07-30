@@ -57,6 +57,20 @@ function req<T>(r: IDBRequest<T>): Promise<T> {
   });
 }
 
+/**
+ * Resolve when the transaction COMMITS (not when the request succeeds): on
+ * quota-constrained TV storage a write request can "succeed" and the
+ * transaction still abort at commit (QuotaExceededError) — reporting success
+ * then would leave the manager believing an entry is persisted when it isn't.
+ */
+function txDone(tx: IDBTransaction): Promise<void> {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error ?? new Error('IndexedDB transaction aborted'));
+  });
+}
+
 class IndexedDbCacheStore implements TvCacheStore {
   private dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -84,28 +98,29 @@ class IndexedDbCacheStore implements TvCacheStore {
     return this.dbPromise;
   }
 
-  private async tx(storeName: string, mode: IDBTransactionMode): Promise<IDBObjectStore> {
-    const db = await this.openDb();
-    return db.transaction(storeName, mode).objectStore(storeName);
-  }
-
   async getEntry(id: string): Promise<TvCacheEntry | null> {
-    const store = await this.tx(FILES_STORE, 'readonly');
+    const db = await this.openDb();
+    const store = db.transaction(FILES_STORE, 'readonly').objectStore(FILES_STORE);
     return (await req(store.get(id))) ?? null;
   }
 
   async putEntry(entry: TvCacheEntry): Promise<void> {
-    const store = await this.tx(FILES_STORE, 'readwrite');
-    await req(store.put(entry));
+    const db = await this.openDb();
+    const tx = db.transaction(FILES_STORE, 'readwrite');
+    tx.objectStore(FILES_STORE).put(entry);
+    await txDone(tx);
   }
 
   async deleteEntry(id: string): Promise<void> {
-    const store = await this.tx(FILES_STORE, 'readwrite');
-    await req(store.delete(id));
+    const db = await this.openDb();
+    const tx = db.transaction(FILES_STORE, 'readwrite');
+    tx.objectStore(FILES_STORE).delete(id);
+    await txDone(tx);
   }
 
   async listEntries(): Promise<Array<Omit<TvCacheEntry, 'blob'>>> {
-    const store = await this.tx(FILES_STORE, 'readonly');
+    const db = await this.openDb();
+    const store = db.transaction(FILES_STORE, 'readonly').objectStore(FILES_STORE);
     const all: TvCacheEntry[] = await req(store.getAll());
     // Strip blobs so eviction scans don't hold every asset in memory.
     return all.map(({ contentId, size, mimeType, lastAccessed, downloadedAt }) => ({
@@ -114,20 +129,29 @@ class IndexedDbCacheStore implements TvCacheStore {
   }
 
   async getMeta(): Promise<TvCacheMeta | null> {
-    const store = await this.tx(META_STORE, 'readonly');
+    const db = await this.openDb();
+    const store = db.transaction(META_STORE, 'readonly').objectStore(META_STORE);
     return (await req(store.get(META_KEY))) ?? null;
   }
 
   async putMeta(meta: TvCacheMeta): Promise<void> {
-    const store = await this.tx(META_STORE, 'readwrite');
-    await req(store.put(meta, META_KEY));
+    const db = await this.openDb();
+    const tx = db.transaction(META_STORE, 'readwrite');
+    tx.objectStore(META_STORE).put(meta, META_KEY);
+    await txDone(tx);
   }
 
   async clearAll(): Promise<void> {
-    const files = await this.tx(FILES_STORE, 'readwrite');
-    await req(files.clear());
-    const meta = await this.tx(META_STORE, 'readwrite');
-    await req(meta.clear());
+    const db = await this.openDb();
+    // Files first: a partial failure must err toward "stamp survives, blobs
+    // gone", never the reverse (an unstamped populated cache would dodge the
+    // tenant purge at the next init).
+    const filesTx = db.transaction(FILES_STORE, 'readwrite');
+    filesTx.objectStore(FILES_STORE).clear();
+    await txDone(filesTx);
+    const metaTx = db.transaction(META_STORE, 'readwrite');
+    metaTx.objectStore(META_STORE).clear();
+    await txDone(metaTx);
   }
 }
 
@@ -138,12 +162,29 @@ export class TvCacheManager {
   private maxCacheSizeMB: number;
   private downloadingSet = new Set<string>();
   private initialized = false;
-  private initFailed = false;
+  /** Latched only for a structurally absent IndexedDB — transient init
+   *  failures leave this false so the next call retries. */
+  private cacheUnavailable = false;
+  private initPromise: Promise<void> | null = null;
   private expectedTenant: string | null = null;
-  /** id → live object URL, revoked on eviction/clear to avoid leaking blobs. */
+  /** id → live object URL. Minted once per id and reused — see trackObjectUrl. */
   private objectUrls = new Map<string, string>();
+  /**
+   * In-memory freshness overlay: the persisted lastAccessed is throttled to
+   * one write a minute, so eviction consults max(persisted, overlay) — the
+   * asset currently on glass must never be the LRU victim just because its
+   * access timestamp hasn't been flushed yet.
+   */
+  private lastAccessOverlay = new Map<string, number>();
+  // Persisted-cache accounting for getCacheStats (refreshed at init,
+  // maintained on put/evict/clear).
+  private statsItemCount = 0;
+  private statsTotalBytes = 0;
 
-  constructor(maxCacheSizeMB = 500, store?: TvCacheStore) {
+  // Default is lower than AndroidCacheManager's 500 MB: real TV IndexedDB
+  // quotas are typically well under that, and it's better for the LRU
+  // eviction to own the ceiling than for QuotaExceededError to.
+  constructor(maxCacheSizeMB = 200, store?: TvCacheStore) {
     this.maxCacheSizeMB = maxCacheSizeMB;
     this.store = store ?? new IndexedDbCacheStore();
   }
@@ -154,11 +195,18 @@ export class TvCacheManager {
   }
 
   async init(): Promise<void> {
-    if (this.initialized || this.initFailed) return;
+    if (this.initialized || this.cacheUnavailable) return;
+    // Serialize concurrent initializers (render + preload race at boot).
+    if (!this.initPromise) {
+      this.initPromise = this.doInit().finally(() => { this.initPromise = null; });
+    }
+    return this.initPromise;
+  }
 
+  private async doInit(): Promise<void> {
     if (typeof indexedDB === 'undefined' && this.store instanceof IndexedDbCacheStore) {
       console.warn('[TvCache] IndexedDB unavailable — cache disabled, streaming direct');
-      this.initFailed = true;
+      this.cacheUnavailable = true;
       return;
     }
 
@@ -168,10 +216,15 @@ export class TvCacheManager {
         console.warn('[TvCache] Cache belongs to a different tenant — clearing');
         await this.store.clearAll();
       }
+      const entries = await this.store.listEntries();
+      this.statsItemCount = entries.length;
+      this.statsTotalBytes = entries.reduce((sum, e) => sum + e.size, 0);
       this.initialized = true;
     } catch (err) {
-      console.warn('[TvCache] init failed — cache disabled, streaming direct:', err);
-      this.initFailed = true;
+      // NOT latched: a transient IndexedDB hiccup at boot must not disable
+      // caching for the whole session (offline resilience depends on it) —
+      // the next cache call retries init.
+      console.warn('[TvCache] init failed — will retry on next cache access:', err);
     }
   }
 
@@ -184,6 +237,9 @@ export class TvCacheManager {
     const existing = await this.getCachedUri(id);
     if (existing) return existing;
 
+    // Re-check after the async gap above: a concurrent caller may have begun
+    // this download while we awaited init/getCachedUri.
+    if (this.downloadingSet.has(id)) return null;
     this.downloadingSet.add(id);
     try {
       const response = await fetch(url);
@@ -200,10 +256,18 @@ export class TvCacheManager {
         lastAccessed: Date.now(),
         downloadedAt: Date.now(),
       };
-      await this.store.putEntry(entry);
+      // Stamp the tenant BEFORE persisting the entry: a crash between the two
+      // IDB transactions must not leave tenant-bound blobs in a cache with no
+      // tenant stamp — an unstamped-but-populated cache would slip through the
+      // init purge via the legacy-grace path (contract §1.4/§2). Stamp-first
+      // fails in the safe direction (stamp with no entries).
       if (this.expectedTenant) {
         await this.store.putMeta({ tenantId: this.expectedTenant });
       }
+      await this.store.putEntry(entry);
+      this.statsItemCount += 1;
+      this.statsTotalBytes += entry.size;
+      this.lastAccessOverlay.set(id, entry.lastAccessed);
       await this.enforceMaxCacheSize();
 
       const objectUrl = this.trackObjectUrl(id, blob);
@@ -221,23 +285,22 @@ export class TvCacheManager {
     await this.init();
     if (!this.initialized) return null;
 
-    // A live object URL is already backed by an in-memory blob — reuse it.
-    const live = this.objectUrls.get(id);
-
     try {
       const entry = await this.store.getEntry(id);
       if (!entry) {
         this.revokeObjectUrl(id);
         return null;
       }
+      this.lastAccessOverlay.set(id, Date.now());
       // Persist lastAccessed at most once a minute — an IDB put rewrites the
       // whole record (blob included, via structured clone), which is too heavy
-      // to pay on every playlist rotation past a large video.
+      // to pay on every playlist rotation past a large video. Eviction reads
+      // the in-memory overlay, so freshness is never lost, only deferred.
       if (Date.now() - entry.lastAccessed > TvCacheManager.ACCESS_WRITE_INTERVAL_MS) {
         entry.lastAccessed = Date.now();
         await this.store.putEntry(entry);
       }
-      return live ?? this.trackObjectUrl(id, entry.blob);
+      return this.trackObjectUrl(id, entry.blob);
     } catch (err) {
       console.warn(`[TvCache] getCachedUri(${id}) failed:`, err);
       return null;
@@ -249,14 +312,21 @@ export class TvCacheManager {
     try {
       const entries = await this.store.listEntries();
       let totalSize = entries.reduce((sum, e) => sum + e.size, 0);
+      this.statsItemCount = entries.length;
+      this.statsTotalBytes = totalSize;
       if (totalSize <= maxBytes) return;
 
-      const byOldest = entries.slice().sort((a, b) => a.lastAccessed - b.lastAccessed);
+      const effectiveAccess = (e: { contentId: string; lastAccessed: number }) =>
+        Math.max(e.lastAccessed, this.lastAccessOverlay.get(e.contentId) ?? 0);
+      const byOldest = entries.slice().sort((a, b) => effectiveAccess(a) - effectiveAccess(b));
       for (const entry of byOldest) {
         if (totalSize <= maxBytes) break;
         await this.store.deleteEntry(entry.contentId);
         this.revokeObjectUrl(entry.contentId);
+        this.lastAccessOverlay.delete(entry.contentId);
         totalSize -= entry.size;
+        this.statsItemCount -= 1;
+        this.statsTotalBytes -= entry.size;
         console.log(`[TvCache] Evicted ${entry.contentId}`);
       }
     } catch (err) {
@@ -265,11 +335,17 @@ export class TvCacheManager {
   }
 
   async clearCache(): Promise<void> {
+    // Revoke first: clearCache is on the confirmed-revocation purge path
+    // (purgeDeviceState §3.4) — live blob: URLs of the purged tenant's content
+    // must die even if the IDB clear below throws.
+    for (const id of Array.from(this.objectUrls.keys())) {
+      this.revokeObjectUrl(id);
+    }
+    this.lastAccessOverlay.clear();
     try {
       await this.store.clearAll();
-      for (const id of Array.from(this.objectUrls.keys())) {
-        this.revokeObjectUrl(id);
-      }
+      this.statsItemCount = 0;
+      this.statsTotalBytes = 0;
       console.log('[TvCache] Cache cleared');
     } catch (err) {
       console.error('[TvCache] Failed to clear cache:', err);
@@ -277,19 +353,24 @@ export class TvCacheManager {
   }
 
   getCacheStats(): { itemCount: number; totalSizeMB: number; maxSizeMB: number } {
-    // Synchronous signature is part of the shared interface; the async store
-    // can't be consulted here. Report live object-URL count as the item count
-    // (what is actually usable this session) — the authoritative accounting
-    // lives in enforceMaxCacheSize.
     return {
-      itemCount: this.objectUrls.size,
-      totalSizeMB: 0,
+      itemCount: this.statsItemCount,
+      totalSizeMB: Math.round(this.statsTotalBytes / 1024 / 1024 * 100) / 100,
       maxSizeMB: this.maxCacheSizeMB,
     };
   }
 
+  /**
+   * Mint (or reuse) the object URL for an id. REUSE is load-bearing: two
+   * concurrent cache calls for the same id (render path + preload race on a
+   * playlist update) must not revoke-and-replace each other's URL — the first
+   * caller would be handed a URL that is dead by the time it reaches img.src.
+   * An id's blob only changes after eviction, which removes the id from this
+   * map, so a live mapping is always backed by the current blob.
+   */
   private trackObjectUrl(id: string, blob: Blob): string {
-    this.revokeObjectUrl(id);
+    const existing = this.objectUrls.get(id);
+    if (existing) return existing;
     const url = URL.createObjectURL(blob);
     this.objectUrls.set(id, url);
     return url;

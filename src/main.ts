@@ -630,6 +630,27 @@ class VizoraAndroidTV {
     }
   }
 
+  // ==================== HTTP ====================
+
+  /**
+   * Bound an HTTP promise in wall-clock time. CapacitorHttp's native layer
+   * honors connectTimeout/readTimeout, but its WEB implementation (the TV
+   * runtimes) is a bare fetch that ignores both — a black-holed connection
+   * would hang the awaiting flow forever. Pairing retries and the auth-probe
+   * loop reschedule only after the promise settles, so an unbounded hang
+   * permanently stalls them. The underlying fetch may keep running (no
+   * AbortController on Chromium 53); only the app logic is unblocked.
+   */
+  private static httpWithTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      promise.then(
+        (value) => { clearTimeout(timer); resolve(value); },
+        (err) => { clearTimeout(timer); reject(err); },
+      );
+    });
+  }
+
   // ==================== PAIRING ====================
 
   private getPairingRetryDelay(): number {
@@ -666,17 +687,21 @@ class VizoraAndroidTV {
 
       console.log('[Vizora] Making pairing request to:', `${this.config.apiUrl}/api/v1/devices/pairing/request`);
 
-      // Use Capacitor's native HTTP for Android
-      const response: HttpResponse = await CapacitorHttp.post({
-        url: `${this.config.apiUrl}/api/v1/devices/pairing/request`,
-        headers: { 'Content-Type': 'application/json' },
-        data: {
-          deviceIdentifier,
-          metadata: deviceInfo,
-        },
-        connectTimeout: 10000,
-        readTimeout: 15000,
-      });
+      // Native HTTP on Android; fetch on the TV web runtimes
+      const response: HttpResponse = await VizoraAndroidTV.httpWithTimeout(
+        CapacitorHttp.post({
+          url: `${this.config.apiUrl}/api/v1/devices/pairing/request`,
+          headers: { 'Content-Type': 'application/json' },
+          data: {
+            deviceIdentifier,
+            metadata: deviceInfo,
+          },
+          connectTimeout: 10000,
+          readTimeout: 15000,
+        }),
+        30_000,
+        'pairing request',
+      );
 
       console.log('[Vizora] Pairing response status:', response.status);
 
@@ -818,12 +843,16 @@ class VizoraAndroidTV {
       if (!this.pairingCode || !this.isOnline) return;
 
       try {
-        // Use Capacitor's native HTTP for Android
-        const response: HttpResponse = await CapacitorHttp.get({
-          url: `${this.config.apiUrl}/api/v1/devices/pairing/status/${this.pairingCode}`,
-          connectTimeout: 10000,
-          readTimeout: 10000,
-        });
+        // Native HTTP on Android; fetch on the TV web runtimes
+        const response: HttpResponse = await VizoraAndroidTV.httpWithTimeout(
+          CapacitorHttp.get({
+            url: `${this.config.apiUrl}/api/v1/devices/pairing/status/${this.pairingCode}`,
+            connectTimeout: 10000,
+            readTimeout: 10000,
+          }),
+          15_000,
+          'pairing status poll',
+        );
 
         if (response.status < 200 || response.status >= 300) {
           if (response.status === 404) {
@@ -984,12 +1013,16 @@ class VizoraAndroidTV {
   private async pullContent(): Promise<void> {
     if (!this.deviceToken || !this.isOnline) return;
     try {
-      const response: HttpResponse = await CapacitorHttp.get({
-        url: `${this.config.apiUrl}/api/v1/devices/me/content`,
-        headers: { Authorization: `Bearer ${this.deviceToken}` },
-        connectTimeout: 10000,
-        readTimeout: 10000,
-      });
+      const response: HttpResponse = await VizoraAndroidTV.httpWithTimeout(
+        CapacitorHttp.get({
+          url: `${this.config.apiUrl}/api/v1/devices/me/content`,
+          headers: { Authorization: `Bearer ${this.deviceToken}` },
+          connectTimeout: 10000,
+          readTimeout: 10000,
+        }),
+        20_000,
+        'content pull',
+      );
       if (response.status < 200 || response.status >= 300) {
         console.warn(`[Vizora] pullContent non-2xx (${response.status}) — keeping last-known-good`);
         return; // fail safe
@@ -1213,12 +1246,16 @@ class VizoraAndroidTV {
   private async runAuthCheck(): Promise<number | null> {
     if (!this.deviceToken) return null;
     try {
-      const response: HttpResponse = await CapacitorHttp.get({
-        url: `${this.config.apiUrl}/api/v1/devices/auth/check`,
-        headers: { Authorization: `Bearer ${this.deviceToken}` },
-        connectTimeout: 10000,
-        readTimeout: 10000,
-      });
+      const response: HttpResponse = await VizoraAndroidTV.httpWithTimeout(
+        CapacitorHttp.get({
+          url: `${this.config.apiUrl}/api/v1/devices/auth/check`,
+          headers: { Authorization: `Bearer ${this.deviceToken}` },
+          connectTimeout: 10000,
+          readTimeout: 10000,
+        }),
+        20_000,
+        'auth check',
+      );
       // Mechanical gate for the §7.1a carve-out: once this device has ever
       // seen the auth-check endpoint respond (backend item §6.4 deployed),
       // remember it — a later 404 can then only mean an anomaly, never

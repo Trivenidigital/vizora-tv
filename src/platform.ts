@@ -42,11 +42,17 @@ interface WebOSServiceGlobal {
   };
 }
 
+interface PalmServiceBridgeInstance {
+  onservicecallback: ((msg: string) => void) | null;
+  call(uri: string, params: string): void;
+}
+
 declare global {
   interface Window {
     tizen?: TizenGlobal;
     webOS?: WebOSServiceGlobal;
     PalmSystem?: unknown;
+    PalmServiceBridge?: new () => PalmServiceBridgeInstance;
     Capacitor?: { isNativePlatform?: () => boolean };
   }
 }
@@ -140,15 +146,31 @@ function keepScreenAwakeTizen(): void {
 }
 
 /**
- * webOS: best-effort screensaver suppression via the Luna bus. Consumer
- * firmwares differ in which service is exposed; a failure is logged and
- * ignored — continuous <video> playback already inhibits the screensaver on
- * most models, so this is defense in depth, not a hard requirement.
+ * webOS: best-effort screensaver suppression via the Luna bus.
+ *
+ * The raw PalmServiceBridge global is what the webOS web runtime actually
+ * injects into every web app; the nicer `window.webOS.service` API only
+ * exists when LG's webOSTV.js library is bundled, so it is the FALLBACK,
+ * not the primary path. Consumer firmwares differ in which power service is
+ * exposed; a failure is logged and ignored — continuous <video> playback
+ * already inhibits the screensaver on most models, so this is defense in
+ * depth, not a hard requirement.
  */
 function keepScreenAwakeWebOS(): void {
+  const uri = 'luna://com.webos.service.tvpower/power/setScreenSaverOff';
+  const params = { screenSaverOff: true };
   try {
-    window.webOS?.service?.request?.('luna://com.webos.service.tvpower/power/setScreenSaverOff', {
-      parameters: { screenSaverOff: true },
+    if (typeof window.PalmServiceBridge === 'function') {
+      const bridge = new window.PalmServiceBridge();
+      bridge.onservicecallback = (msg: string) => {
+        console.log('[Platform] webOS screensaver-off response:', msg);
+      };
+      bridge.call(uri, JSON.stringify(params));
+      return;
+    }
+    // webOSTV.js, if the deployment bundles it.
+    window.webOS?.service?.request?.(uri, {
+      parameters: params,
       onFailure: (res: unknown) => {
         console.warn('[Platform] webOS screensaver-off request rejected (non-fatal):', res);
       },

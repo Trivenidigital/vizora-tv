@@ -12,7 +12,7 @@
  * release machine — this script stops at the assembled directory and prints
  * the exact command to run next. See docs/SAMSUNG_LG_TV.md.
  */
-import { cpSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -38,6 +38,14 @@ function assemble(platform) {
   // Web build first, then the platform manifest/icons on top.
   cpSync(distTv, out, { recursive: true });
   cpSync(src, out, { recursive: true });
+
+  // Packaged TV apps load from file:// — a `crossorigin` attribute puts the
+  // script fetch in CORS mode, which stock Chromium blocks for file:// URLs.
+  // Vite emits the attribute for HTTP serving; strip it for the package.
+  const indexPath = join(out, 'index.html');
+  const html = readFileSync(indexPath, 'utf8');
+  writeFileSync(indexPath, html.replace(/ crossorigin(="[^"]*")?/g, ''));
+
   console.log(`Assembled ${out}`);
 }
 

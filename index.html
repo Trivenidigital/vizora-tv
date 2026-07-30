@@ -241,7 +241,13 @@
       right: 1rem;
       display: flex;
       align-items: center;
-      gap: 0.5rem;
+      /* margins, not flex `gap` (Chromium 84+): TV engines up to webOS 5 /
+         Tizen 5.5 ignore flex gap, and @supports can't feature-detect it
+         separately from grid gap */
+    }
+
+    .status-bar > * + * {
+      margin-left: 0.5rem;
       background: rgba(0, 0, 0, 0.5);
       padding: 0.5rem 1rem;
       border-radius: 2rem;
@@ -322,8 +328,12 @@
       display: flex;
       flex-direction: column;
       align-items: center;
-      gap: 4px;
+      /* margins, not flex `gap` — see .status-bar note */
       pointer-events: none;
+    }
+
+    #qr-overlay > * + * {
+      margin-top: 4px;
     }
 
     #qr-overlay.top-left { top: 16px; left: 16px; }

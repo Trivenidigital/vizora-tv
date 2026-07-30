@@ -104,7 +104,21 @@ describe('initTvPlatform', () => {
     expect(() => initTvPlatform()).not.toThrow();
   });
 
-  it('requests webOS screensaver-off via the Luna bus when available', () => {
+  it('requests webOS screensaver-off via the raw PalmServiceBridge (the runtime-injected API)', () => {
+    const call = vi.fn();
+    class BridgeStub {
+      onservicecallback: ((msg: string) => void) | null = null;
+      call = call;
+    }
+    stubEnv({ PalmSystem: {}, PalmServiceBridge: BridgeStub });
+    initTvPlatform();
+    expect(call).toHaveBeenCalledWith(
+      'luna://com.webos.service.tvpower/power/setScreenSaverOff',
+      JSON.stringify({ screenSaverOff: true }),
+    );
+  });
+
+  it('falls back to webOSTV.js service.request when PalmServiceBridge is absent', () => {
     const request = vi.fn();
     stubEnv({ PalmSystem: {}, webOS: { service: { request } } });
     initTvPlatform();
@@ -114,8 +128,16 @@ describe('initTvPlatform', () => {
     );
   });
 
-  it('is a no-op on webOS without a service bridge', () => {
+  it('is a no-op on webOS without any service bridge', () => {
     stubEnv({ PalmSystem: {} });
+    expect(() => initTvPlatform()).not.toThrow();
+  });
+
+  it('survives a throwing PalmServiceBridge', () => {
+    class ThrowingBridge {
+      constructor() { throw new Error('luna denied'); }
+    }
+    stubEnv({ PalmSystem: {}, PalmServiceBridge: ThrowingBridge });
     expect(() => initTvPlatform()).not.toThrow();
   });
 

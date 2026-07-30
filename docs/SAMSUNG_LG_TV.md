@@ -42,9 +42,14 @@ npm run webos:build   # build:tv + assemble build/webos/
 npm run tv:build      # both
 ```
 
-The TV build transpiles + polyfills down to Chromium 53 and emits a SystemJS
-(`nomodule`) loader — the frozen TV engines predate `<script type="module">`.
-Newer TVs automatically use the modern build in the same bundle.
+The TV build transpiles + polyfills down to Chromium 53, uses a relative
+`base` (packaged apps load from `file://`, where root-absolute `/assets/…`
+resolves to the filesystem root), and emits ONLY the legacy SystemJS bundle
+(`renderModernChunks: false`): `<script type="module">` is blocked from a
+`file://` origin on Chromium regardless of engine age, so shipping module
+scripts at all would strand newer TVs. `scripts/package-tv.mjs` additionally
+strips `crossorigin` attributes, which put script fetches into (blocked)
+CORS mode on `file://`.
 
 ### Packaging for Samsung (Tizen Studio required)
 
@@ -86,9 +91,16 @@ with `npm run tv:icons`.
 ## Backend / operations notes
 
 - **CORS**: packaged TV apps run from a `file://` origin, so API requests may
-  carry `Origin: null` (or no Origin). The API and Socket.IO realtime gateway
-  must not reject null-origin requests from device endpoints. Tizen's
-  `<access origin="*">` grants the client side; the server side must allow it.
+  carry `Origin: null` (or no Origin). Unlike Android's native CapacitorHttp
+  (which bypasses CORS), the TV path is a real browser `fetch`: the JSON
+  pairing POST and every `Authorization`-header GET trigger an OPTIONS
+  preflight. The API **and** the Socket.IO realtime gateway (including its
+  polling transport) must answer preflights and allow null-origin requests on
+  device endpoints. Tizen's `<access origin="*">` grants the client side; the
+  server side must allow it.
+- **HTTP timeouts**: the web fetch path has no native connect/read timeouts;
+  the app enforces wall-clock bounds itself (`httpWithTimeout` in main.ts) so
+  a black-holed connection can't stall the pairing or auth-probe loops.
 - **Pairing metadata**: expect `platform: "tizen_tv" | "webos_tv"` and
   `tizen-`/`webos-` prefixed device identifiers from these devices.
 - **Auto-start on boot**: Android auto-starts via `BootReceiver`. Consumer
@@ -110,9 +122,37 @@ storage. Revocation (contract §3.4) behaves identically on all platforms.
 - **Multi-zone layouts** use CSS Grid (Chromium 57+): rendered correctly on
   Tizen 5.0+ (2019) and webOS 5.0+ (2020); on the 2018 floor models zones
   stack instead of forming a grid. Single-content playlists are unaffected.
-- **Keep-awake on webOS** is best-effort (Luna service availability varies by
-  firmware); continuous video playback inhibits the screensaver on most models.
+- **Keep-awake on webOS** is best-effort: the app calls the Luna power
+  service through the runtime-injected `PalmServiceBridge` (falling back to
+  `webOS.service` if webOSTV.js is bundled), but which power methods exist
+  varies by firmware; continuous video playback inhibits the screensaver on
+  most models.
+- **Content cache size** defaults to 200 MB on TV (vs 500 MB on Android) —
+  real TV IndexedDB quotas are limited, and a quota error just degrades that
+  asset to direct streaming.
 - **Heartbeat memory metrics** (`performance.memory`) are Chrome-only and
   report the default value on some TV engines.
 - The Tizen/webOS **emulators/simulators** don't implement every TV API
   (`webapis`, some Luna services); on-device testing is authoritative.
+
+## On-device verification checklist
+
+Code-level review can't cover everything; verify on real hardware (one 2018
+floor model + one recent model per brand):
+
+1. App boots from the installed package (SystemJS bundle loads from `file://`).
+2. Pairing round-trip against production API — watch for CORS preflight
+   rejections (`Origin: null`) in the remote web inspector.
+3. Socket.IO connects (websocket first, then force polling) and heartbeats ack.
+4. TLS: 2018-era TV trust stores may lack newer roots (e.g. ISRG Root X1 /
+   Let's Encrypt) — confirm the production cert chain is accepted.
+5. Offline resilience: pull power, reboot without network, cached playlist
+   plays from IndexedDB.
+6. IndexedDB quota behavior with a video-heavy playlist (eviction vs quota
+   errors).
+7. Screensaver stays off through a long image-only playlist (Tizen `power`
+   privilege / webOS Luna call).
+8. Remote-control Back key does not exit the app; app survives Home + relaunch.
+9. If `VITE_SENTRY_DSN` is set: @sentry/browser 10.x officially targets newer
+   engines than Chromium 53 — verify init doesn't throw, or ship TV builds
+   with the DSN empty.
