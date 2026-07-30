@@ -1,13 +1,19 @@
 /**
- * Vizora Android TV Display Client
+ * Vizora TV Display Client
  *
- * Built with Capacitor for native Android TV support.
+ * One codebase, three TV families:
+ * - Android TV — Capacitor native runtime (native HTTP, Filesystem cache,
+ *   Keystore-backed SecureStorage, boot auto-start)
+ * - Samsung Smart TV (Tizen) and LG Smart TV (webOS) — packaged web app; the
+ *   Capacitor plugin calls below fall through to their web implementations
+ *   (Preferences→localStorage, CapacitorHttp→fetch, Network→navigator.onLine,
+ *   App→visibilitychange, SplashScreen→no-op) and src/platform.ts owns the
+ *   genuinely platform-specific pieces (detection, keep-awake, remote keys).
+ *
  * Features:
- * - Native Android performance
- * - D-pad navigation support
+ * - D-pad / remote-control navigation support
  * - Hardware acceleration for video
- * - Background service capability
- * - Auto-start on boot
+ * - Auto-start on boot (Android; TV runtimes configure this per-platform)
  * - Persistent storage via Capacitor Preferences
  */
 
@@ -18,6 +24,14 @@ import { SplashScreen } from '@capacitor/splash-screen';
 import { CapacitorHttp, HttpResponse } from '@capacitor/core';
 import { io, Socket } from 'socket.io-client';
 import { AndroidCacheManager } from './cache-manager';
+import { TvCacheManager } from './tv-cache-manager';
+import {
+  initTvPlatform,
+  isNativeCapacitor,
+  isTvBackKey,
+  platformDeviceType,
+  platformIdentifierPrefix,
+} from './platform';
 import { SecureStorage } from './secure-storage';
 import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature, shouldApplyContent } from './utils';
 import { ScreenStateMachine } from './screen-state';
@@ -135,7 +149,11 @@ class VizoraAndroidTV {
   private currentContentPlaylistId: string | null = null;
   private playbackTimer: ReturnType<typeof setTimeout> | null = null;
   private isOnline = true;
-  private cacheManager = new AndroidCacheManager();
+  // Filesystem-backed cache under Capacitor (native URIs via convertFileSrc);
+  // IndexedDB blob cache on the TV web runtimes, where Filesystem URIs don't
+  // resolve. Both honor the same tenant-binding + LRU contract.
+  private cacheManager: AndroidCacheManager | TvCacheManager =
+    isNativeCapacitor() ? new AndroidCacheManager() : new TvCacheManager();
 
   // Screen ownership state machine (P0-1) — the only screen-visibility authority
   private machine: ScreenStateMachine;
@@ -445,6 +463,10 @@ class VizoraAndroidTV {
     // Init retries must not double-register listeners (F19 retry path)
     if (this.capacitorSetupDone) return;
 
+    // TV runtime bootstrap (Tizen/webOS keep-awake etc.) — no-op on Android,
+    // best-effort everywhere: a missing TV API must never fail init.
+    initTvPlatform();
+
     // Setup network status monitoring
     Network.addListener('networkStatusChange', (status) => {
       console.log('[Vizora] Network status changed:', status);
@@ -500,6 +522,14 @@ class VizoraAndroidTV {
     }
 
     this.dpadHandler = (event: KeyboardEvent) => {
+      // Samsung/LG remote "back" keys arrive as raw keyCodes (10009 / 461)
+      // with firmware-dependent `key` values — swallow them so back never
+      // exits the signage loop to the TV home screen.
+      if (isTvBackKey(event)) {
+        event.preventDefault();
+        return;
+      }
+
       const focusableElements = document.querySelectorAll('.focusable');
       const currentFocus = document.activeElement;
 
@@ -632,7 +662,7 @@ class VizoraAndroidTV {
     try {
       // Generate a unique device identifier
       const deviceInfo = await this.getDeviceInfo();
-      const deviceIdentifier = `android-${deviceInfo.screenWidth}x${deviceInfo.screenHeight}-${Date.now().toString(36)}`;
+      const deviceIdentifier = `${platformIdentifierPrefix()}-${deviceInfo.screenWidth}x${deviceInfo.screenHeight}-${Date.now().toString(36)}`;
 
       console.log('[Vizora] Making pairing request to:', `${this.config.apiUrl}/api/v1/devices/pairing/request`);
 
@@ -1755,7 +1785,9 @@ class VizoraAndroidTV {
       .filter(item => item.content && (item.content.type === 'image' || item.content.type === 'video'))
       .map(async (item) => {
         const content = item.content!;
-        const contentUrl = transformContentUrl(content.url, this.config.apiUrl, this.deviceToken);
+        const contentUrl = transformContentUrl(content.url, this.config.apiUrl, this.deviceToken, {
+          rewriteLocalhostForEmulator: isNativeCapacitor(),
+        });
         const cached = await this.cacheManager.getCachedUri(content.id);
         if (!cached) {
           await this.cacheManager.downloadContent(
@@ -2134,7 +2166,9 @@ class VizoraAndroidTV {
     // Transform URL (skip for HTML/template which contain raw markup)
     const contentUrl = (contentType === 'html' || contentType === 'template')
       ? content.url
-      : transformContentUrl(content.url, this.config.apiUrl, this.deviceToken);
+      : transformContentUrl(content.url, this.config.apiUrl, this.deviceToken, {
+          rewriteLocalhostForEmulator: isNativeCapacitor(),
+        });
 
     // Resolve through cache for media content
     let resolvedUrl = contentUrl;
@@ -2285,7 +2319,7 @@ class VizoraAndroidTV {
     const networkStatus = await Network.getStatus();
 
     return {
-      platform: 'android_tv',
+      platform: platformDeviceType(),
       userAgent: navigator.userAgent,
       language: navigator.language,
       screenWidth: window.screen.width,

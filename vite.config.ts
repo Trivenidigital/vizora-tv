@@ -1,17 +1,34 @@
 import { defineConfig, loadEnv } from 'vite';
+import legacy from '@vitejs/plugin-legacy';
 
 export default defineConfig(({ mode }) => {
   // Load env file based on `mode` in the current directory
   const env = loadEnv(mode, process.cwd(), '');
 
+  // TV mode: build for Samsung Tizen / LG webOS smart TVs. Their browser
+  // engines are frozen per firmware generation (Tizen 4.0 ≈ Chromium 56,
+  // webOS 4.x ≈ Chromium 53), so the bundle needs transpilation + core-js
+  // polyfills and a SystemJS (nomodule) loader — old engines don't support
+  // <script type="module">, and packaged TV apps load from file:// where
+  // module scripts are unreliable anyway. Newer TVs pick the modern build.
+  const isTvBuild = mode === 'tv';
+
   return {
     root: '.',
+    plugins: isTvBuild
+      ? [
+          legacy({
+            targets: ['chrome >= 53'],
+            modernPolyfills: true,
+          }),
+        ]
+      : [],
     test: {
       environment: 'node',
       include: ['src/**/*.spec.ts'],
     },
     build: {
-      outDir: 'dist',
+      outDir: isTvBuild ? 'dist-tv' : 'dist',
       assetsDir: 'assets',
       // Generate single file for Capacitor
       rollupOptions: {
@@ -19,7 +36,9 @@ export default defineConfig(({ mode }) => {
           manualChunks: undefined,
         },
       },
-      // Strip console.log/warn in production builds (keep console.error)
+      // Strip console.log/warn in production builds (keep console.error).
+      // TV builds keep console output — field debugging on TVs happens over
+      // remote web inspector where the console is the primary signal.
       minify: 'terser',
       terserOptions: {
         compress: {

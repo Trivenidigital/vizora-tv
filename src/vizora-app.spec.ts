@@ -184,6 +184,10 @@ vi.stubGlobal('window', {
   location: { search: '', reload: vi.fn() },
   screen: { width: 1920, height: 1080, colorDepth: 24 },
   devicePixelRatio: 1,
+  // Native Capacitor bridge marker: platform detection (src/platform.ts) must
+  // resolve to 'capacitor' so the suite exercises the Android baseline
+  // (AndroidCacheManager mock, android_tv identity).
+  Capacitor: { isNativePlatform: () => true },
 });
 
 // HTMLElement stub — D-pad code uses `instanceof HTMLElement` for focus/click

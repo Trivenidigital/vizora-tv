@@ -1,18 +1,21 @@
-# Vizora TV - Android TV Display App
+# Vizora TV - Smart TV Display App
 
 ## What This Is
 
-Standalone Android TV app that displays digital signage content pushed from the Vizora web dashboard. Extracted from the Vizora monorepo — builds and runs independently.
+Standalone TV app that displays digital signage content pushed from the Vizora web dashboard. Extracted from the Vizora monorepo — builds and runs independently. Runs on Android TV (Capacitor native), Samsung Smart TV (Tizen 4.0+), and LG Smart TV (webOS 4.0+) from one codebase — see `docs/SAMSUNG_LG_TV.md`.
 
 ## Architecture
 
-Capacitor 6 + Vite + TypeScript. The app is a web app (TypeScript) rendered in an Android WebView via Capacitor. Native Java code handles boot auto-start, secure storage, and crash recovery.
+Capacitor 6 + Vite + TypeScript. The app is a web app (TypeScript): on Android it renders in a WebView via Capacitor (native Java handles boot auto-start, secure storage, crash recovery); on Samsung/LG it ships as a packaged TV web app where Capacitor plugin calls fall through to their web implementations and `src/platform.ts` handles the platform-specific pieces.
 
-**Source files (6 TypeScript + 4 Java)**:
-- `src/main.ts` — All app logic (~1300 lines): pairing, WebSocket, content rendering, heartbeat, caching
-- `src/cache-manager.ts` — Capacitor Filesystem-based content cache
-- `src/secure-storage.ts` — Encrypted storage for device tokens
+**Source files (TypeScript + 4 Java)**:
+- `src/main.ts` — All app logic: pairing, WebSocket, content rendering, heartbeat, caching
+- `src/platform.ts` — Platform detection (capacitor/tizen/webos/web) + TV bootstrap (keep-awake, remote back keys, device identity)
+- `src/cache-manager.ts` — Capacitor Filesystem-based content cache (Android)
+- `src/tv-cache-manager.ts` — IndexedDB blob content cache (Tizen/webOS/web)
+- `src/secure-storage.ts` — Encrypted storage for device tokens (native on Android; localStorage fallback on TV web runtimes)
 - `android/app/src/main/java/com/vizora/display/` — 4 Java files (MainActivity, BootReceiver, SecureStoragePlugin, CrashRecoveryHandler)
+- `tizen/` + `webos/` — TV packaging manifests and icons; assembled by `scripts/package-tv.mjs`
 
 ## Communication with Backend
 
@@ -48,6 +51,13 @@ npx cap open android   # Opens in Android Studio
 ```
 
 Or combined: `npm run android:build`
+
+Samsung/LG TV builds (legacy-transpiled for frozen TV Chromium engines):
+
+```bash
+npm run tizen:build    # dist-tv/ + build/tizen/ (package with Tizen Studio CLI)
+npm run webos:build    # dist-tv/ + build/webos/ (package with ares-package)
+```
 
 ## Key Patterns
 
