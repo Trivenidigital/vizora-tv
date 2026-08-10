@@ -25,6 +25,15 @@ android/keystore.properties
 android/*.keystore
 android/*.jks
 
+# Android signing material — NEVER commit, anywhere in the tree.
+# The three patterns above are anchored to android/; these are not, so a
+# keystore dropped in any other directory is still excluded. A private repo is
+# not a key vault: repo access spreads to developers, CI and integrations.
+*.jks
+*.keystore
+*.p12
+keystore.properties
+
 # Environment files
 .env
 .env.local
