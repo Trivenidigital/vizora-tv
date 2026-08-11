@@ -31,8 +31,18 @@
             android:theme="@style/AppTheme.NoActionBarLaunch"
             android:launchMode="singleTask"
             android:exported="true"
-            android:screenOrientation="sensorLandscape"
-            android:keepScreenOn="true">
+            android:screenOrientation="sensorLandscape">
+
+            <!--
+              DO NOT add android:keepScreenOn="true" here. It was present until
+              1.3.12 and did nothing: keepScreenOn is a View attribute, so it is
+              accepted by the manifest namespace but never read from ActivityInfo.
+              It looked like the screen was being kept awake for a 24/7 signage
+              app while the device followed its normal sleep/screensaver policy.
+
+              The screen is kept awake by FLAG_KEEP_SCREEN_ON on the Activity
+              window — see MainActivity.onCreate().
+            -->
 
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

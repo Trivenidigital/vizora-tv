@@ -5,6 +5,7 @@ import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Log;
 import android.webkit.RenderProcessGoneDetail;
+import android.view.WindowManager;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 
@@ -39,6 +40,7 @@ public class MainActivity extends BridgeActivity {
 
         super.onCreate(savedInstanceState);
 
+        keepScreenOn();
         enterImmersiveMode();
 
         // C5: Register crash recovery handler for auto-restart. F48: install once per
@@ -95,6 +97,34 @@ public class MainActivity extends BridgeActivity {
         startActivity(intent);
         finish();
         return true; // handled — do not let the framework kill the app process
+    }
+
+    /**
+     * Keep the panel awake for 24/7 signage.
+     *
+     * Until 1.3.12 this was attempted with android:keepScreenOn="true" on the
+     * <activity> tag in AndroidManifest.xml. That silently did nothing —
+     * keepScreenOn is a View attribute, so the manifest accepts it (it exists in
+     * the android namespace) but ActivityInfo never reads it. The build did not
+     * warn, so the app appeared to hold the screen on while every device just
+     * followed its own sleep and screensaver policy.
+     *
+     * FLAG_KEEP_SCREEN_ON is the window-level equivalent and is the right tool
+     * here: it needs no permission, it is scoped to this Activity being visible,
+     * and it therefore cannot leak the way a WakeLock does if a release is missed.
+     * It also suppresses the daydream/screensaver, not just the display timeout.
+     *
+     * Set after super.onCreate() alongside the other window setup. onCreate runs
+     * again on the in-process renderer-recovery relaunch (recoverFromRendererGone),
+     * so the flag is re-applied on the fresh Activity rather than being inherited —
+     * there is a sub-second gap during the relaunch, which is far below any
+     * screen-off timeout.
+     *
+     * Note this cannot defeat an OEM "eco"/no-signal power mode, which lives below
+     * the app layer. Verify on real pilot hardware, not only an emulator.
+     */
+    private void keepScreenOn() {
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
     }
 
     /**
