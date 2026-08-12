@@ -149,7 +149,7 @@ function resetDOM() {
     'pairing-code', 'pairing-countdown', 'qr-code', 'content-container',
     'loading-screen', 'pairing-screen', 'content-screen', 'error-screen',
     'holding-screen', 'holding-message',
-    'error-message', 'status-dot', 'status-text', 'qr-overlay',
+    'error-message', 'status-dot', 'status-text', 'status-bar', 'qr-overlay',
   ];
   for (const id of elementIds) {
     const el = createElementStub('div');
@@ -1235,6 +1235,70 @@ describe('VizoraAndroidTV', () => {
       triggerSocketEvent('connect');
       triggerSocketEvent('disconnect', 'io server disconnect');
       expect(domElements.get('status-text')!.textContent).toBe('Disconnected');
+    });
+
+    it('hides the status bar once online — no permanent Connected badge', async () => {
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+
+      expect(domElements.get('status-dot')!.className).toBe('status-dot online');
+      expect(domElements.get('status-bar')!._classListSet.has('hidden')).toBe(true);
+    });
+
+    it('keeps the status bar in the DOM when hidden, so it can reappear', async () => {
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+
+      // Hidden by class, never removed — a removed node could not come back
+      // without re-creating it.
+      const bar = domElements.get('status-bar')!;
+      expect(bar._classListSet.has('hidden')).toBe(true);
+      expect(bar.remove).not.toHaveBeenCalled();
+      expect(document.getElementById('status-bar')).toBe(bar);
+    });
+
+    it('shows the status bar again when the connection drops after being online', async () => {
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+      expect(domElements.get('status-bar')!._classListSet.has('hidden')).toBe(true);
+
+      triggerSocketEvent('disconnect', 'io server disconnect');
+
+      expect(domElements.get('status-dot')!.className).toBe('status-dot offline');
+      expect(domElements.get('status-bar')!._classListSet.has('hidden')).toBe(false);
+    });
+
+    it('hides the status bar again after reconnecting', async () => {
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+      triggerSocketEvent('disconnect', 'io server disconnect');
+      expect(domElements.get('status-bar')!._classListSet.has('hidden')).toBe(false);
+
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+
+      expect(domElements.get('status-bar')!._classListSet.has('hidden')).toBe(true);
+    });
+
+    it('leaves the status bar visible while connecting', async () => {
+      await importFresh();
+
+      // Never reached `online`, so nothing should have hidden it.
+      expect(domElements.get('status-bar')!._classListSet.has('hidden')).toBe(false);
+    });
+
+    it('does not throw when the status bar is absent from the DOM', async () => {
+      // Tizen/webOS bundles share this markup, but the guard must hold if any
+      // host ever renders without the element.
+      domElements.delete('status-bar');
+      await importFresh();
+      currentMockSocket.connected = true;
+      expect(() => triggerSocketEvent('connect')).not.toThrow();
+      expect(domElements.get('status-dot')!.className).toBe('status-dot online');
     });
 
     it('shows offline overlay after 60s of disconnect', async () => {
