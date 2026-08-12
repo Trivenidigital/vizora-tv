@@ -456,8 +456,15 @@
     <div id="error-message">An error occurred</div>
   </div>
 
-  <!-- Status Bar (always visible) -->
-  <div class="status-bar">
+  <!--
+    Status Bar. Visible while connecting/offline, hidden once online — see
+    updateStatus() in src/main.ts. It stays in the DOM rather than being removed
+    so it can reappear the moment connectivity changes.
+
+    Starts visible: the first paint is "Initializing...", and hiding is applied
+    only when a status of `online` arrives.
+  -->
+  <div id="status-bar" class="status-bar">
     <div id="status-dot" class="status-dot connecting"></div>
     <span id="status-text">Initializing...</span>
   </div>

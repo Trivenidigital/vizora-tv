@@ -2349,6 +2349,20 @@ class VizoraAndroidTV {
     if (statusText) {
       statusText.textContent = text;
     }
+
+    // Signage runs unattended for months, so a permanent "Connected" badge is
+    // just burn-in risk and a distraction on customer-facing glass. Show the bar
+    // only when there is something worth telling someone about: `connecting` and
+    // `offline` stay visible, `online` hides.
+    //
+    // Hidden by class, not removed from the DOM, so the next non-online status
+    // brings it straight back without re-creating any nodes. `.hidden` is the
+    // primitive already used for the overlay elsewhere in this file, and its
+    // `display: none !important` is what overrides `.status-bar`'s `display: flex`.
+    const statusBar = document.getElementById('status-bar');
+    if (statusBar) {
+      statusBar.classList.toggle('hidden', status === 'online');
+    }
   }
 
   private async getDeviceInfo() {
