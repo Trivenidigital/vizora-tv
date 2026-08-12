@@ -197,7 +197,19 @@ class HTMLElementStub {
 }
 vi.stubGlobal('HTMLElement', HTMLElementStub);
 
-vi.stubGlobal('navigator', { userAgent: 'test-agent', language: 'en-US' });
+// Node 21+ defines `navigator` as a GETTER-ONLY accessor on globalThis
+// (`{get, configurable: true}`, no setter), so vi.stubGlobal's assignment
+// silently no-ops there: the stub appears to be installed while
+// platform.ts:detectPlatform() actually reads the host's real userAgent
+// ("Node.js/24"). It happens not to change any current outcome — neither UA
+// matches Tizen or webOS — but a test that quietly does not apply is worse than
+// no test, so own the property explicitly. defineProperty works on Node 20
+// (property absent) and Node 21+ (accessor present) alike.
+Object.defineProperty(globalThis, 'navigator', {
+  value: { userAgent: 'test-agent', language: 'en-US' },
+  configurable: true,
+  writable: true,
+});
 vi.stubGlobal('performance', {
   memory: { usedJSHeapSize: 50_000_000, jsHeapSizeLimit: 100_000_000 },
 });
