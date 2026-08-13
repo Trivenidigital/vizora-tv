@@ -3644,4 +3644,81 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
     expect(preferencesStore.has('device_id')).toBe(false);
     expect(secureStorageStore.get('device_token')).toBe('tok-123'); // secure copy untouched
   });
+
+
+  describe('token:refresh — server-initiated credential rotation (vizora-tv#20)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    it('persists a rotated token and presents it on the next connect', async () => {
+      // The whole point: the server rotates the stored hash when it emits this. A
+      // device that ignores it is holding a credential the server has already
+      // replaced, which ends in either a false DEVICE_REVOKED (pairing screen on
+      // customer glass) or a hard AUTH_EXPIRED with no recovery.
+      secureStorageStore.set('device_token', 'old-tok');
+      secureStorageStore.set('device_id', 'dev-123');
+      await importFresh();
+
+      triggerSocketEvent('token:refresh', { token: 'new-tok' });
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(secureStorageStore.get('device_token')).toBe('new-tok');
+      expect(currentMockSocket.auth).toEqual({ token: 'new-tok' });
+    });
+
+    it('NEGATIVE: a malformed payload never clears a working credential', async () => {
+      // A refresh we cannot use is strictly better than none. If a bad payload
+      // could blank the token, one malformed emit would de-pair the fleet — the
+      // exact failure this listener exists to prevent.
+      secureStorageStore.set('device_token', 'old-tok');
+      secureStorageStore.set('device_id', 'dev-123');
+      await importFresh();
+
+      for (const bad of [undefined, null, {}, { token: null }, { token: 123 }, { token: '' }, 'nope']) {
+        triggerSocketEvent('token:refresh', bad);
+        await vi.advanceTimersByTimeAsync(10);
+        expect(secureStorageStore.get('device_token')).toBe('old-tok');
+      }
+    });
+
+    it('NEGATIVE: a storage failure keeps the OLD token rather than adopting an unpersisted one', async () => {
+      // Order matters. Adopting in memory before a successful write would leave a
+      // device running a token it cannot survive a reboot with — worse than not
+      // rotating, because the old one is still valid right now.
+      secureStorageStore.set('device_token', 'old-tok');
+      secureStorageStore.set('device_id', 'dev-123');
+      await importFresh();
+
+      const { SecureStorage } = await import('./secure-storage');
+      (SecureStorage.set as Mock).mockRejectedValueOnce(new Error('keystore unavailable'));
+
+      triggerSocketEvent('token:refresh', { token: 'new-tok' });
+      await vi.advanceTimersByTimeAsync(10);
+
+      // The property that matters: nothing adopted the unpersisted token. Storage
+      // still holds the working credential, and the socket was not switched to a
+      // token that would be lost on reboot.
+      expect(secureStorageStore.get('device_token')).toBe('old-tok');
+      expect(currentMockSocket.auth).not.toEqual({ token: 'new-tok' });
+    });
+
+    it('is idempotent — a re-delivered identical token does not rewrite storage', async () => {
+      secureStorageStore.set('device_token', 'same-tok');
+      secureStorageStore.set('device_id', 'dev-123');
+      await importFresh();
+
+      const { SecureStorage } = await import('./secure-storage');
+      (SecureStorage.set as Mock).mockClear();
+
+      triggerSocketEvent('token:refresh', { token: 'same-tok' });
+      await vi.advanceTimersByTimeAsync(10);
+
+      expect(SecureStorage.set).not.toHaveBeenCalledWith({ key: 'device_token', value: 'same-tok' });
+    });
+  });
 });
