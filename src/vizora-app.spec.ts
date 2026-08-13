@@ -11,6 +11,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, type Mock } from 'vitest';
+import { readFileSync } from 'node:fs';
 
 // ======================== GLOBAL STUBS ========================
 
@@ -3692,6 +3693,55 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
     expect(secureStorageStore.get('device_token')).toBe('tok-123'); // secure copy untouched
   });
 
+
+  describe('heartbeat ack — cross-boundary wire contract (#8 / F40)', () => {
+    // The ack crosses a process boundary that nothing else checks. Each side owns
+    // its own shape — the server builds { success, data, timestamp } via
+    // createSuccessResponse(), the client hand-unwraps `.data` — and neither
+    // imports the other, so a change on either side could silently stop the other
+    // working. That is exactly what happened three times in this subsystem:
+    // reconcileContent always undefined until the .data unwrap landed, an
+    // unwhitelisted heartbeat field rejecting every beat for four releases, and a
+    // mistyped impression timestamp rejecting every impression for the repo's
+    // lifetime. Every one passed its own side's unit tests.
+    //
+    // Driven from a committed fixture that the Vizora repo asserts against too, so
+    // an incompatible change to the envelope OR to this unwrap fails a test rather
+    // than going quiet in the field.
+    const wire = JSON.parse(
+      readFileSync(new URL('./ack-envelope.fixture.json', import.meta.url), 'utf8'),
+    ) as { envelope: Record<string, unknown>; legacyUnwrapped: Record<string, unknown> };
+
+    it.each([
+      ['wrapped envelope { success, data, timestamp }', 'envelope'],
+      ['legacy unwrapped payload', 'legacyUnwrapped'],
+    ])('acts on commands, revoked AND reconcileContent from the %s', async (_label, key) => {
+      secureStorageStore.set('device_token', 'tok-123');
+      secureStorageStore.set('device_id', 'dev-123');
+      await importFresh();
+
+      const ackPayload = (wire as Record<string, Record<string, unknown>>)[key];
+      // Heartbeats only start once the socket connects (and reports connected).
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+      await vi.advanceTimersByTimeAsync(200);
+      const { CapacitorHttp: httpForClear } = await import('@capacitor/core');
+      (httpForClear.get as Mock).mockClear(); // ignore the pull-on-connect
+      const hb = currentMockSocket.emit.mock.calls.find((c: unknown[]) => c[0] === 'heartbeat');
+      const cb = hb?.[2] as ((r: unknown) => void) | undefined;
+      expect(typeof cb).toBe('function');
+
+      cb!(ackPayload);
+      await vi.advanceTimersByTimeAsync(50);
+
+      // reconcileContent must reach pullContent -> an HTTP GET for effective content.
+      const { CapacitorHttp } = await import('@capacitor/core');
+      const pulled = (CapacitorHttp.get as Mock).mock.calls.some(
+        (c: unknown[]) => String((c[0] as { url?: string })?.url ?? '').includes('/devices/me/content'),
+      );
+      expect(pulled).toBe(true);
+    });
+  });
 
   describe('token:refresh — server-initiated credential rotation (vizora-tv#20)', () => {
     beforeEach(() => {
