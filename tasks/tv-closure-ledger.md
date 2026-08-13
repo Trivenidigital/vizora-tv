@@ -460,12 +460,49 @@ attached. Re-pairing is the only recovery: the refresh path requires a live
 authenticated socket and returns early on `msUntilExpiry <= 0`, and the handshake
 rejects an expired token before it is ever reached.
 
-### Known pre-existing flake
+### The "pre-existing flake" was a REAL PRODUCT DEFECT — #28 / PR #29
 
-`src/vizora-app.spec.ts` → `F41: an auth-probe 403 suspends…` fails ~**2 runs in 10 on
-pristine `origin/master`** (`3c57812`), asserting `expected [content-screen] to deeply
-equal [holding-screen]`. Measured on a clean worktree with no local changes. Unrelated
-to #26 and not fixed by it; recorded so a red TV CI run is not misread as a regression.
+Recorded first as a flaky test (`F41: an auth-probe 403 suspends…`, ~2 runs in 10 on
+pristine `origin/master`). It is not flakiness. **The intermittency was the bug being
+sampled.**
+
+`advance()` checks the tenant-suspend gate once at entry (`main.ts:1696`) and its only
+post-await invalidation is the playback generation (`:1715`) — which suspension did not
+bump. So a `tenant:suspended` arriving while `prepare()` is in flight is honoured, the
+device enters holding, and the frame already being prepared **commits on top of it**.
+
+Two mechanisms then make it stick rather than self-heal:
+
+- the illegitimate `holding → playing` transition cancels the 30s retry `enterHolding`
+  just armed (`:236-239` clears `holdingRetryTimer` on ANY transition out of holding)
+- `completeItem` parks without re-advancing on the last item when
+  `loopPlaylist === false` (`:1879-1884`)
+
+Together: **a suspended tenant keeps rendering indefinitely.** Reachable in ordinary
+operation — `tenant:suspended` is the billing dunning escalation
+(`entitlement.service.ts:144` → `device.gateway.ts:476`) — so it is an
+entitlement-enforcement bypass, and it contradicts `revocation-contract.md:110`/`:114`.
+
+Evidence: a deterministic regression test (no jitter, drives the event straight into the
+prepare window) fails **8/8** on pristine master and passes **6/6** with a one-line fix;
+the full spec goes from 2-in-10 failures to **10/10 clean**; reverting the line fails the
+test again.
+
+**The lesson, which outlives the bug:** the probe-backoff jitter was the obvious suspect
+and was the wrong answer — it only decided *where in the playback cadence* the signal
+landed. An intermittent failure was reporting a real defect, and F41 additionally
+*under*-detected it, because a later timer sometimes restored holding before the
+assertion ran. Writing it off as flake would have preserved a live enforcement bypass.
+
+**Release impact — OPERATOR DECISION, deliberately left open.** The defect is present in
+**shipped v1.3.13**, so 1.3.14 is **not a regression** and publishing it as-is makes
+nothing worse. But the fix changes production client bytes, which voids the Gate A
+approval bound to `DAB50353…D88151` and needs a rebuild plus re-approval. PR #29 is open
+and **not merged**; nothing was rebuilt and Gate A is untouched.
+
+Related and NOT fixed: `renderTemporaryContent` has the same shape — gates at entry
+(`:2007-2011`), re-checks only `temporaryContent` after its await (`:2063-2064`), no
+suspension or generation check before committing at `:2072-2079`.
 
 ---
 
