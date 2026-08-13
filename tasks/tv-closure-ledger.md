@@ -370,6 +370,105 @@ token. This belongs in the ship decision, not a footnote.
 
 ---
 
+## Phase F — 2026-08-13 (later) — #8 closed, and two earlier findings CORRECTED
+
+### CORRECTION 1 — `GET /api/v1/devices/me/content` is no longer 404. #256 is DEPLOYED.
+
+Phase B recorded this endpoint 404ing on production and built a lot of reasoning on
+top of it. **That finding is now STALE.** Re-probed directly:
+
+| probe | result |
+|---|---|
+| `GET /api/v1/devices/me/content` | **401** `{"message":"Device authentication required"}` |
+| same, garbage bearer | **401** `{"message":"Invalid or expired device token"}` |
+| NEGATIVE CONTROL `GET /api/v1/devices/me/definitely-not-a-route` | **404** `{"message":"Cannot GET …"}` |
+| CONTROL `POST /api/v1/devices/pairing/request` | 400 |
+
+The negative control is what makes this conclusive rather than suggestive: an
+unmatched route still answers Nest's `Cannot GET …` 404, so a 401 naming device auth
+means the handler is registered and the guard ran.
+
+Confirmed independently at the deploy: `/opt/vizora/app` HEAD is `69e02244`
+(= `origin/main`), and `42149be6` (#294) and `9828b53d` (#297) are both ancestors of
+it, with #300 + `a7a11d30` on the log. **The backend half is live.** The six-week
+half-merged pair is closed.
+
+### CORRECTION 2 — all `playlist:update` sites now carry `version`
+
+Phase B recorded all three emit sites emitting `{playlist, timestamp}` versionless.
+Re-verified against current source: all three now carry `version` —
+`device.gateway.ts:1337`, `:2089`, `:2274`. One bounded exception remains
+(`redis.service.ts:255-257` returns `version: ''` for pending records written in the
+older bare-playlist shape).
+
+**The conclusion is unchanged**: do NOT delete the client's legacy versionless branch
+at `main.ts:1254-1256`. The reason changed — it is now a narrow deploy-transient case
+rather than the only branch ever taken — but it is still reachable.
+
+### #8 — closed. The first attempt at its server half was vacuous.
+
+Recorded because it is the same defect class as everything else in this ledger, and it
+survived a full review round before being caught.
+
+Vizora#307 originally asserted `createSuccessResponse(fixture.data) === fixture.data`
+— a pass-through identity check on a six-line helper. It never called
+`handleHeartbeat`, never loaded `device.gateway.ts`, and would have stayed green with
+the heartbeat handler deleted.
+
+**Demonstrated rather than argued:** apply the naive one-line fix for its CI load
+error, then mutate production so the ack emits `reconcileContentX` — the old spec
+reports **3/3 PASS**.
+
+The fixture was wrong too: it described `commands:[{type:'reload'}]` and
+`revoked:true` as the heartbeat response. The server emits `commands: []` always and
+has **never** emitted `revoked`. It was a *client-accepted* shape promoted into a
+claimed *server-emitted* contract, so the only way a server test could pass was by not
+looking at the server.
+
+**Rule to carry forward, sharper than the Phase A one:** a negative control proves a
+checker is sensitive to what it observes. It does **not** prove the checker observes
+the production path. Both are required, and the second is the one that gets skipped.
+Establish `production path → checker observation → intentional mutation → checker
+failure`, and never accept `fixture → helper → same fixture`.
+
+Landed: Vizora#307 (server, drives the real handler, 9 production mutations all fire)
+and vizora-tv#26 (fixture split into `serverAck.*` vs `clientAccepted.*`), with
+vizora-tv#25 (client half).
+
+Honest margin, since a reviewer would otherwise have to measure it: 7 of the 9 server
+mutations already failed `device.gateway.spec.ts`. The two caught **uniquely** by the
+new spec are both *added* keys — it asserts the key SET, so a field the server starts
+sending is a wire change too.
+
+### Gate 2 state — prepared, blocked only on physical access
+
+Runbook: `tasks/gate2-paired-device-acceptance.md`.
+
+Prod fleet, queried read-only: **24 devices, all offline, zero heartbeats since the
+realtime service started** (`2026-08-13T07:40:58Z`); most recent beat of any device is
+~25h old. `content_impressions` is still **0 rows**.
+
+**`0 of 24 carry `metadata.appVersion`` — the same count as before #294 merged.** That
+is fully explained by there being no heartbeats since deploy, and is NOT evidence the
+fix is broken. It is equally **not evidence it works**: appVersion persistence remains
+unproven at runtime, and Gate 2 step 10 is its first real test. Do not record it as
+verified on any weaker basis.
+
+TV1 and Lobby last beat 2026-02-19, paired 2026-02-18/19 — both far past the 90-day
+expiry, and **neither has a playlist assigned**, so the acceptance run needs one
+attached. Re-pairing is the only recovery: the refresh path requires a live
+authenticated socket and returns early on `msUntilExpiry <= 0`, and the handshake
+rejects an expired token before it is ever reached.
+
+### Known pre-existing flake
+
+`src/vizora-app.spec.ts` → `F41: an auth-probe 403 suspends…` fails ~**2 runs in 10 on
+pristine `origin/master`** (`3c57812`), asserting `expected [content-screen] to deeply
+equal [holding-screen]`. Measured on a clean worktree with no local changes. Unrelated
+to #26 and not fixed by it; recorded so a red TV CI run is not misread as a regression.
+
+---
+
 ## Constraints held throughout
 
 - 1.3.13 is settled: not reopened, retagged, rebuilt, republished; Gate A untouched.
