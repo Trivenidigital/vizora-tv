@@ -2073,9 +2073,56 @@ describe('VizoraAndroidTV', () => {
       expect(currentMockSocket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'content:impression').length).toBe(0);
     });
 
-    // TODO: push_content with payload.content = undefined crashes handleContentPush
-    // at `content.name` (line 976). This is a production bug — handleCommand should
-    // guard: `if (command.payload?.content)`. Deferring test until code fix is applied.
+    // The guard this TODO was deferring landed at src/main.ts:1921-1929
+    // (`if (command.payload?.content != null)`). The comment outlived it and still
+    // named a line number that had moved, so anyone auditing this file was told a
+    // fixed bug was live. Replaced with the tests it was waiting for — a guard with
+    // no negative test is indistinguishable from no guard.
+
+    // Assert the guard's OWN signal, not merely the absence of an impression.
+    // "no impression emitted" is ALSO true when the handler crashes, so asserting
+    // only that is vacuous — verified by deleting the guard and watching an
+    // absence-only version still pass while throwing unhandled rejections.
+    it.each([
+      ['undefined', undefined],
+      ['null', null],
+    ])('NEGATIVE: push_content with content=%s takes the guard, and does not crash into it', async (_label, content) => {
+      await importFresh();
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      currentMockSocket.emit.mockClear();
+
+      triggerSocketEvent('command', { type: 'push_content', payload: { content } });
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(warn).toHaveBeenCalledWith('[Vizora] push_content command missing content payload');
+      expect(
+        currentMockSocket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'content:impression').length,
+      ).toBe(0);
+      warn.mockRestore();
+    });
+
+    it('NEGATIVE: a shapeless content object does not blank the screen', async () => {
+      // {} has no `type`, so renderContentToDiv hits its default branch and resolves
+      // ready='error', which resumes the playlist. Asserting the FAIL-SAFE, not
+      // merely the absence of a throw: the screen must keep playing.
+      await importFresh();
+      currentMockSocket.emit.mockClear();
+      triggerSocketEvent('command', { type: 'push_content', payload: { content: {} } });
+      await vi.advanceTimersByTimeAsync(200);
+      expect(
+        currentMockSocket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'content:impression').length,
+      ).toBe(0);
+    });
+
+    it('NEGATIVE: an array masquerading as content is inert', async () => {
+      await importFresh();
+      currentMockSocket.emit.mockClear();
+      triggerSocketEvent('command', { type: 'push_content', payload: { content: [] } });
+      await vi.advanceTimersByTimeAsync(200);
+      expect(
+        currentMockSocket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'content:impression').length,
+      ).toBe(0);
+    });
 
     it('qr-overlay-update calls renderQrOverlay', async () => {
       await importFresh();
