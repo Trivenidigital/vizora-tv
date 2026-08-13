@@ -3784,8 +3784,18 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
     // asserts come out of the real handler. Without them the client half would only
     // ever be exercised against a payload production never produces, which is the
     // mirror image of the server-side defect this fixture was split to fix.
+    // Rebuild the on-the-wire envelope from the fixture's serverAck entry. The entry also
+    // carries `_comment` and `envelopeKeys` for documentation, and no `timestamp` — feeding
+    // it raw would hand the client a payload production never sends, in the one test whose
+    // whole point is fidelity to what production sends.
+    const asWire = (shape: { success: boolean; data: Record<string, unknown> }) => ({
+      success: shape.success,
+      data: shape.data,
+      timestamp: '2026-08-13T00:00:00.000Z',
+    });
+
     it('on the REAL active-socket ack: reconciles, and does NOT reload or auth-check', async () => {
-      const urls = await ackWith(wire.serverAck.activeSocket);
+      const urls = await ackWith(asWire(wire.serverAck.activeSocket));
 
       expect(urls.some(u => u.includes('/devices/me/content'))).toBe(true);
       // commands is [] and revoked absent, so neither side effect may fire.
@@ -3796,7 +3806,13 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
     it('on the REAL superseded-socket ack: no reconcile pull, no reload, no auth-check', async () => {
       // That path omits reconcileContent entirely. An absent key must read as "no",
       // never as a reason to act — a device beating on a stale socket must stay quiet.
-      const urls = await ackWith(wire.serverAck.supersededSocket);
+      const urls = await ackWith(asWire(wire.serverAck.supersededSocket));
+
+      // POSITIVE CONTROL FIRST. Every other assertion here is a negative, and negatives
+      // go vacuous the moment the ack stops being delivered at all. Proving the same
+      // helper still produces observable HTTP for a reconciling ack is what keeps the
+      // three "did not happen" assertions meaningful on their own.
+      expect(await ackWith(asWire(wire.serverAck.activeSocket))).not.toHaveLength(0);
 
       expect(urls.some(u => u.includes('/devices/me/content'))).toBe(false);
       expect(window.location.reload as Mock).not.toHaveBeenCalled();
