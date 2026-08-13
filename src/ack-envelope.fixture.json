@@ -1,0 +1,38 @@
+{
+  "_comment": [
+    "CANONICAL heartbeat-ack wire fixture. Committed in vizora-tv and asserted against",
+    "in BOTH repos, because the ack crosses a process boundary that nothing else checks.",
+    "",
+    "The envelope is exactly what the server's createSuccessResponse() emits",
+    "(Vizora realtime/src/gateways/dto/index.ts) — { success, data, timestamp } — and the",
+    "client unwraps `.data` by hand (vizora-tv src/main.ts). Neither side imports the",
+    "other, so until now a change on either side could silently stop the other working.",
+    "",
+    "That is not hypothetical. `reconcileContent` was wired on both sides, unit-tested",
+    "green on both, and was ALWAYS undefined at runtime until the ack-.data unwrap was",
+    "fixed (Vizora tasks/pending-decisions.md:379-403). Two more instances followed in the",
+    "same subsystem: an unwhitelisted heartbeat field rejected every beat for four",
+    "releases, and a mistyped impression timestamp rejected every impression for the",
+    "repo's lifetime. All three were client->server or server->client shape mismatches",
+    "that each side's own tests could not see.",
+    "",
+    "If you change this file, the corresponding test fails in BOTH repos — which is the",
+    "point. Change it only when the wire format genuinely changes, and change both sides."
+  ],
+  "envelope": {
+    "success": true,
+    "data": {
+      "nextHeartbeatIn": 15000,
+      "commands": [{ "type": "reload" }],
+      "revoked": true,
+      "reconcileContent": true
+    },
+    "timestamp": "2026-08-13T00:00:00.000Z"
+  },
+  "legacyUnwrapped": {
+    "nextHeartbeatIn": 15000,
+    "commands": [{ "type": "reload" }],
+    "revoked": true,
+    "reconcileContent": true
+  }
+}

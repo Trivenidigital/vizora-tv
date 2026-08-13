@@ -224,6 +224,45 @@ the negative control (revert the DTO → exactly 2 tests fail; restore → pass)
 the suite was reading the worktree's files. **The negative control is what made the
 green trustworthy**, which is the whole argument for running them.
 
+### Correction to my own claim about the structural pipe fix
+
+I wrote that making telemetry validation tolerant "ends the class". **That is too
+strong.** `tolerateUnknown` flips only `forbidNonWhitelisted`; a CONSTRAINT
+violation still rejects the whole envelope. So:
+
+- "an unknown telemetry field can no longer take the fleet down" — **true**
+- "an invalid telemetry value can no longer take the fleet down" — **false**
+
+`contentVersion`'s 64-char bound is now load-bearing for fleet-wide heartbeat
+acceptance, as are `@MaxLength(32)` on `screenState`/`playbackSource` and
+`@Max(100)` on `memoryUsage` — a device reporting 100.01 still loses its whole
+heartbeat, and the client does not clamp. ISO-8601 at 24 chars gives headroom, so
+this is not live, but half the original failure class remains open. Closing it
+properly means validating telemetry values, dropping the invalid ones, and keeping
+the envelope. Follow-up, not scope creep into this release.
+
+### Composition review found a bug none of the individual PRs could
+
+Each of #294/#297/#300 was reviewed alone and each was green. **F1 only exists in
+the composition:** unassigning a playlist makes the resolver return
+`{playlist: null, version: ''}`, #300 sees a version difference and signals drift,
+and the client structurally refuses to apply a null playlist (the never-black
+guarantee). So the device is told to reconcile, cannot converge, and repeats
+forever — one resolve + signal + HTTP pull per device every 60s until content is
+reassigned. Unassigning is a normal dashboard action.
+
+Also found: the pending-replay path recomputes a version from a payload whose
+inputs the serializer strips (`device.gateway.ts:2067`), so it can never equal what
+the compare derives — a spurious reconcile after every offline-device replay; and
+the new endpoint's throttle is IP-keyed, so 24 devices behind one NAT issuing two
+pulls each on deploy exceed the limit of 40 (the repo already solved this for
+`auth/check` and the guard was not reused).
+
+All three fixed pre-deploy in one PR. **The lesson is the reviewing pattern, not
+the bugs:** per-PR review cannot see interaction, and my Phase C harness cannot
+either, because it serves a scripted authority — F1 and F2 both depend on what the
+REAL resolver returns.
+
 ## Phase C — runtime reproduction — CORE SCENARIO PROVEN
 
 Driven with `scripts/phase-c-harness.mjs`: a real socket, real HTTP, real signed
@@ -289,7 +328,45 @@ the version round-trip, because each was observed firing against a real player.
 
 ## Phase D — merges/deploys — not started
 
-## Phase E — 1.3.14 release candidate — not started
+## Phase E — 1.3.14 release candidate
+
+### The delta (vizora-tv master `a44e3f5` vs tag `v1.3.13`)
+
+| Change | Issue | Files |
+|---|---|---|
+| Deterministic release origins: committed pin, fail-closed build, in-bundle marker | #18 | `release-origins.json` (new), `vite.config.ts` +137, `src/main.ts` |
+| `token:refresh` listener — adopt server-rotated credentials | #20 | `src/main.ts` |
+| Test hardening incl. the push_content guard negatives | #3 | `src/vizora-app.spec.ts` +130 |
+
+392 insertions / 7 deletions. **No `android/` change, no `index.html` change.**
+Version bump to 1.3.14 / 10144 still to come.
+
+### SEQUENCING — the thing that most affects the ship decision
+
+**Publishing 1.3.14 without deploying the backend would not fix the reported
+symptom.** The client-side content-delivery code was already correct and shipped in
+v1.3.10; what was broken is entirely server-side:
+
+| Break | Fixed by | Ships in the APK? |
+|---|---|---|
+| Heartbeats rejected fleet-wide | Vizora#294 | **No** — server |
+| `devices/me/content` 404 | Vizora#297 | **No** — server |
+| Drift never signalled | Vizora#300 | **No** — server |
+| Device strands on token rotation | vizora-tv#21 | **Yes** |
+| Build points at the wrong backend | vizora-tv#19 | **Yes** |
+
+So 1.3.14's customer-visible value is *preventing future stranding* and release
+provenance. **The stale-playlist fix is a deployment, not a release.** The two are
+separable and the backend one is both more urgent and lower risk (no migration,
+rollback clean in both directions).
+
+### Independently: 14 of 24 devices need a re-pair regardless
+
+Past 90-day hard expiry, rejected at the handshake before any of this code runs.
+No release and no deployment recovers them — they never received a replacement
+token. This belongs in the ship decision, not a footnote.
+
+## Phase E — build — not started
 
 ---
 
