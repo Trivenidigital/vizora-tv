@@ -1,10 +1,22 @@
-# TV Closure Ledger — autonomous run toward a verified 1.3.14 release candidate
+# TV Closure Ledger — autonomous run, ending in the publication of 1.3.15
 
 Started 2026-08-13. Living document: every claim ends CLOSED, BLOCKED or STALE, and
 every closure carries evidence. A claim with no evidence gets demoted, not assumed.
 
-Terminal condition: a signed, fully verified 1.3.14 release-candidate APK exists and
-is **not** published. Publication is explicitly outside this run's authorisation.
+**TERMINAL STATE REACHED — and it is not the one this document was opened with.**
+
+The original terminal condition read: *"a signed, fully verified 1.3.14
+release-candidate APK exists and is **not** published. Publication is explicitly
+outside this run's authorisation."* Both halves changed under operator decision:
+
+| | |
+|---|---|
+| 1.3.14 | built, verified, Gate-A approved — then **REJECTED, never published** |
+| 1.3.15 | built once, Gate-A approved, **PUBLISHED 2026-08-13** |
+| live now | `1.3.15 / 10145 / 95D1BC01B47E20BD87456D62FF905512D6030AC829DAB72B17AE7F16C74E2383` |
+
+Kept verbatim rather than rewritten, because a ledger that quietly restates its own
+starting premise to match the outcome is worth nothing. See "Publication" at the end.
 
 ---
 
@@ -571,6 +583,69 @@ lever that looked weak and reported it **without checking whether the production
 reaches it**. Verifying that a mechanism is actually consumed is the same discipline as
 verifying a checker observes the production path — I applied it to the heartbeat ack and
 then skipped it one step later on my own tooling finding.
+
+---
+
+## Publication — 1.3.15 is LIVE (2026-08-13)
+
+Operator authorised publication bound to the exact approved artifact, and moved
+paired-device acceptance from a pre-publication hold to **post-publication
+confirmation** — the same disposition 1.3.13 shipped under.
+
+Published via the sanctioned path (`publish-display-apk.sh`, which runs the verifier
+with all four hardening flags before uploading). No rebuild.
+
+| check | result |
+|---|---|
+| `/tv` advertises | 1.3.15 / 10145, with the matching SHA rendered on the page |
+| APK endpoint | HTTP 200, `application/vnd.android.package-archive`, 1250557 bytes |
+| **public bytes re-downloaded** | `95D1BC01…C74E2383` — identical |
+| server filesystem | identical |
+| outgoing 1.3.13 archived | as `vizora-display-1.3.13-release.apk`, re-hashed `C5C0B72C…F856C72` |
+| watchdog | observed the new bytes: *install surface: healthy (APK 1250557 bytes)* |
+| customer surfaces | homepage 200, API health ok + DB connected, socket.io 200, device route 401 |
+
+### A live trap, caught by the page check
+
+`deploy/tv/index.html` was still rendered from the **REJECTED 1.3.14** — generated
+while that was the candidate, never published. Publishing without regenerating would
+have uploaded a page advertising a rejected build alongside 1.3.15 bytes. The page and
+APK ship as one operation so it could not have reached customers, but this was a real
+trap sitting in the tree, not a hypothetical, and `render-tv-page.mjs --check` is the
+thing that stops it.
+
+### What was NOT proven, recorded because it is the most assumable thing here
+
+Production-connected acceptance was **attempted and blocked**. This build machine runs
+Norton HTTPS inspection re-signing all TLS — `vizora.cloud`, `github.com` and
+`dl.google.com` all returned certificates issued by `Norton Web/Mail Shield Root` — and
+the release APK **correctly refused** the chain
+(`CertPathValidatorException: Trust anchor for certification path not found`; the app
+sat on *"Pairing request failed — retrying…"*). Weakening the client to trust it was
+forbidden and was not done. DNS was fine and the app failed safe, so this was neither a
+network fault nor an app defect.
+
+Therefore, for the artifact now in customers' hands, these are **runtime-unproven**:
+
+- the entitlement fix that is the entire reason this release exists, on a built APK
+- heartbeat `appVersion` persistence — 0 of 24 devices carry the key
+- durable impression persistence — `content_impressions` has 0 rows lifetime
+- resolver-backed pull / realtime update / heartbeat reconcile against production
+
+They rest on deterministic regression tests with mutation controls, and on source
+review. **Not on observed production behaviour.** The first customer installation is
+the acceptance test. `PHYSICAL_TV_SMOKE = DEFERRED_POST_RELEASE`.
+
+That is a deliberate, operator-owned trade — 1.3.13 was live carrying the same
+entitlement bypass, so shipping the fix unobserved is strictly better than withholding
+it — but it is a trade, and it should be read as one rather than as a passed gate.
+
+### First real origins baseline
+
+`published.compiledOrigins` is populated for the first time. Everything through 1.3.13
+predates the `__VIZORA_RELEASE_ORIGINS__` marker, so the release-over-release origins
+comparison reported SKIPPED on this publish and becomes a live check from the next
+release onward.
 
 ---
 
