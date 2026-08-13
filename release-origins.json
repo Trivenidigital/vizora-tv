@@ -24,10 +24,13 @@
     "release builds directly and REFUSES to build when an environment variable disagrees",
     "with them, so a developer's local .env can no longer reach a shipped artifact.",
     "",
-    "Changing an origin here changes what every future release talks to. It is a",
-    "release-gating change: the publish-side verifier reads the origins back out of the",
-    "packaged APK and compares them against the pin recorded in the Vizora repo's",
-    "deploy/tv/release.json. Update both, or publication fails closed."
+    "Changing an origin here changes the DEFAULT origins compiled into every future",
+    "release. It is a release-gating change: the publish-side verifier reads the origins",
+    "back out of the packaged APK and compares them against the pin recorded in the",
+    "Vizora repo's deploy/tv/release.json. Update both, or publication fails closed.",
+    "",
+    "Moving environments also needs an approved originTransition in that same file — the",
+    "published record of what customers are running is never edited just to clear a gate."
   ],
   "api": "https://vizora.cloud",
   "realtime": "wss://vizora.cloud",
