@@ -3701,6 +3701,37 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
     expect(await reportedEvents()).toContain('push_suppressed_tenant_suspended');
   });
 
+  // -------- F54: the SIBLING of F53 on the temporary-content path --------
+
+  // F50 covers suspend-then-push. This is push-then-suspend, which is a different
+  // path: handleContentPush gates on tenantSuspended only at entry, and
+  // renderTemporaryContent re-checks only whether temporaryContent was superseded.
+  // enterTenantSuspended does not clear temporaryContent, so that check cannot save
+  // it — the pushed frame commits on top of the holding screen and transitions the
+  // machine back to playing.
+  //
+  // Same entitlement invariant as F53: once suspension is observed, no renderer that
+  // began before it may put tenant content on glass.
+  it('F54: a tenant:suspended landing mid-push is not overwritten by the pushed frame', async () => {
+    await connectAndCommit();
+    const container = domElements.get('content-container')!;
+
+    triggerSocketEvent('command', {
+      type: 'push_content',
+      payload: { content: { id: 'p1', name: 'P', type: 'image', url: '/p.jpg' }, duration: 1 },
+    });
+    // Suspension arrives WHILE renderTemporaryContent is awaiting readiness.
+    triggerSocketEvent('tenant:suspended', {});
+    await vi.advanceTimersByTimeAsync(50);
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    const appends = (container.appendChild as Mock).mock.calls.length;
+
+    // Let the pushed render resolve past READY_WAIT_MS.
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    expect((container.appendChild as Mock).mock.calls.length).toBe(appends);
+  });
+
   // -------- F52: idempotent plaintext cleanup on the already-migrated path --------
 
   it('F52: lingering plaintext credentials are cleared even when already migrated', async () => {
