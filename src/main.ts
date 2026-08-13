@@ -1508,6 +1508,13 @@ class VizoraAndroidTV {
     console.warn('[Vizora] Tenant suspended:', source);
     reportEvent('tenant_suspended', { source });
     this.tenantSuspended = true;
+    // Invalidate any prepare() already in flight. advance() checks the suspend gate
+    // once at entry (:1696) and its ONLY post-await check is the playback generation
+    // (:1715), so without this a frame prepared BEFORE this signal commits on top of
+    // the holding screen we are about to enter — and the transition out of holding
+    // then cancels the 30s self-heal retry (:236-239). Same supersede primitive
+    // purgeDeviceState() already uses for the same reason (:1537).
+    this.playbackGeneration++;
     this.enterHolding('tenant_suspended');
     this.setHoldingMessage('Display paused — contact your administrator');
   }
@@ -2048,6 +2055,14 @@ class VizoraAndroidTV {
     const container = document.getElementById('content-container');
     if (!container) return;
 
+    // Captured AFTER handleContentPush's own bump (:2030), so this is this push's
+    // generation. Re-checked after the awaits below — the same contract advance()
+    // already follows. playbackGeneration is the single supersession primitive in
+    // this engine: purgeDeviceState, a new playlist, a newer push and tenant
+    // suspension all bump it, and every asynchronous renderer must revalidate it
+    // before putting anything on glass. This path was the one that did not.
+    const gen = this.playbackGeneration;
+
     // Build off-DOM; the current frame stays visible until the push is ready.
     const contentDiv = document.createElement('div');
     contentDiv.className = 'content-item';
@@ -2061,6 +2076,7 @@ class VizoraAndroidTV {
 
     const waitMs = VizoraAndroidTV.READY_WAIT_MS[content.type] ?? 0;
     const result = await Promise.race([ready, this.timeoutAfter(waitMs)]);
+    if (gen !== this.playbackGeneration) return; // superseded mid-render (incl. suspension)
     if (this.temporaryContent !== content) return; // superseded / cancelled
     if (result === 'error') {
       console.warn(`[Vizora] Pushed content failed to load: ${content.name} — resuming playlist`);

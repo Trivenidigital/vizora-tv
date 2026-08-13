@@ -3461,6 +3461,28 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
 
   // -------- F41: tenantSuspended latch cleared on resume + reconnect --------
 
+  // F53: the suspend gate in advance() is checked ONCE at entry, and the only
+  // post-await check is the playback generation. A tenant:suspended arriving while
+  // prepare() is in flight was therefore honoured and then immediately overwritten by
+  // the frame already being prepared — and the resulting transition out of holding
+  // cancelled the 30s self-heal retry, so on the last item of a non-looping playlist a
+  // suspended tenant kept rendering INDEFINITELY.
+  //
+  // Deterministic on purpose. The pre-existing F41 test caught this only ~2 runs in 10,
+  // via probe-backoff jitter that happened to land the 403 inside the prepare window —
+  // it sampled the bug rather than testing it, and under-detected it besides.
+  it('F53: a tenant:suspended landing mid-prepare is not overwritten by the in-flight frame', async () => {
+    await connectAndCommit();
+    // The committed item expires at +10s, re-entering advance() and starting prepare()
+    // for the next one, which then waits up to READY_WAIT_MS.
+    await vi.advanceTimersByTimeAsync(10_000);
+    // Suspension arrives WHILE that prepare() is in flight.
+    triggerSocketEvent('tenant:suspended', {});
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    // …and must still be holding after the in-flight prepare() resolves.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(visibleScreens()).toEqual(['holding-screen']);
+  });
   it('F41: an auth-probe 403 suspends, and a later 200 clears the latch and resumes playback', async () => {
     let n = 0;
     httpGetHandler = (opts: { url: string }) => {
@@ -3677,6 +3699,37 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
     expect((container.appendChild as Mock).mock.calls.length).toBe(appends);
     expect(visibleScreens()).toEqual(['holding-screen']);
     expect(await reportedEvents()).toContain('push_suppressed_tenant_suspended');
+  });
+
+  // -------- F54: the SIBLING of F53 on the temporary-content path --------
+
+  // F50 covers suspend-then-push. This is push-then-suspend, which is a different
+  // path: handleContentPush gates on tenantSuspended only at entry, and
+  // renderTemporaryContent re-checks only whether temporaryContent was superseded.
+  // enterTenantSuspended does not clear temporaryContent, so that check cannot save
+  // it — the pushed frame commits on top of the holding screen and transitions the
+  // machine back to playing.
+  //
+  // Same entitlement invariant as F53: once suspension is observed, no renderer that
+  // began before it may put tenant content on glass.
+  it('F54: a tenant:suspended landing mid-push is not overwritten by the pushed frame', async () => {
+    await connectAndCommit();
+    const container = domElements.get('content-container')!;
+
+    triggerSocketEvent('command', {
+      type: 'push_content',
+      payload: { content: { id: 'p1', name: 'P', type: 'image', url: '/p.jpg' }, duration: 1 },
+    });
+    // Suspension arrives WHILE renderTemporaryContent is awaiting readiness.
+    triggerSocketEvent('tenant:suspended', {});
+    await vi.advanceTimersByTimeAsync(50);
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    const appends = (container.appendChild as Mock).mock.calls.length;
+
+    // Let the pushed render resolve past READY_WAIT_MS.
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    expect((container.appendChild as Mock).mock.calls.length).toBe(appends);
   });
 
   // -------- F52: idempotent plaintext cleanup on the already-migrated path --------
