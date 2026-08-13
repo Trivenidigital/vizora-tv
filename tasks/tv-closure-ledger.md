@@ -500,9 +500,61 @@ nothing worse. But the fix changes production client bytes, which voids the Gate
 approval bound to `DAB50353…D88151` and needs a rebuild plus re-approval. PR #29 is open
 and **not merged**; nothing was rebuilt and Gate A is untouched.
 
-Related and NOT fixed: `renderTemporaryContent` has the same shape — gates at entry
-(`:2007-2011`), re-checks only `temporaryContent` after its await (`:2063-2064`), no
-suspension or generation check before committing at `:2072-2079`.
+Related and NOT fixed **at the time that entry was written**: `renderTemporaryContent`
+has the same shape. Now closed — see below.
+
+### The sibling was real too, and the operator held the release until both closed — #31
+
+Filed as a suspicion in the entry above; proven, and fixed, before any new bytes were
+cut. The push path gates on suspension only at entry (`:2011`) and re-checks only
+whether `temporaryContent` was superseded (`:2071`), which suspension does not clear.
+F50 covered suspend-then-push; **push-then-suspend** was uncovered. It reproduces
+5/5 deterministically **with the first fix already applied**, so the two are independent
+instances rather than one bug seen twice.
+
+Fixed through the engine's existing single supersession primitive rather than a second
+`if (this.tenantSuspended) return;`. `playbackGeneration` is already bumped by
+`purgeDeviceState`, a new playlist, a newer push and now suspension, and `advance()`
+revalidates it in three places; `renderTemporaryContent` was the only asynchronous
+renderer that never did. Stating the invariant once and enforcing it the same way
+everywhere covers the next renderer by construction.
+
+Mutation table isolates them cleanly: removing only the new check breaks **only** F54
+while F53 still passes. Every legitimate path (suspend-then-push suppression,
+unsuspend/resume, reconnect-clears-latch, ordinary push while active) survives every
+mutation.
+
+**Invariant search, bounded and recorded rather than left open:** exactly two
+`transition('playing')` sites exist (`:1832`, `:2095`) and both are now covered. Zone
+rendering commits synchronously and is reached only through `advance()`'s checked path,
+with timers torn down by the cleanup closure `enterHolding` runs (`:1908`);
+`renderContentToDiv` appends off-DOM. No third instance.
+
+### Release chain — 1.3.14 REJECTED, 1.3.15 cut
+
+Operator decision 2026-08-13, choosing neither of the two options put to them:
+
+> 1.3.13 published → **1.3.14 verified but REJECTED/unpublished** → 1.3.15 fixed
+> replacement candidate → physical acceptance → publish decision
+
+Neither knowingly publish a discovered enforcement bypass, nor rewrite already-bound
+provenance. `v1.3.14 → 4c5870f → DAB50353…D88151` is preserved unaltered; the tag was
+not moved and the APK was not rebuilt.
+
+**1.3.15 / 10145**, built once from `8fb863c`, tagged `v1.3.15`:
+`95D1BC01B47E20BD87456D62FF905512D6030AC829DAB72B17AE7F16C74E2383`, 1250557 bytes, cert
+`BE2320A5…3A9187A5`, origins read back out of the packaged APK.
+
+Gate A was **reset when 1.3.14 was retired** and rebound to the new hash — an approval
+is bound to exact bytes and cannot be inherited. The negative control matters more than
+the pass: the release verifier now **rejects** the 1.3.14 bytes
+(`FAIL Gate A approval is bound to this exact APK`). The retirement is mechanically
+enforced, not merely written down.
+
+Worth recording about the verifier itself: its default invocation **SKIPS** the four
+load-bearing checks — pinned cert, compiled origins, candidate binding, Gate A binding —
+and still prints `VERDICT: PASS`. Only `--against … --require-pinned-cert` runs them.
+Same class as everything else in this ledger: a green result about the wrong thing.
 
 ---
 

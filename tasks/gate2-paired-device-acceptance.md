@@ -4,7 +4,25 @@ Prepared 2026-08-13 so the whole acceptance can be completed in **one controlled
 once a human re-pairs TV1 or Lobby. Everything that can be established without touching
 a panel is established below; what remains genuinely needs the physical device.
 
-**Publication of 1.3.14 is NOT authorised by this runbook.** This gate proves the
+> ## RUN THIS AGAINST 1.3.15, NOT 1.3.14
+>
+> Operator decision 2026-08-13: the 1.3.14 candidate is **REJECTED / NOT PUBLISHED**,
+> superseded before release by the entitlement-enforcement fix (#28, #31 → #29). The
+> replacement candidate is:
+>
+> | | |
+> |---|---|
+> | version | **1.3.15 / versionCode 10145** |
+> | APK sha256 | `95D1BC01B47E20BD87456D62FF905512D6030AC829DAB72B17AE7F16C74E2383` |
+> | source | commit `8fb863c`, tag `v1.3.15` |
+> | install from | the 1.3.15 artifact directly — **not** `/tv`, which still serves 1.3.13 |
+>
+> The re-pair is scarce evidence and must not be spent validating an artifact already
+> decided against. Before starting, confirm the panel is running **10145**:
+> `adb shell dumpsys package com.vizora.display | grep versionCode`, or read the
+> in-app version. If it reports 10144, stop — that is the rejected build.
+
+**Publication of 1.3.15 is NOT authorised by this runbook.** This gate proves the
 deployed backend + the paired client converge. Publishing is a separate operator decision.
 
 ---
@@ -88,6 +106,7 @@ end to end.
 | 10 | Heartbeat records a **non-zero** appVersion | `metadata->>'appVersion'` is set and non-zero | see §4 probe B |
 | 11 | A real impression reaches durable storage | `content_impressions` row count **> 0** | see §4 probe B |
 | 12 | Healthy after reconnect/restart | no persistent "connection failed"; no stale playlist winning; no unexpected pairing purge | panel + `AuditLog` |
+| 13 | **Entitlement invariant holds on hardware** | suspending the tenant leaves the panel on holding and it **stays** there | see §4 probe D |
 
 Steps 6–7 are the tester's original symptom, deliberately induced. Step 9 is the second,
 independent recovery path (pull-on-connect) — both must work on their own.
@@ -130,6 +149,25 @@ restore). The device then holds a stale `contentVersion` with no push having rea
 which is exactly the state step 7 must repair. Reassigning while connected would be
 repaired by the push itself and would not test reconcile.
 
+**Probe D — the entitlement invariant on hardware (step 13).** This is what 1.3.15
+exists for, so it is worth confirming on glass rather than only in unit tests. It is the
+one step that deliberately changes billing-adjacent state, so do it **last**, and only if
+the tenant used for acceptance is one you are willing to suspend and resume.
+
+1. With content playing, suspend the tenant (the dunning escalation, or emit
+   `tenant:suspended` to the device's org room directly).
+2. The panel must show the branded holding screen ("Display paused — contact your
+   administrator") **within one heartbeat interval**.
+3. **Wait at least two full item durations.** The pre-1.3.15 defect showed up exactly
+   here: the holding screen appeared correctly and was then overwritten seconds later by
+   an in-flight frame. Watching only the first second would have passed the old build.
+4. Push temporary content while suspended — it must be suppressed, and the panel must
+   stay on holding.
+5. Resume the tenant; playback must return.
+
+PASS = holding appears, **stays**, survives a push attempt, and resume restores playback.
+Any flicker back to content is a regression of #28/#31.
+
 **Realtime logs for steps 5/7/9:**
 
 ```bash
@@ -157,6 +195,19 @@ for acceptance because they are named, non-test panels. The remaining roster is 
 `Smoke Display` / `QA Test TV` / `E2E …` scratch entries plus `MOBILE`, `Home`,
 `Counter 1`, `Surya`, `Moto`.
 
-1.3.14 **cannot** remotely recover any hard-expired credential — the refresh path needs a
+1.3.15 **cannot** remotely recover any hard-expired credential — the refresh path needs a
 live authenticated socket, and an expired token is rejected at the handshake before it.
-Its value here is preventing *future* stranding, plus release provenance.
+Its value here is preventing *future* stranding, closing the entitlement bypass, and
+release provenance.
+
+---
+
+## 7. On completion
+
+If steps 1–13 pass on the **1.3.15** candidate (`95D1BC01…C74E2383`), the software and
+build gates are closed and the remaining decision is publication, which is explicitly
+withheld and operator-owned.
+
+Record the run against the artifact hash, not just the version string — "1.3.15" will
+stop being unambiguous the moment anything is rebuilt, which is the whole reason 1.3.14
+was retired under its own identity rather than replaced in place.
