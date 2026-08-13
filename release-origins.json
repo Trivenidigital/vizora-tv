@@ -1,6 +1,14 @@
 {
   "_comment": [
-    "The backend origins compiled into every customer-shipped Vizora Display build.",
+    "The DEFAULT backend origins compiled into every customer-shipped Vizora Display",
+    "build.",
+    "",
+    "SCOPE: these are build-time defaults, i.e. what DEFAULT_CONFIG is seeded with —",
+    "not a guarantee about where a running device ends up pointed. src/main.ts applies",
+    "URL parameters and stored Preferences over them at startup, and the guarded",
+    "update_config path can move a paired device to another host in the same",
+    "registrable domain. What this file fixes is BUILD PROVENANCE: which origins a",
+    "given artifact was compiled against, which used to depend on the build machine.",
     "",
     "COMMITTED ON PURPOSE. These are public values — they ship inside an APK that is",
     "handed to customers, so there is nothing here to protect by hiding. Hiding them is",

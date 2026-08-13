@@ -33,9 +33,14 @@ The app talks to two Vizora backend services:
 ## Configuration
 
 **Release builds** (`production` → Android APK, `tv` → Tizen/webOS) take their three
-backend origins from the committed `release-origins.json` and **fail closed** — a
-missing/malformed pin, a wrong protocol, or a `VITE_*` env var that disagrees with
-the pin all stop the build. A local `.env` cannot redirect a customer artifact.
+**default** backend origins from the committed `release-origins.json` and **fail
+closed** — a missing/malformed pin, a wrong protocol, or a `VITE_*` env var that
+disagrees with the pin all stop the build. A local `.env` cannot decide what a
+customer artifact was built against.
+
+Scope: this fixes *build provenance*, not effective runtime destination. These
+values seed `DEFAULT_CONFIG`; URL params, stored Preferences and the guarded
+`update_config` path can still move a device at runtime.
 
 ```
 api        https://vizora.cloud

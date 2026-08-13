@@ -42,19 +42,25 @@ initCrashReporting();
 declare const __APP_VERSION__: string;
 
 /**
- * The backend origins this bundle was COMPILED with, as a JSON string, stamped in
- * at build time from release-origins.json (see vite.config.ts).
+ * The DEFAULT backend origins this bundle was COMPILED with, as a JSON string,
+ * stamped in at build time from release-origins.json (see vite.config.ts).
+ *
+ * These are the seeds for DEFAULT_CONFIG, not the effective runtime destination:
+ * loadConfig() applies URL parameters and stored Preferences over them, and the
+ * guarded update_config path can move a paired device to another host in the same
+ * registrable domain. This value records what the BUILD was pointed at.
  *
  * Published as a global so the shipped artifact describes itself. Two consumers:
  *
  *  - The publish-side release gate unpacks the APK and reads this back out, so
- *    "which backend does this binary talk to" is verified from the bytes we are
- *    about to hand customers rather than from the config we think we built with.
- *    Scanning the bundle for bare URLs cannot do that job: `api` and `dashboard`
- *    are both https://vizora.cloud today, so the strings alone cannot say which
- *    value landed in which slot.
+ *    "which origins was this binary compiled with" is verified from the bytes we
+ *    are about to hand customers rather than from the config we think we built
+ *    with. Scanning the bundle for bare URLs cannot do that job: `api` and
+ *    `dashboard` are both https://vizora.cloud today, so the strings alone cannot
+ *    say which value landed in which slot.
  *  - Support: read `__VIZORA_RELEASE_ORIGINS__` off a device console to see what a
- *    screen's build targets, without guessing from its behaviour.
+ *    screen's build shipped with — then compare against its live config, since the
+ *    two can legitimately differ.
  *
  * A plain string rather than an object literal on purpose — it survives
  * minification as one quoted token the verifier can extract with a regex, instead
