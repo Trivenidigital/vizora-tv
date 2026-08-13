@@ -3461,6 +3461,28 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
 
   // -------- F41: tenantSuspended latch cleared on resume + reconnect --------
 
+  // F53: the suspend gate in advance() is checked ONCE at entry, and the only
+  // post-await check is the playback generation. A tenant:suspended arriving while
+  // prepare() is in flight was therefore honoured and then immediately overwritten by
+  // the frame already being prepared — and the resulting transition out of holding
+  // cancelled the 30s self-heal retry, so on the last item of a non-looping playlist a
+  // suspended tenant kept rendering INDEFINITELY.
+  //
+  // Deterministic on purpose. The pre-existing F41 test caught this only ~2 runs in 10,
+  // via probe-backoff jitter that happened to land the 403 inside the prepare window —
+  // it sampled the bug rather than testing it, and under-detected it besides.
+  it('F53: a tenant:suspended landing mid-prepare is not overwritten by the in-flight frame', async () => {
+    await connectAndCommit();
+    // The committed item expires at +10s, re-entering advance() and starting prepare()
+    // for the next one, which then waits up to READY_WAIT_MS.
+    await vi.advanceTimersByTimeAsync(10_000);
+    // Suspension arrives WHILE that prepare() is in flight.
+    triggerSocketEvent('tenant:suspended', {});
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    // …and must still be holding after the in-flight prepare() resolves.
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(visibleScreens()).toEqual(['holding-screen']);
+  });
   it('F41: an auth-probe 403 suspends, and a later 200 clears the latch and resumes playback', async () => {
     let n = 0;
     httpGetHandler = (opts: { url: string }) => {

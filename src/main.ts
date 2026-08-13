@@ -1508,6 +1508,13 @@ class VizoraAndroidTV {
     console.warn('[Vizora] Tenant suspended:', source);
     reportEvent('tenant_suspended', { source });
     this.tenantSuspended = true;
+    // Invalidate any prepare() already in flight. advance() checks the suspend gate
+    // once at entry (:1696) and its ONLY post-await check is the playback generation
+    // (:1715), so without this a frame prepared BEFORE this signal commits on top of
+    // the holding screen we are about to enter — and the transition out of holding
+    // then cancels the 30s self-heal retry (:236-239). Same supersede primitive
+    // purgeDeviceState() already uses for the same reason (:1537).
+    this.playbackGeneration++;
     this.enterHolding('tenant_suspended');
     this.setHoldingMessage('Display paused — contact your administrator');
   }
