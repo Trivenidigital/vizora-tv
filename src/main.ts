@@ -1042,6 +1042,43 @@ class VizoraAndroidTV {
    * delivery model rests on. FAILS SAFE: on any error the device keeps playing
    * last-known-good — it NEVER blanks (never-black on the reconcile path).
    */
+  /**
+   * Persist a server-rotated device token and adopt it for future connects.
+   *
+   * Order matters: SecureStorage first, in-memory second. If the write throws we
+   * keep the OLD token in memory, so a storage failure leaves a device that still
+   * works on its current credential rather than one holding a token it cannot
+   * survive a reboot with.
+   *
+   * `socket.auth` is updated in place so the next reconnect presents the new token
+   * without tearing down the working socket — Socket.IO re-reads auth on each
+   * reconnection attempt.
+   */
+  private async handleTokenRefresh(payload: unknown): Promise<void> {
+    const token = (payload as { token?: unknown } | null | undefined)?.token;
+    if (typeof token !== 'string' || token.length === 0) {
+      console.warn('[Vizora] Ignoring malformed token:refresh payload — keeping current credential');
+      return;
+    }
+    if (token === this.deviceToken) return; // idempotent re-delivery
+
+    try {
+      await SecureStorage.set({ key: 'device_token', value: token });
+    } catch (error) {
+      // Keep the old token: it is still valid for now, and re-issue is retried on
+      // the next connect. Adopting a token we failed to persist would lose it.
+      console.error('[Vizora] Failed to persist rotated device token — keeping current credential:', error);
+      return;
+    }
+
+    this.deviceToken = token;
+    if (this.socket) {
+      (this.socket.auth as Record<string, unknown>) = { token };
+    }
+    console.log('[Vizora] Device token rotated by server and persisted');
+    reportEvent('device_token_rotated', { hasSocket: Boolean(this.socket) });
+  }
+
   private async pullContent(): Promise<void> {
     if (!this.deviceToken || !this.isOnline) return;
     try {
@@ -1132,6 +1169,31 @@ class VizoraAndroidTV {
       reconnectionDelay: 1000,
       reconnectionDelayMax: 60000,
       randomizationFactor: 0.5,
+    });
+
+    // Server-initiated credential rotation. The gateway re-issues a 90-day token
+    // when a device connects within 14 days of expiry and pushes it here; the
+    // stored hash is rotated at the same moment, so a device that ignores this
+    // event is holding a credential the server has already replaced.
+    //
+    // Until now nothing listened. The refresh was built for the Electron client
+    // and the TV was never wired up, which strands a screen two ways:
+    //   - the socket survives on a short-lived Redis grace record, but auth/check
+    //     compares against the CURRENT hash and answers 410 DEVICE_REVOKED, so a
+    //     single transient connect_error makes the device wipe its own credentials
+    //     and put a pairing code on customer glass
+    //   - once the old token hard-expires the handshake returns AUTH_EXPIRED, which
+    //     is fail-open by contract, so the device retries forever showing
+    //     "Connection failed" over a stale cached playlist
+    //
+    // Not hypothetical: 14 of 24 production devices are already past the 90-day
+    // expiry, across five organisations.
+    //
+    // Deliberately conservative — a bad payload must never clear a WORKING
+    // credential. Anything non-string or empty is ignored and the current token
+    // keeps running; a refresh we cannot use is strictly better than none.
+    this.socket.on('token:refresh', (payload: unknown) => {
+      void this.handleTokenRefresh(payload);
     });
 
     this.socket.on('connect', () => {
