@@ -554,7 +554,23 @@ enforced, not merely written down.
 Worth recording about the verifier itself: its default invocation **SKIPS** the four
 load-bearing checks — pinned cert, compiled origins, candidate binding, Gate A binding —
 and still prints `VERDICT: PASS`. Only `--against … --require-pinned-cert` runs them.
-Same class as everything else in this ledger: a green result about the wrong thing.
+
+**CORRECTION to the sentence that used to follow this one.** It read "Same class as
+everything else in this ledger: a green result about the wrong thing", which overstated
+the finding by implying a live exposure. The operator traced the actual consuming path
+and it does not have one: `scripts/release/publish-display-apk.sh:111-117` invokes the
+verifier with `--against --require-apksigner --require-pinned-cert
+--require-pinned-origins --require-candidate-binding` **before uploading anything**.
+Nothing can be published through the sanctioned route on a skipped check.
+
+So the residual risk is a *human* reading a manual run's `PASS` as publish-equivalent —
+worth fixing, but not a gate. Filed as Vizora#318, explicitly non-blocking for 1.3.15.
+
+The mistake is the one this ledger keeps recording, committed by me this time: I found a
+lever that looked weak and reported it **without checking whether the production path
+reaches it**. Verifying that a mechanism is actually consumed is the same discipline as
+verifying a checker observes the production path — I applied it to the heartbeat ack and
+then skipped it one step later on my own tooling finding.
 
 ---
 
