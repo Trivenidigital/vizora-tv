@@ -3708,20 +3708,36 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
     // Driven from a committed fixture that the Vizora repo asserts against too, so
     // an incompatible change to the envelope OR to this unwrap fails a test rather
     // than going quiet in the field.
+    // The fixture is split in two, and the halves mean different things.
+    //
+    //   clientAccepted.*  the SUPERSET this client tolerates. It is NOT a claim about
+    //                     what the server sends: `revoked` is never emitted by the
+    //                     current server (revocation rides the separate device:revoked
+    //                     event; revocation-contract.md §3.2 only says the ack MAY carry
+    //                     the flag), and `commands` is emitted but ALWAYS empty. Both
+    //                     branches must keep working, so both are exercised here.
+    //
+    //   serverAck.*       what the server ACTUALLY emits, asserted against the real
+    //                     DeviceGateway.handleHeartbeat() in Vizora
+    //                     (realtime/src/gateways/heartbeat-ack-contract.spec.ts).
+    //
+    // That distinction is the correction this file needed: the earlier fixture had only
+    // the first kind and labelled it the server contract, so a server-side test bound to
+    // it could only have passed by not looking at the server.
     const wire = JSON.parse(
       readFileSync(new URL('./ack-envelope.fixture.json', import.meta.url), 'utf8'),
-    ) as { envelope: Record<string, unknown>; legacyUnwrapped: Record<string, unknown> };
+    ) as {
+      clientAccepted: { envelope: Record<string, unknown>; legacyUnwrapped: Record<string, unknown> };
+      serverAck: Record<'activeSocket' | 'supersededSocket', { success: boolean; data: Record<string, unknown> }>;
+    };
 
-    it.each([
-      ['wrapped envelope { success, data, timestamp }', 'envelope'],
-      ['legacy unwrapped payload', 'legacyUnwrapped'],
-    ])('acts on commands, revoked AND reconcileContent from the %s', async (_label, key) => {
+    /** Connect, take the heartbeat ack callback, invoke it with `ackPayload`. */
+    const ackWith = async (ackPayload: unknown) => {
       secureStorageStore.set('device_token', 'tok-123');
       secureStorageStore.set('device_id', 'dev-123');
       await importFresh();
       (window.location.reload as Mock).mockClear();
 
-      const ackPayload = (wire as Record<string, Record<string, unknown>>)[key];
       // Heartbeats only start once the socket connects (and reports connected).
       currentMockSocket.connected = true;
       triggerSocketEvent('connect');
@@ -3735,21 +3751,72 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
       cb!(ackPayload);
       await vi.advanceTimersByTimeAsync(50);
 
+      const { CapacitorHttp } = await import('@capacitor/core');
+      return (CapacitorHttp.get as Mock).mock.calls.map(
+        (c: unknown[]) => String((c[0] as { url?: string })?.url ?? ''),
+      );
+    };
+
+    it.each([
+      ['wrapped envelope { success, data, timestamp }', 'envelope'],
+      ['legacy unwrapped payload', 'legacyUnwrapped'],
+    ])('acts on commands, revoked AND reconcileContent from the %s', async (_label, key) => {
+      const urls = await ackWith(
+        (wire.clientAccepted as Record<string, Record<string, unknown>>)[key],
+      );
+
       // All THREE fields must be observably acted on. Asserting only the one that
       // was convenient would leave the other two unbound — a test claiming a
       // contract it does not check is the defect this file exists to prevent.
-      const { CapacitorHttp } = await import('@capacitor/core');
-      const urls = () =>
-        (CapacitorHttp.get as Mock).mock.calls.map((c: unknown[]) => String((c[0] as { url?: string })?.url ?? ''));
 
       // reconcileContent -> pullContent -> GET effective content
-      expect(urls().some(u => u.includes('/devices/me/content'))).toBe(true);
+      expect(urls.some(u => u.includes('/devices/me/content'))).toBe(true);
 
       // revoked -> confirmRevocation -> runAuthCheck -> GET auth/check
-      expect(urls().some(u => u.includes('/devices/auth/check'))).toBe(true);
+      expect(urls.some(u => u.includes('/devices/auth/check'))).toBe(true);
 
       // commands -> handleCommand({type:'reload'}) -> window.location.reload()
       expect(window.location.reload as Mock).toHaveBeenCalled();
+    });
+
+    // The block above proves the client copes with everything it MIGHT be sent. These
+    // two prove it behaves correctly on what it IS sent — the shapes the Vizora spec
+    // asserts come out of the real handler. Without them the client half would only
+    // ever be exercised against a payload production never produces, which is the
+    // mirror image of the server-side defect this fixture was split to fix.
+    // Rebuild the on-the-wire envelope from the fixture's serverAck entry. The entry also
+    // carries `_comment` and `envelopeKeys` for documentation, and no `timestamp` — feeding
+    // it raw would hand the client a payload production never sends, in the one test whose
+    // whole point is fidelity to what production sends.
+    const asWire = (shape: { success: boolean; data: Record<string, unknown> }) => ({
+      success: shape.success,
+      data: shape.data,
+      timestamp: '2026-08-13T00:00:00.000Z',
+    });
+
+    it('on the REAL active-socket ack: reconciles, and does NOT reload or auth-check', async () => {
+      const urls = await ackWith(asWire(wire.serverAck.activeSocket));
+
+      expect(urls.some(u => u.includes('/devices/me/content'))).toBe(true);
+      // commands is [] and revoked absent, so neither side effect may fire.
+      expect(window.location.reload as Mock).not.toHaveBeenCalled();
+      expect(urls.some(u => u.includes('/devices/auth/check'))).toBe(false);
+    });
+
+    it('on the REAL superseded-socket ack: no reconcile pull, no reload, no auth-check', async () => {
+      // That path omits reconcileContent entirely. An absent key must read as "no",
+      // never as a reason to act — a device beating on a stale socket must stay quiet.
+      const urls = await ackWith(asWire(wire.serverAck.supersededSocket));
+
+      // POSITIVE CONTROL FIRST. Every other assertion here is a negative, and negatives
+      // go vacuous the moment the ack stops being delivered at all. Proving the same
+      // helper still produces observable HTTP for a reconciling ack is what keeps the
+      // three "did not happen" assertions meaningful on their own.
+      expect(await ackWith(asWire(wire.serverAck.activeSocket))).not.toHaveLength(0);
+
+      expect(urls.some(u => u.includes('/devices/me/content'))).toBe(false);
+      expect(window.location.reload as Mock).not.toHaveBeenCalled();
+      expect(urls.some(u => u.includes('/devices/auth/check'))).toBe(false);
     });
   });
 

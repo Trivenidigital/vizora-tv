@@ -1,38 +1,122 @@
 {
   "_comment": [
-    "CANONICAL heartbeat-ack wire fixture. Committed in vizora-tv and asserted against",
-    "in BOTH repos, because the ack crosses a process boundary that nothing else checks.",
+    "CANONICAL heartbeat-ack wire fixture. Committed in BOTH vizora-tv and Vizora and",
+    "asserted against in both, because the ack crosses a process boundary that nothing",
+    "else checks. Keep the two copies byte-identical.",
     "",
-    "The envelope is exactly what the server's createSuccessResponse() emits",
-    "(Vizora realtime/src/gateways/dto/index.ts) — { success, data, timestamp } — and the",
-    "client unwraps `.data` by hand (vizora-tv src/main.ts). Neither side imports the",
-    "other, so until now a change on either side could silently stop the other working.",
+    "READ THIS BEFORE EDITING — the file is split in two on purpose.",
     "",
-    "That is not hypothetical. `reconcileContent` was wired on both sides, unit-tested",
-    "green on both, and was ALWAYS undefined at runtime until the ack-.data unwrap was",
-    "fixed (Vizora tasks/pending-decisions.md:379-403). Two more instances followed in the",
-    "same subsystem: an unwhitelisted heartbeat field rejected every beat for four",
-    "releases, and a mistyped impression timestamp rejected every impression for the",
-    "repo's lifetime. All three were client->server or server->client shape mismatches",
-    "that each side's own tests could not see.",
+    "  serverAck.*      what the server ACTUALLY EMITS today. Expected OUTPUT of",
+    "                   DeviceGateway.handleHeartbeat(). Asserted in Vizora at",
+    "                   realtime/src/gateways/heartbeat-ack-contract.spec.ts, which drives",
+    "                   the real handler and compares its return value against these.",
     "",
-    "If you change this file, the corresponding test fails in BOTH repos — which is the",
-    "point. Change it only when the wire format genuinely changes, and change both sides."
+    "  clientAccepted.* the SUPERSET the client must tolerate — every field vizora-tv acts",
+    "                   on, including ones the current server never sends. This is CLIENT",
+    "                   COMPATIBILITY COVERAGE, NOT a server promise. Asserted in vizora-tv",
+    "                   at src/vizora-app.spec.ts.",
+    "",
+    "The previous version of this file had only the second kind and labelled it the server",
+    "contract. That was wrong in a way worth recording: it described",
+    "commands:[{type:'reload'}] and revoked:true as the heartbeat response, when the server",
+    "emits commands:[] always and has never emitted revoked at all. A server-side test bound",
+    "to that shape could only have been made to pass by NOT looking at the server. A fixture",
+    "must be expected output, never input that manufactures the output.",
+    "",
+    "That is this subsystem's whole history. reconcileContent was wired on both sides, green",
+    "on both sides, and ALWAYS undefined at runtime until the .data unwrap landed.",
+    "contentVersion went unwhitelisted and every heartbeat was rejected for four releases.",
+    "content:impression.timestamp was typed string while both clients send a number, and that",
+    "table held zero rows for the repo's lifetime. Every one passed its own side's tests.",
+    "",
+    "If you change this file the corresponding test fails in BOTH repos — that is the point.",
+    "Change it only when the wire format genuinely changes, and change both sides."
   ],
-  "envelope": {
-    "success": true,
-    "data": {
+
+  "serverAck": {
+    "_comment": [
+      "Vizora realtime/src/gateways/device.gateway.ts handleHeartbeat has exactly four return",
+      "statements. The two SUCCESS shapes are below; the two error shapes (createErrorResponse,",
+      "rate-limited and caught-exception) carry no data payload and are not part of this contract.",
+      "",
+      "The envelope wrapper { success, data, timestamp } comes from createSuccessResponse",
+      "(realtime/src/gateways/dto/index.ts). The client hand-unwraps `.data` (vizora-tv",
+      "src/main.ts:1017). Neither side imports the other."
+    ],
+
+    "activeSocket": {
+      "_comment": [
+        "device.gateway.ts:1902-1906 — the normal path, reached when the heartbeat arrives on",
+        "the device's CURRENT socket. reconcileContent is computed per-device by",
+        "shouldReconcileContent(); `true` here is one legal value and the contract test drives",
+        "the real handler for both true and false.",
+        "",
+        "commands is a HARDCODED EMPTY LITERAL at this site. The key is part of the wire shape;",
+        "it has never carried data. Commands are delivered by the separate `command` socket",
+        "event (device.gateway.ts:2314 live, :2142 offline replay)."
+      ],
+      "envelopeKeys": ["data", "success", "timestamp"],
+      "success": true,
+      "data": {
+        "reconcileContent": true,
+        "nextHeartbeatIn": 15000,
+        "commands": []
+      }
+    },
+
+    "supersededSocket": {
+      "_comment": [
+        "device.gateway.ts:1804-1807 — returned when the beat arrives on a socket that is no",
+        "longer the device's active one. NOTE THE DIFFERENCE: no reconcileContent key. A",
+        "contract test asserting one fixed key set for all success paths would be wrong about",
+        "this one, and would break the first time a stale socket beat."
+      ],
+      "envelopeKeys": ["data", "success", "timestamp"],
+      "success": true,
+      "data": {
+        "nextHeartbeatIn": 15000,
+        "commands": []
+      }
+    }
+  },
+
+  "clientAccepted": {
+    "_comment": [
+      "NOT A SERVER PROMISE. The union of everything vizora-tv's ack handler acts on",
+      "(src/main.ts:1017-1030), used to prove the client stays correct if any of it ever",
+      "arrives. Field by field, against the CURRENT server:",
+      "",
+      "  reconcileContent  genuinely emitted today (see serverAck.activeSocket)",
+      "  commands          key emitted today but ALWAYS []. A non-empty array has never been",
+      "                    reachable in a heartbeat ack. Kept here because the revocation",
+      "                    contract (vizora-tv docs/design/revocation-contract.md §7.1a(a))",
+      "                    names the ack's commands array as an authenticated channel for",
+      "                    `unpair`, so the client must handle it.",
+      "  revoked           NEVER emitted by the current server. Permitted-but-optional by",
+      "                    design: revocation-contract.md §3.2 says the ack MAY carry it and",
+      "                    §6.3 calls the ack flag optional. Delivered today by the separate",
+      "                    `device:revoked` event. The client branch must stay.",
+      "  nextHeartbeatIn   emitted by the server, but the client does not read it — it",
+      "                    hardcodes its own 15s interval (main.ts:954-961).",
+      "",
+      "Both shapes below carry the same fields: the client accepts the wrapped envelope OR a",
+      "bare unwrapped payload, and must behave identically for either."
+    ],
+    "envelope": {
+      "success": true,
+      "data": {
+        "nextHeartbeatIn": 15000,
+        "commands": [{ "type": "reload" }],
+        "revoked": true,
+        "reconcileContent": true
+      },
+      "timestamp": "2026-08-13T00:00:00.000Z"
+    },
+    "legacyUnwrapped": {
       "nextHeartbeatIn": 15000,
       "commands": [{ "type": "reload" }],
       "revoked": true,
       "reconcileContent": true
-    },
-    "timestamp": "2026-08-13T00:00:00.000Z"
-  },
-  "legacyUnwrapped": {
-    "nextHeartbeatIn": 15000,
-    "commands": [{ "type": "reload" }],
-    "revoked": true,
-    "reconcileContent": true
+    }
   }
 }
