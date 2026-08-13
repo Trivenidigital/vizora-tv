@@ -3719,6 +3719,7 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
       secureStorageStore.set('device_token', 'tok-123');
       secureStorageStore.set('device_id', 'dev-123');
       await importFresh();
+      (window.location.reload as Mock).mockClear();
 
       const ackPayload = (wire as Record<string, Record<string, unknown>>)[key];
       // Heartbeats only start once the socket connects (and reports connected).
@@ -3734,12 +3735,21 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
       cb!(ackPayload);
       await vi.advanceTimersByTimeAsync(50);
 
-      // reconcileContent must reach pullContent -> an HTTP GET for effective content.
+      // All THREE fields must be observably acted on. Asserting only the one that
+      // was convenient would leave the other two unbound — a test claiming a
+      // contract it does not check is the defect this file exists to prevent.
       const { CapacitorHttp } = await import('@capacitor/core');
-      const pulled = (CapacitorHttp.get as Mock).mock.calls.some(
-        (c: unknown[]) => String((c[0] as { url?: string })?.url ?? '').includes('/devices/me/content'),
-      );
-      expect(pulled).toBe(true);
+      const urls = () =>
+        (CapacitorHttp.get as Mock).mock.calls.map((c: unknown[]) => String((c[0] as { url?: string })?.url ?? ''));
+
+      // reconcileContent -> pullContent -> GET effective content
+      expect(urls().some(u => u.includes('/devices/me/content'))).toBe(true);
+
+      // revoked -> confirmRevocation -> runAuthCheck -> GET auth/check
+      expect(urls().some(u => u.includes('/devices/auth/check'))).toBe(true);
+
+      // commands -> handleCommand({type:'reload'}) -> window.location.reload()
+      expect(window.location.reload as Mock).toHaveBeenCalled();
     });
   });
 
