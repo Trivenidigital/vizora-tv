@@ -186,6 +186,18 @@ export default defineConfig(({ mode }) => {
       'import.meta.env.VITE_API_URL': JSON.stringify(origins.VITE_API_URL),
       'import.meta.env.VITE_REALTIME_URL': JSON.stringify(origins.VITE_REALTIME_URL),
       'import.meta.env.VITE_DASHBOARD_URL': JSON.stringify(origins.VITE_DASHBOARD_URL),
+      // Self-describing artifact: the compiled origins as a JSON *string*, stamped
+      // into the bundle so the publish-side gate can read them back out of the APK.
+      // Double-stringified deliberately — the inner JSON is the value, the outer
+      // quoting is what makes it a single string literal after minification.
+      // See the __RELEASE_ORIGINS_JSON__ comment in src/main.ts.
+      '__RELEASE_ORIGINS_JSON__': JSON.stringify(
+        JSON.stringify({
+          api: origins.VITE_API_URL,
+          realtime: origins.VITE_REALTIME_URL,
+          dashboard: origins.VITE_DASHBOARD_URL,
+        }),
+      ),
       'import.meta.env.VITE_SENTRY_DSN': JSON.stringify(env.VITE_SENTRY_DSN || ''),
     },
   };

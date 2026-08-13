@@ -41,6 +41,32 @@ initCrashReporting();
 
 declare const __APP_VERSION__: string;
 
+/**
+ * The backend origins this bundle was COMPILED with, as a JSON string, stamped in
+ * at build time from release-origins.json (see vite.config.ts).
+ *
+ * Published as a global so the shipped artifact describes itself. Two consumers:
+ *
+ *  - The publish-side release gate unpacks the APK and reads this back out, so
+ *    "which backend does this binary talk to" is verified from the bytes we are
+ *    about to hand customers rather than from the config we think we built with.
+ *    Scanning the bundle for bare URLs cannot do that job: `api` and `dashboard`
+ *    are both https://vizora.cloud today, so the strings alone cannot say which
+ *    value landed in which slot.
+ *  - Support: read `__VIZORA_RELEASE_ORIGINS__` off a device console to see what a
+ *    screen's build targets, without guessing from its behaviour.
+ *
+ * A plain string rather than an object literal on purpose — it survives
+ * minification as one quoted token the verifier can extract with a regex, instead
+ * of an object whose keys a minifier is free to reshape.
+ */
+declare const __RELEASE_ORIGINS_JSON__: string;
+
+// Assigned unconditionally at module scope: a side effect, so it is never
+// tree-shaken out of the release bundle the gate has to read.
+(globalThis as Record<string, unknown>).__VIZORA_RELEASE_ORIGINS__ =
+  typeof __RELEASE_ORIGINS_JSON__ !== 'undefined' ? __RELEASE_ORIGINS_JSON__ : '';
+
 // Configuration - can be overridden via URL params or stored preferences
 const DEFAULT_CONFIG = {
   apiUrl: import.meta.env.VITE_API_URL || 'http://localhost:3000',
