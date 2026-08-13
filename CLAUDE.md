@@ -32,14 +32,24 @@ The app talks to two Vizora backend services:
 
 ## Configuration
 
-Three Vite env vars in `.env`:
+**Release builds** (`production` → Android APK, `tv` → Tizen/webOS) take their three
+backend origins from the committed `release-origins.json` and **fail closed** — a
+missing/malformed pin, a wrong protocol, or a `VITE_*` env var that disagrees with
+the pin all stop the build. A local `.env` cannot redirect a customer artifact.
+
 ```
-VITE_API_URL=https://api.vizora.io
-VITE_REALTIME_URL=wss://realtime.vizora.io
-VITE_DASHBOARD_URL=https://dashboard.vizora.io
+api        https://vizora.cloud
+realtime   wss://vizora.cloud
+dashboard  https://vizora.cloud
 ```
 
-Can also be overridden at runtime via URL params or stored Capacitor Preferences.
+**Local development** still uses `.env` (see `.env.example`); the `VITE_*` vars apply
+in non-release modes only. To build against another backend, use a non-release mode:
+`vite build --mode staging`.
+
+`VITE_SENTRY_DSN` is not an origin and stays env-driven in every mode. All three
+origins can still be overridden at runtime via URL params or stored Capacitor
+Preferences — that is a paired-device support path, not a build input.
 
 ## Build
 

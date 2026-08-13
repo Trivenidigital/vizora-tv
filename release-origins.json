@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "The backend origins compiled into every customer-shipped Vizora Display build.",
+    "",
+    "COMMITTED ON PURPOSE. These are public values — they ship inside an APK that is",
+    "handed to customers, so there is nothing here to protect by hiding. Hiding them is",
+    "what created the problem this file exists to fix: until 1.3.13 the production",
+    "origins came from a gitignored, machine-local `.env`, with vite.config.ts falling",
+    "back to *a different environment* (api.vizora.io) when it was absent. Two people",
+    "could build the same commit, with the same signing key, and ship APKs pointing at",
+    "different backends — and every release gate would pass, because package id,",
+    "version, certificate and artifact hash are all indifferent to what the binary",
+    "talks to. See Trivenidigital/vizora-tv#18.",
+    "",
+    "This file is the single source of truth. vite.config.ts compiles these values into",
+    "release builds directly and REFUSES to build when an environment variable disagrees",
+    "with them, so a developer's local .env can no longer reach a shipped artifact.",
+    "",
+    "Changing an origin here changes what every future release talks to. It is a",
+    "release-gating change: the publish-side verifier reads the origins back out of the",
+    "packaged APK and compares them against the pin recorded in the Vizora repo's",
+    "deploy/tv/release.json. Update both, or publication fails closed."
+  ],
+  "api": "https://vizora.cloud",
+  "realtime": "wss://vizora.cloud",
+  "dashboard": "https://vizora.cloud"
+}
