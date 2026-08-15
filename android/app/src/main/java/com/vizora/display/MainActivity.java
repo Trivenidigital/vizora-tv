@@ -80,12 +80,33 @@ public class MainActivity extends BridgeActivity {
 
         long now = SystemClock.elapsedRealtime();
         if (!RendererRecoveryGuard.shouldRecover(now, lastRendererRecoveryAt)) {
-            // Renderer died again within the guard window — a tight loop. Don't
-            // hot-loop: return false so the framework terminates the process and the
-            // restart falls to the crash-recovery / next-boot path. (Full
-            // renderer-loop safe-mode is folded into the F2/S-19c crash-loop work.)
+            // Renderer died again within the guard window — a tight loop. Don't hot-loop
+            // in-process: return false and let the framework terminate us.
+            //
+            // But returning false alone was a DARK SCREEN. The framework kills the process
+            // with NO Java exception, so CrashRecoveryHandler.uncaughtException never runs;
+            // BootReceiver only fires on boot/quickboot/package-replace; there is no service
+            // or watchdog. Nothing was left to bring the app back — identical in effect to the
+            // terminal HOLD that CrashLoopGuard no longer has. This comment used to defer the
+            // fix to "the F2/S-19c crash-loop work"; this IS that work, so the restart is
+            // scheduled here rather than promised elsewhere.
+            //
+            // Safe to do now: we are still on the live foreground main thread of a healthy
+            // process (only the renderer died), so AlarmManager is fully usable — unlike the
+            // uncaught-exception caller, which is mid-teardown. Routing through
+            // recordAndScheduleRelaunch also puts renderer deaths on the SAME escalation
+            // ladder as Java crashes, so a device alternating between them still backs off
+            // instead of restarting every 3s forever.
             Log.e(TAG, "Renderer gone again within " + RendererRecoveryGuard.MIN_INTERVAL_MS
-                + "ms — deferring to process restart");
+                + "ms — scheduling a process restart and letting the framework kill us");
+            try {
+                CrashRecoveryHandler.recordAndScheduleRelaunch(
+                    getApplicationContext(), CrashRecoveryHandler.REASON_RENDERER_LOOP);
+            } catch (Throwable t) {
+                // Never let the relaunch bookkeeping change what we return: a throw here
+                // would propagate into the framework's onRenderProcessGone caller.
+                Log.e(TAG, "Failed to schedule restart after renderer loop", t);
+            }
             return false;
         }
         lastRendererRecoveryAt = now;

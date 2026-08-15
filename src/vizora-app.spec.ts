@@ -655,6 +655,92 @@ describe('VizoraAndroidTV', () => {
     });
   });
 
+  // ==================== 2b. CRASH-LOOP DEGRADATION MARKER ====================
+
+  describe('Crash-loop degradation marker (CLAUDE.md 12b)', () => {
+    beforeEach(() => {
+      vi.useFakeTimers();
+      resetCapacitorFakes();
+      resetDOM();
+      (window.location as { search: string }).search = '';
+      (window.location.reload as Mock).mockClear();
+      ioFactory.mockClear();
+      currentMockSocket = createMockSocket();
+      ioFactory.mockReturnValue(currentMockSocket);
+      mockCacheManager.getCachedUri.mockReset().mockResolvedValue(null);
+      mockCacheManager.downloadContent.mockReset().mockResolvedValue(null);
+      qrToCanvasMock.mockReset().mockResolvedValue(undefined);
+      vi.spyOn(console, 'log').mockImplementation(() => {});
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    it('reports the marker the native crash handler left behind', async () => {
+      // The native side cannot report this itself — the process that made the decision was
+      // terminating. If this boot does not report it, nobody is ever told that the device
+      // spent minutes crash-looping and degraded to one restart attempt per hour.
+      const { reportEvent } = await import('./crash-reporting');
+      (reportEvent as Mock).mockClear();
+      preferencesStore.set('crash_loop_capped', '1700000000000:4:uncaught_exception');
+
+      await importFresh();
+
+      const call = (reportEvent as Mock).mock.calls.find(c => c[0] === 'crash_loop_capped');
+      expect(call).toBeDefined();
+      expect(call![1]).toMatchObject({
+        at: 1700000000000,
+        crashes: 4,
+        reason: 'uncaught_exception',
+      });
+    });
+
+    it('clears the marker so a past episode is not re-reported forever', async () => {
+      preferencesStore.set('crash_loop_capped', '1700000000000:4:uncaught_exception');
+
+      await importFresh();
+
+      expect(preferencesStore.has('crash_loop_capped')).toBe(false);
+    });
+
+    it('reports nothing on a device that never crash-looped', async () => {
+      // Negative control: the event must be evidence of a real episode, not something every
+      // boot emits.
+      const { reportEvent } = await import('./crash-reporting');
+      (reportEvent as Mock).mockClear();
+
+      await importFresh();
+
+      expect((reportEvent as Mock).mock.calls.some(c => c[0] === 'crash_loop_capped')).toBe(false);
+    });
+
+    it('still boots normally when the marker read fails', async () => {
+      // Telemetry must never be able to brick boot. A device recovering from a crash loop is
+      // precisely the device that cannot afford a new failure on the startup path.
+      // Fail ONLY the marker read — loadConfig() reads Preferences first, so a blanket
+      // "reject the next call" would break config instead and prove nothing about this path.
+      const { Preferences } = await import('@capacitor/preferences');
+      const prefsGet = Preferences.get as Mock;
+      const previous = prefsGet.getMockImplementation();
+      prefsGet.mockImplementation(async (arg: { key: string }) => {
+        if (arg.key === 'crash_loop_capped') throw new Error('prefs unavailable');
+        return { value: preferencesStore.get(arg.key) ?? null };
+      });
+      secureStorageStore.set('device_token', 'tok-123');
+      secureStorageStore.set('device_id', 'dev-123');
+
+      try {
+        await importFresh();
+        expect(ioFactory).toHaveBeenCalled();
+      } finally {
+        if (previous) prefsGet.mockImplementation(previous);
+      }
+    });
+  });
+
   // ==================== 3. INITIALIZATION FLOW ====================
 
   describe('Initialization Flow', () => {

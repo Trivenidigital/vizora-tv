@@ -118,3 +118,53 @@ export function transformContentUrl(
 
   return result;
 }
+
+/**
+ * Key under which the Android native crash handler leaves its degradation marker.
+ * Written by CrashRecoveryHandler.writeCappedMarker() into the "CapacitorStorage"
+ * SharedPreferences file, which is exactly what the Capacitor Preferences plugin reads,
+ * so no new plugin or bridge is involved.
+ */
+export const CRASH_LOOP_MARKER_KEY = 'crash_loop_capped';
+
+export interface CrashLoopMarker {
+  at: number | null;
+  crashes: number | null;
+  reason: string | null;
+}
+
+/**
+ * Parse the native crash-loop degradation marker.
+ *
+ * Wire format is "<wallClockMs>:<crashesInWindow>:<reason>" — colon-delimited rather than
+ * JSON on purpose, because it is written by a process that is in the middle of dying and a
+ * half-written JSON value would throw in the reader.
+ *
+ * Why this exists at all: when the native crash ladder is exhausted the device drops to one
+ * relaunch attempt per hour. That is an automated state change that materially degrades the
+ * device, and nothing else can tell the operator about it — the native side cannot report
+ * telemetry (reportEvent is here, in JS, and that process is terminating) and logcat reaches
+ * nobody on a fielded screen. So the native side leaves this breadcrumb and the next boot
+ * that gets far enough reports it (CLAUDE.md 12b).
+ *
+ * TOLERANT BY DESIGN: a truncated or garbled marker still yields an event with whatever
+ * fields survived, because "this device was crash-looping" is the load-bearing signal and
+ * losing it to a strict parse would reintroduce the silence this is meant to remove.
+ * Returns null only when there is genuinely nothing to report.
+ */
+export function parseCrashLoopMarker(raw: string | null | undefined): CrashLoopMarker | null {
+  if (!raw) {
+    return null;
+  }
+  const parts = raw.split(':');
+  const num = (part: string | undefined): number | null => {
+    if (part === undefined || part.trim() === '') return null;
+    const parsed = Number(part);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  return {
+    at: num(parts[0]),
+    crashes: num(parts[1]),
+    reason: parts[2] !== undefined && parts[2] !== '' ? parts[2] : null,
+  };
+}
