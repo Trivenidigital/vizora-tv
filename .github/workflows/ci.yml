@@ -16,6 +16,8 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      - name: Version alignment (package.json vs gradle/tizen/webos)
+        run: node scripts/check-version-alignment.mjs
       - name: Typecheck
         run: npx tsc --noEmit
       - name: Unit tests

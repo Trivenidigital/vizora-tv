@@ -17,7 +17,7 @@
 <widget xmlns="http://www.w3.org/ns/widgets"
         xmlns:tizen="http://tizen.org/ns/widgets"
         id="http://vizora.io/vizora-display"
-        version="1.0.1"
+        version="1.3.16"
         viewmodes="maximized">
   <access origin="*" subdomains="true"/>
   <tizen:application id="VizoraDsp0.VizoraDisplay" package="VizoraDsp0" required_version="4.0"/>
