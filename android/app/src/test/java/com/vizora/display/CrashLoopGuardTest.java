@@ -155,10 +155,92 @@ public class CrashLoopGuardTest {
     }
 
     @Test
-    public void pruneKeepsOnlyEntriesInsideWindow() {
+    public void pruneKeepsTheWholeChainWhileCrashesKeepArriving() {
+        // The window is measured from the PREVIOUS crash, not from each entry independently:
+        // as long as the chain is unbroken the older entries stay, however long the chain has
+        // been running. Measuring each entry against now is what made the cap unreachable —
+        // see theCappedRungIsAReachableSteadyState.
         long now = T0 + CrashLoopGuard.WINDOW_MS;
         long[] history = { T0 - 1, T0, T0 + 1, now };
-        assertArrayEquals(new long[] { T0 + 1, now }, CrashLoopGuard.pruneToWindow(history, now));
+        assertArrayEquals(history, CrashLoopGuard.pruneToWindow(history, now));
+    }
+
+    @Test
+    public void pruneDropsTheChainOnceTheDeviceHasBeenQuietForAWindow() {
+        long[] history = { T0, T0 + 1_000L, T0 + 2_000L };
+        long now = T0 + 2_000L + CrashLoopGuard.WINDOW_MS;
+        assertEquals(0, CrashLoopGuard.pruneToWindow(history, now).length);
+    }
+
+    // ---- N2: the cap has to be a steady state, not a place the ladder passes through -------
+
+    @Test
+    public void windowIsLongerThanTheCappedRetryInterval() {
+        // Not a style constraint. If the quiet window is shorter than the capped retry
+        // interval, a device sitting on the capped rung prunes its own chain between attempts
+        // and drops straight back to the fast rung — the ladder restarts from the bottom
+        // forever and the cap is decorative.
+        assertTrue("WINDOW_MS (" + CrashLoopGuard.WINDOW_MS + ") must exceed CAPPED_RETRY_MS ("
+                + CrashLoopGuard.CAPPED_RETRY_MS + ")",
+            CrashLoopGuard.WINDOW_MS > CrashLoopGuard.CAPPED_RETRY_MS);
+    }
+
+    @Test
+    public void theCappedRungIsAReachableSteadyState() {
+        // Simulates the case the ladder exists for: a deterministic crash on startup, where
+        // each crash lands as soon as the scheduled restart delivers. Walk a full day of it
+        // using the delays the guard itself hands back.
+        //
+        // The old absolute-window prune failed here on the 5th crash: it landed ~65 minutes
+        // after the 4th, by which point every earlier entry was outside a 10-minute window, so
+        // the guard saw a history of length 1 and handed back 3s. Real steady state was ~4
+        // crashes per ~65min (~88/day), not the ~24/day the cap advertises.
+        long[] h = new long[0];
+        long t = T0;
+        long delay = 0L;
+        for (int crash = 1; crash <= 24; crash++) {
+            t += delay;
+            h = CrashLoopGuard.recordCrash(h, t);
+            delay = CrashLoopGuard.decide(h);
+            if (crash > CrashLoopGuard.BACKOFF_MS.length) {
+                assertEquals("crash " + crash + " (t+" + (t - T0) + "ms) fell off the capped "
+                        + "rung and restarted the ladder", CrashLoopGuard.CAPPED_RETRY_MS, delay);
+            }
+        }
+    }
+
+    @Test
+    public void aLongLoopIsDistinguishableFromAShortOneInTheMarkerCount() {
+        // The marker reports historyMs.length. Under the old prune that count was ALWAYS
+        // BACKOFF_MS.length + 1, so a device that had looped for a week reported exactly the
+        // same number as one that looped four times and recovered.
+        long[] h = new long[0];
+        long t = T0;
+        long delay = 0L;
+        for (int crash = 1; crash <= 24; crash++) {
+            t += delay;
+            h = CrashLoopGuard.recordCrash(h, t);
+            delay = CrashLoopGuard.decide(h);
+        }
+        assertTrue("a day of crash-looping still reports only " + h.length + " events",
+            h.length > CrashLoopGuard.BACKOFF_MS.length + 1);
+        assertEquals("and it saturates at the size cap, so read it as 'at least this many'",
+            CrashLoopGuard.MAX_HISTORY, h.length);
+    }
+
+    @Test
+    public void aDeviceThatStopsCrashingLeavesTheCappedRung() {
+        // The cap must be sticky, not permanent: the transient-cause argument for capping
+        // (rather than giving up) depends on the device healing itself once the cause clears.
+        long[] h = new long[0];
+        for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
+            h = CrashLoopGuard.recordCrash(h, T0 + i * 1_000L);
+        }
+        assertEquals(CrashLoopGuard.CAPPED_RETRY_MS, CrashLoopGuard.decide(h));
+
+        long afterAQuietWindow = T0 + CrashLoopGuard.WINDOW_MS + 60_000L;
+        assertEquals(3_000L,
+            CrashLoopGuard.decide(CrashLoopGuard.recordCrash(h, afterAQuietWindow)));
     }
 
     @Test
