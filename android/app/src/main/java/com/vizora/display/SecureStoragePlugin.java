@@ -174,11 +174,39 @@ public class SecureStoragePlugin extends Plugin {
             // non-fatal tenant_id recovery) so the subsequent re-pair/rewrite of this key
             // lands on clean storage, then reject with the GENERIC retryable code (NOT
             // SECURE_STORAGE_UNAVAILABLE) so the web layer takes the re-pair path.
-            Log.e(TAG, "Failed to get secure value — clearing corrupt entry (F56)", e);
-            try {
-                securePrefs.edit().remove(key).commit();
-            } catch (Exception clearEx) {
-                Log.e(TAG, "Failed to clear corrupt secure entry", clearEx);
+            //
+            // N1: but ONLY for a genuinely unrecoverable entry. This catch used to clear on
+            // ANY exception, i.e. destructive-by-default, and the damage landed before
+            // anything could retry: main.ts reads device_token TWICE on the boot path, first
+            // inside migrateCredentialsToSecureStorage() (whose catch only logs) and only
+            // then through the guarded read that budgets CRED_READ_MAX_RETRIES=3. So the
+            // migration read's exception deleted the credential, the guarded read then
+            // returned null instead of throwing, the retry budget was never spent, the
+            // 'secure_storage_read_failed' telemetry never fired, and a fielded screen fell
+            // through to "No credentials found" and displayed a pairing code. Preserving the
+            // entry is what makes that budget and that telemetry real.
+            //
+            // HONESTY: this is NOT protection against a "transient keystore fault in get()".
+            // Decompiling androidx.security-crypto:1.0.0 + tink-android:1.5.0 shows
+            // EncryptedSharedPreferences.getString() does no Android Keystore work at all —
+            // the master key is consumed once at create() above (~:80), and per-value crypto
+            // is Tink's pure-JCE AesGcmJce. A wedged keystore surfaces in ensureSecurePrefs()
+            // as SECURE_STORAGE_UNAVAILABLE, which is a DIFFERENT path that this change does
+            // not touch. The correct justification for preserving is narrower: the exception
+            // is not PROOF the stored value is dead (an IOException off the backing file, an
+            // OOM, a Tink state error), and a false positive destroys a working credential.
+            // The rejection itself is unchanged in both branches (same message, same absent
+            // code) — main.ts branches on SECURE_STORAGE_UNAVAILABLE only.
+            if (SecureStorageFailureClassifier.isUnrecoverableEntryCorruption(e)) {
+                Log.e(TAG, "Failed to get secure value — clearing corrupt entry (F56)", e);
+                try {
+                    securePrefs.edit().remove(key).commit();
+                } catch (Exception clearEx) {
+                    Log.e(TAG, "Failed to clear corrupt secure entry", clearEx);
+                }
+            } else {
+                Log.e(TAG, "Failed to get secure value — possibly transient, entry PRESERVED "
+                    + "so the JS read-retry budget is real (N1)", e);
             }
             call.reject("Failed to retrieve value: " + e.getMessage());
         }

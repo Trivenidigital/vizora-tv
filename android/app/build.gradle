@@ -3,6 +3,11 @@ apply plugin: 'com.android.application'
 android {
     namespace "com.vizora.display"
     compileSdk rootProject.ext.compileSdkVersion
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+        }
+    }
     buildFeatures {
         buildConfig = true
     }
@@ -86,6 +91,37 @@ repositories {
     }
 }
 
+// Robolectric normally downloads its android-all runtime jar itself, at TEST time, with its
+// own HTTP client (MavenArtifactFetcher). Resolve it through Gradle instead and run
+// Robolectric in offline mode against the resolved file. Two reasons: the test run becomes
+// hermetic (no network during `testDebugUnitTest`, so the suite is reproducible and CI does
+// not depend on Maven Central being reachable from the forked test JVM), and the fetcher's
+// client does not inherit the Gradle JVM's trust configuration, so on a workstation behind a
+// TLS-intercepting proxy its download fails while Gradle's own resolution succeeds.
+configurations {
+    robolectricAndroidAll
+}
+
+dependencies {
+    // Pinned to the android-all build that Robolectric 4.14.1 maps to the project's
+    // targetSdk (35) — see org.robolectric.plugins.DefaultSdkProvider. Bump this in
+    // lockstep with the robolectric version or with targetSdk.
+    robolectricAndroidAll "org.robolectric:android-all-instrumented:15-robolectric-12650502-i7"
+}
+
+def robolectricJarDir = layout.buildDirectory.dir("robolectric-android-all")
+
+tasks.register('collectRobolectricAndroidAll', Copy) {
+    from configurations.robolectricAndroidAll
+    into robolectricJarDir
+}
+
+tasks.withType(Test).configureEach {
+    dependsOn 'collectRobolectricAndroidAll'
+    systemProperty 'robolectric.offline', 'true'
+    systemProperty 'robolectric.dependency.dir', robolectricJarDir.get().asFile.absolutePath
+}
+
 dependencies {
     implementation fileTree(include: ['*.jar'], dir: 'libs')
     implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
@@ -95,6 +131,7 @@ dependencies {
     implementation "androidx.security:security-crypto:1.0.0"
     implementation project(':capacitor-android')
     testImplementation "junit:junit:$junitVersion"
+    testImplementation "org.robolectric:robolectric:4.14.1"
     androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
     androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
     implementation project(':capacitor-cordova-android-plugins')

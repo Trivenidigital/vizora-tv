@@ -34,7 +34,7 @@ import {
   platformIdentifierPrefix,
 } from './platform';
 import { SecureStorage } from './secure-storage';
-import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature, shouldApplyContent } from './utils';
+import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature, shouldApplyContent, parseCrashLoopMarker, CRASH_LOOP_MARKER_KEY } from './utils';
 import { ScreenStateMachine } from './screen-state';
 import { initCrashReporting, setCrashReportingDevice, reportEvent } from './crash-reporting';
 
@@ -279,6 +279,11 @@ class VizoraAndroidTV {
 
     // Setup Capacitor plugins
     await this.setupCapacitor();
+
+    // Report (once) that the native crash handler degraded this device to its slow retry
+    // rung. Deliberately before the credential work: this is the one boot that got far
+    // enough to tell anyone, and a later step failing must not swallow the report.
+    await this.reportCrashLoopMarker();
 
     // Check for existing device token (from encrypted storage)
     await this.migrateCredentialsToSecureStorage();
@@ -648,6 +653,42 @@ class VizoraAndroidTV {
     const nextElement = elementsArray[currentIndex];
     if (nextElement instanceof HTMLElement) {
       nextElement.focus();
+    }
+  }
+
+  /**
+   * Surface the native crash-loop degradation marker, then clear it.
+   *
+   * The Android uncaught-exception handler escalates restarts 3s -> 30s -> 5min and then caps
+   * at one attempt per hour. Reaching that cap means the device has been crash-looping for
+   * minutes and is now barely restarting — an automated degradation the operator would
+   * otherwise never hear about, because the process that made the decision was dying and
+   * could not report anything itself (CLAUDE.md 12b). It writes a marker instead; this reads
+   * it on the next boot that works well enough to talk to the backend.
+   *
+   * Reported ONCE then removed: the marker describes a past episode, and re-reporting it on
+   * every boot forever would turn a real signal into noise. Non-Android runtimes never have
+   * it (nothing writes the key), so this is a single no-op read there.
+   *
+   * Never throws. Telemetry must not be able to break boot.
+   */
+  private async reportCrashLoopMarker() {
+    try {
+      const stored = await Preferences.get({ key: CRASH_LOOP_MARKER_KEY });
+      const marker = parseCrashLoopMarker(stored.value);
+      if (!marker) {
+        return;
+      }
+      console.warn('[Vizora] Recovered from a native crash loop — device had degraded to the '
+        + 'slow restart rung:', stored.value);
+      reportEvent('crash_loop_capped', {
+        at: marker.at,
+        crashes: marker.crashes,
+        reason: marker.reason,
+      });
+      await Preferences.remove({ key: CRASH_LOOP_MARKER_KEY });
+    } catch (err) {
+      console.warn('[Vizora] Failed to read/clear the crash-loop marker:', err);
     }
   }
 

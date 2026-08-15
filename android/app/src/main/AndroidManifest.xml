@@ -66,6 +66,17 @@
                 <action android:name="android.intent.action.QUICKBOOT_POWERON" />
                 <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
             </intent-filter>
+            <!-- N3: relaunch after our own app is updated (Play or sideload). The update
+                 kills the process and nothing restarts it, so the screen stays dark until a
+                 power-cycle. MY_PACKAGE_REPLACED is delivered only to the replaced app and
+                 carries no data scheme, hence its own filter (unlike PACKAGE_REPLACED).
+                 HONESTY: the background-activity-launch restriction applies here exactly as
+                 it does to BOOT_COMPLETED — on Android 12+ this may be a no-op. Landed
+                 because it cannot regress and it closes the hole on permissive/AOSP boxes;
+                 NOT because we have evidence it relaunches on a modern Google TV. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
         </receiver>
 
         <provider

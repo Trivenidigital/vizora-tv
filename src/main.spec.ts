@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature, shouldApplyContent } from './utils';
+import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature, shouldApplyContent, parseCrashLoopMarker } from './utils';
 import { scrubUrl } from './crash-reporting';
 
 describe('scrubUrl (F51 — Sentry credential scrubbing)', () => {
@@ -269,5 +269,47 @@ describe('shouldApplyContent — T2 client version-wins (increment 5 acceptance)
     expect(shouldApplyContent(V('pl-1', 'v2'), cur)).toBe(false); // equal → no-op
     expect(shouldApplyContent(V('pl-1', 'v3'), cur)).toBe(true); // newer → apply
     expect(shouldApplyContent(V('pl-1', 'v1'), cur)).toBe(false); // older → ignore
+  });
+});
+
+describe('parseCrashLoopMarker (native crash-loop degradation marker)', () => {
+  it('parses the exact wire format the native handler writes', () => {
+    // "<wallClockMs>:<crashesInWindow>:<reason>" — see
+    // CrashRecoveryHandler.writeCappedMarker().
+    expect(parseCrashLoopMarker('1700000000000:4:uncaught_exception')).toEqual({
+      at: 1700000000000,
+      crashes: 4,
+      reason: 'uncaught_exception',
+    });
+  });
+
+  it('parses the renderer-loop reason tag', () => {
+    expect(parseCrashLoopMarker('1700000000000:5:renderer_loop')?.reason).toBe('renderer_loop');
+  });
+
+  it('returns null when there is nothing to report', () => {
+    expect(parseCrashLoopMarker(null)).toBeNull();
+    expect(parseCrashLoopMarker(undefined)).toBeNull();
+    expect(parseCrashLoopMarker('')).toBeNull();
+  });
+
+  it('still reports the episode when the marker is truncated', () => {
+    // Written by a dying process, so a partial value is plausible. Losing the whole signal
+    // to a strict parse would reintroduce exactly the silence the marker exists to remove.
+    expect(parseCrashLoopMarker('1700000000000')).toEqual({
+      at: 1700000000000,
+      crashes: null,
+      reason: null,
+    });
+    expect(parseCrashLoopMarker('1700000000000:4')).toEqual({
+      at: 1700000000000,
+      crashes: 4,
+      reason: null,
+    });
+  });
+
+  it('does not throw or invent numbers for a garbled marker', () => {
+    expect(parseCrashLoopMarker('garbage')).toEqual({ at: null, crashes: null, reason: null });
+    expect(parseCrashLoopMarker('::')).toEqual({ at: null, crashes: null, reason: null });
   });
 });
