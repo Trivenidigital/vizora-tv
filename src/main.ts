@@ -161,6 +161,26 @@ interface HeartbeatResponse {
   reconcileContent?: boolean;
 }
 
+/**
+ * Capabilities advertised to the realtime gateway in the Socket.IO handshake.
+ *
+ * `deliveryAck` is the switch that takes the server OFF its legacy delivery path.
+ * Without it the gateway does a bare `socket.emit()` and reports back
+ * `{ delivered: true, legacy: true }` — so a payload written into a half-open
+ * socket (TCP dead, the server has not noticed yet, up to ~45s) is lost while the
+ * operator's dashboard says it was delivered and writes an audit row saying so.
+ *
+ * For `command` that loss is permanent: commands are not re-derivable from DB state
+ * the way content is. For `playlist:update` the server additionally DELETES the
+ * pending-replay entry on the strength of that false receipt.
+ *
+ * Advertised ALWAYS — see handshakeAuth() for why "sometimes" is worse than never.
+ */
+const CLIENT_CAPABILITIES: readonly string[] = ['deliveryAck'];
+
+/** The callback the server attaches to a delivery-guaranteed emit. May be absent. */
+type DeliveryAck = ((response: { ok: boolean }) => void) | undefined;
+
 interface PerformanceMemory {
   usedJSHeapSize: number;
   jsHeapSizeLimit: number;
@@ -231,6 +251,12 @@ class VizoraAndroidTV {
   // Pairing retry state
   private pairingRetryCount = 0;
 
+  // Delivery-ack duplicate suppression for `command` (see commandDedupeKey /
+  // handleCommand). PERSISTED — the whole point is surviving a reload.
+  private static readonly COMMAND_DEDUPE_PREF_KEY = 'seen_command_keys';
+  private static readonly COMMAND_DEDUPE_MAX = 20;
+  private seenCommandKeys: string[] = [];
+
   private dpadHandler: ((event: KeyboardEvent) => void) | null = null;
 
   constructor() {
@@ -276,6 +302,12 @@ class VizoraAndroidTV {
 
     // Load configuration
     await this.loadConfig();
+
+    // Restore the command dedupe ring BEFORE anything can deliver a command. This
+    // is the guard against the reload→replay→reload loop described on
+    // loadSeenCommands(); loading it late would leave a window in which the very
+    // replay it exists to absorb arrives against an empty ring.
+    await this.loadSeenCommands();
 
     // Setup Capacitor plugins
     await this.setupCapacitor();
@@ -1127,6 +1159,20 @@ class VizoraAndroidTV {
       };
 
       this.socket.emit('heartbeat', heartbeatData, (response: HeartbeatResponse) => {
+        // An ERROR ack (createErrorResponse: { success:false, error, timestamp } — no
+        // `data`) used to fall through the unwrap below to the top level, where every
+        // field it reads is undefined. The result was indistinguishable from a clean
+        // beat: a rate-limited or failed heartbeat produced no signal at all, so a
+        // device could beat into a wall indefinitely with nobody the wiser. Surface it.
+        //
+        // Deliberately no retry and no backoff here — the 15s cadence is unchanged and
+        // the next beat is the retry. The defect being fixed is the SILENCE.
+        const failed = response as unknown as { success?: unknown; error?: unknown } | undefined;
+        if (failed?.success === false) {
+          console.warn('[Vizora] Heartbeat rejected by server:', failed.error);
+          reportEvent('heartbeat_ack_error', { error: String(failed.error ?? 'unspecified') });
+          return; // a failure envelope carries no data to act on
+        }
         // The server wraps the ack payload in `.data` (createSuccessResponse), so read
         // from there; fall back to the top level so this is robust either way (a legacy
         // unwrapped ack still works). Read revoked/commands/reconcileContent all from the
@@ -1192,7 +1238,16 @@ class VizoraAndroidTV {
 
     this.deviceToken = token;
     if (this.socket) {
-      (this.socket.auth as Record<string, unknown>) = { token };
+      // MERGE, never replace. A wholesale `= { token }` silently drops
+      // `capabilities`, so the device would revert to the server's legacy delivery
+      // path on its next reconnect — with no signal anywhere that it had — and a
+      // command lost on a half-open socket would be gone permanently while the
+      // dashboard reported it delivered. The spread keeps anything else Socket.IO
+      // or a future field put there; handshakeAuth() re-asserts what must be true.
+      (this.socket.auth as Record<string, unknown>) = {
+        ...(this.socket.auth as Record<string, unknown> | undefined),
+        ...VizoraAndroidTV.handshakeAuth(token),
+      };
     }
     console.log('[Vizora] Device token rotated by server and persisted');
     reportEvent('device_token_rotated', { hasSocket: Boolean(this.socket) });
@@ -1260,6 +1315,25 @@ class VizoraAndroidTV {
 
   // ==================== REALTIME CONNECTION ====================
 
+  /**
+   * The Socket.IO handshake `auth` payload — the ONE place it is constructed, so a
+   * connect and a token rotation cannot drift apart on what this device claims to
+   * support.
+   *
+   * `capabilities` is read by the gateway off the handshake. Advertise it ALWAYS or
+   * never, never conditionally between reconnects: a device that goes legacy for a
+   * single reconnect has a window in which a command pushed into a half-open socket
+   * is lost permanently while the dashboard reports it delivered — and nothing on
+   * either side records that the window existed. The array form is used because the
+   * server accepts either an array containing the string or an object with
+   * `deliveryAck === true`, and the array is the one it treats as canonical.
+   */
+  private static handshakeAuth(token: string | null): Record<string, unknown> {
+    // Fresh array per call: the handshake object is handed to a third-party client
+    // that may hold it, and a shared module-level array is a mutation hazard.
+    return { token, capabilities: [...CLIENT_CAPABILITIES] };
+  }
+
   private connectToRealtime() {
     if (!this.deviceToken) {
       console.error('[Vizora] No device token available');
@@ -1292,9 +1366,7 @@ class VizoraAndroidTV {
     }
 
     this.socket = io(this.config.realtimeUrl, {
-      auth: {
-        token: this.deviceToken,
-      },
+      auth: VizoraAndroidTV.handshakeAuth(this.deviceToken),
       transports: ['websocket', 'polling'],
       reconnection: true,
       reconnectionAttempts: Infinity,
@@ -1431,7 +1503,15 @@ class VizoraAndroidTV {
       }
     });
 
-    this.socket.on('playlist:update', (data) => {
+    this.socket.on('playlist:update', (data, ack?: DeliveryAck) => {
+      // DELIVERY receipt, sent FIRST and unconditionally — see the ACK SEMANTICS
+      // block above handleCommand. Never a nack, specifically including the
+      // malformed and apply-failure paths below: content is re-derivable (the
+      // connect-time resolver push and the T2 heartbeat reconcile both re-deliver
+      // it), so a nack buys nothing — it can only replay the SAME payload that just
+      // failed, while consuming the backoff counter that this device's command
+      // delivery shares. `ack` is absent for the connect-time sendInitialState emit.
+      VizoraAndroidTV.ackDelivery(ack);
       console.log('[Vizora] Received playlist update:', data);
       const playlist = this.validatePlaylist(data?.playlist);
       if (!playlist) {
@@ -1458,9 +1538,23 @@ class VizoraAndroidTV {
       }
     });
 
-    this.socket.on('command', (command) => {
+    this.socket.on('command', (command, ack?: DeliveryAck) => {
+      // ACK BEFORE DISPATCH — not a style choice. `reload`, `restart` and
+      // `clear_cache` call window.location.reload() synchronously inside
+      // handleCommand; an ack sent afterwards would never leave the device, the
+      // server would time out at 10s and requeue, and the device would reload →
+      // reconnect → replay → reload forever. See the ACK SEMANTICS block above
+      // handleCommand. Duplicate suppression lives inside handleCommand, AFTER this
+      // line, so a suppressed replay is still acked — otherwise the server just
+      // requeues the thing we deliberately ignored.
+      VizoraAndroidTV.ackDelivery(ack);
       console.log('[Vizora] Received command:', command);
-      this.handleCommand(command);
+      void this.handleCommand(command).catch((error) => {
+        // The receipt is already sent and stays sent: it reports delivery, not
+        // outcome. A failed command surfaces here, never through the ack.
+        console.error('[Vizora] Command handler failed:', error);
+        reportEvent('command_handler_failed', { type: (command as { type?: unknown })?.type ?? null });
+      });
     });
 
     this.socket.on('qr-overlay:update', (data) => {
@@ -2104,11 +2198,151 @@ class VizoraAndroidTV {
     await Promise.allSettled(tasks);
   }
 
+  // ==================== DELIVERY ACK (capability: deliveryAck) ====================
+  //
+  // ACK SEMANTICS — all four rules are derived from the realtime gateway's
+  // behaviour, not from taste. Breaking any one of them produces a fleet-wide
+  // storm the SERVER cannot stop, so they are stated once, here, and every ack
+  // site defers to this comment.
+  //
+  //  1. ALWAYS `{ ok: true }`. NEVER a negative ack, for any reason. The server has
+  //     no attempt counter, no dead-letter queue and no give-up for a nacked
+  //     payload. Its only circuit breaker (5 failures) is per-device/per-process,
+  //     is RESET by any clean replay round, and is BYPASSED entirely by the
+  //     connect-time replay path — which also refreshes the Redis TTL. So a nack on
+  //     a failure class that also restarts this client (a bad payload that crashes
+  //     the renderer, an OOM reload) is a self-sustaining loop with no terminator.
+  //     Worse, playlist and command replay share ONE backoff counter, so nacking
+  //     playlists would throttle and eventually SUPPRESS this device's own command
+  //     delivery. Apply failures go out through reportEvent / content:error — the
+  //     channels that exist for them — never through the ack.
+  //
+  //  2. It is a DELIVERY receipt, not an APPLY receipt. Nothing server-side reads
+  //     an "applied" status. Ack on receipt after cheap validation; never couple it
+  //     to the outcome of the work.
+  //
+  //  3. Ack BEFORE any dispatch that can destroy the JS context. `reload`,
+  //     `restart` and `clear_cache` call window.location.reload() synchronously. An
+  //     ack sent after that would never leave the device: the server times out at
+  //     10s, requeues, and the device reloads → reconnects → replays → reloads,
+  //     forever.
+  //
+  //  4. EXACTLY ONCE on every path, including a throwing handler. A missed callback
+  //     is a 10s server-side stall plus a requeue, and leaks an entry in the
+  //     server's ack map for the socket's lifetime.
+  //
+  // The callback may also be ABSENT: the connect-time playlist:update
+  // (sendInitialState) and the config / qr-overlay:update emits are not
+  // ack-wrapped, so every call site goes through this helper rather than invoking
+  // `ack` directly.
+
+  /** Answer a delivery-guaranteed emit. Positive, once, and never throws. */
+  private static ackDelivery(ack: unknown): void {
+    if (typeof ack !== 'function') return; // legacy / unacked emit — rule above
+    try {
+      (ack as (response: { ok: boolean }) => void)({ ok: true });
+    } catch (error) {
+      // A throwing callback must not take the handler down with it, and must not
+      // tempt a retry: from the server's side the ack either arrived or it did not.
+      console.warn('[Vizora] delivery ack callback threw:', error);
+    }
+  }
+
   // ==================== COMMANDS ====================
 
+  /**
+   * Idempotency key for a delivered command: `(type, timestamp)`.
+   *
+   * NOT `commandId`. That exists only on fleet-originated commands — the
+   * POST /api/push/content path constructs `{ type, payload }` with no id at all,
+   * and the realtime DeviceCommand type does not declare one. `timestamp` is
+   * stamped ONCE server-side and the identical object is requeued verbatim, so it
+   * is stable across every replay and every reconnect, which is exactly the
+   * property a dedupe key needs.
+   *
+   * Returns null when the command carries no timestamp: an unkeyable command is
+   * EXECUTED (never suppressed on a guess) — and, as always, still acked.
+   */
+  private static commandDedupeKey(command: { type?: unknown; timestamp?: unknown }): string | null {
+    const type = command?.type;
+    const timestamp = command?.timestamp;
+    if (typeof type !== 'string' || !type) return null;
+    if (typeof timestamp !== 'string' && typeof timestamp !== 'number') return null;
+    return `${type}@${timestamp}`;
+  }
+
+  /**
+   * Restore the persisted dedupe ring.
+   *
+   * This is the infinite-reload guard, and it only works because it is on DISK.
+   * The sequence it defends against: we ack a `reload`, the device reloads, the ack
+   * is lost in flight because the socket died mid-reload, the server times out and
+   * requeues, and on reconnect the IDENTICAL (reload, timestamp) arrives again.
+   * In memory alone the ring is empty at that point and the device reloads forever.
+   *
+   * Fails OPEN: an unreadable ring suppresses nothing, which costs at most one
+   * duplicate execution — strictly better than refusing to boot.
+   */
+  private async loadSeenCommands(): Promise<void> {
+    try {
+      const stored = await Preferences.get({ key: VizoraAndroidTV.COMMAND_DEDUPE_PREF_KEY });
+      if (!stored.value) return;
+      const parsed: unknown = JSON.parse(stored.value);
+      if (!Array.isArray(parsed)) return;
+      this.seenCommandKeys = parsed
+        .filter((k): k is string => typeof k === 'string')
+        .slice(-VizoraAndroidTV.COMMAND_DEDUPE_MAX);
+    } catch (error) {
+      console.warn('[Vizora] Could not restore command dedupe ring — duplicates may re-execute:', error);
+    }
+  }
+
+  /**
+   * Record a key in the bounded ring and persist it, BEFORE the command is
+   * dispatched. Awaited on purpose: a `reload` dispatched first would race the
+   * write and could tear the context down before it landed — which is precisely
+   * the state the ring exists to prevent. A failed write is not fatal (the
+   * in-memory entry still covers a same-session replay) and never blocks the
+   * operator's command.
+   */
+  private async rememberCommand(key: string): Promise<void> {
+    this.seenCommandKeys.push(key);
+    if (this.seenCommandKeys.length > VizoraAndroidTV.COMMAND_DEDUPE_MAX) {
+      this.seenCommandKeys = this.seenCommandKeys.slice(-VizoraAndroidTV.COMMAND_DEDUPE_MAX);
+    }
+    try {
+      await Preferences.set({
+        key: VizoraAndroidTV.COMMAND_DEDUPE_PREF_KEY,
+        value: JSON.stringify(this.seenCommandKeys),
+      });
+    } catch (error) {
+      console.warn('[Vizora] Could not persist command dedupe ring:', error);
+    }
+  }
+
   private async handleCommand(command: { type: string; payload?: Record<string, unknown>; [key: string]: unknown }) {
+    // Duplicate suppression sits here, at the single choke point both delivery
+    // paths funnel through (the `command` socket event and the heartbeat ack's
+    // commands array), so a replay cannot slip in via the other door. The ack is
+    // already sent by the caller — a suppressed duplicate is still acked, or the
+    // server would just requeue it (rule 1).
+    const dedupeKey = VizoraAndroidTV.commandDedupeKey(command);
+    if (dedupeKey !== null) {
+      if (this.seenCommandKeys.includes(dedupeKey)) {
+        console.log(`[Vizora] Duplicate command suppressed: ${dedupeKey}`);
+        reportEvent('command_duplicate_suppressed', { type: command.type });
+        return;
+      }
+      await this.rememberCommand(dedupeKey);
+    }
+
     switch (command.type) {
       case 'reload':
+      // An app restart for a WebView client IS a reload — there is no separate
+      // process to bounce, so `restart` shares the path rather than getting a
+      // parallel implementation or a fake one. Until now it fell to `default:`
+      // and warned while the dashboard reported it delivered.
+      case 'restart':
         window.location.reload();
         break;
 
@@ -2175,6 +2409,36 @@ class VizoraAndroidTV {
 
       case 'qr-overlay-update':
         this.renderQrOverlay(command.payload?.config as QrOverlayConfig | undefined);
+        break;
+
+      case 'clear_override':
+        // An operator cancelling an emergency push. Until now this fell to
+        // `default:` and warned, so the pushed content stayed on the glass for the
+        // rest of its timer — up to 240 minutes — while the dashboard reported the
+        // cancel delivered. Reuses the push-expiry resume path rather than a
+        // parallel one, so there is exactly one definition of "what comes back".
+        if (this.temporaryContent) {
+          console.log('[Vizora] clear_override — cancelling temporary content');
+          this.resumePlaylist();
+        } else {
+          // Deliberately a no-op with nothing on the glass to clear. resumePlaylist()
+          // with no push active would fall through to enterHolding() and BLANK a
+          // perfectly good playlist — a clear_override arriving late must not do that.
+          console.log('[Vizora] clear_override — no temporary content active, nothing to clear');
+        }
+        break;
+
+      // Genuinely not implementable in this client: a device reboot needs
+      // device-owner privileges, an app update is the store's job, and a screenshot
+      // needs native frame capture. They are ACKED anyway — rule 1 forbids nacking
+      // even a permanent failure, because the server would replay it forever — but
+      // reported, so the gap is visible to us instead of being silently absorbed.
+      // NOT stubbed with fake behaviour: pretending would be worse than the gap.
+      case 'reboot':
+      case 'update':
+      case 'screenshot':
+        console.warn(`[Vizora] Command not supported by this client: ${command.type}`);
+        reportEvent('command_unsupported', { type: command.type });
         break;
 
       default:
