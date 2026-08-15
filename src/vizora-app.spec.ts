@@ -2341,6 +2341,38 @@ describe('VizoraAndroidTV', () => {
       }
     });
 
+    it('a server-pushed position outside the known set cannot suppress the overlay', async () => {
+      // `position` is typed as a union but arrives unvalidated, and this is the
+      // overlay's only className write — a push of "hidden" applied the app's own
+      // hide rule and made the QR overlay silently disappear while every other
+      // observable said it was rendered.
+      await importFresh();
+      const ov = domElements.get('qr-overlay')!;
+      triggerSocketEvent('config', {
+        qrOverlay: { enabled: true, url: 'https://e.com', position: 'hidden', margin: 24 },
+      });
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(ov.className).toBe('bottom-right');   // fell back, not applied
+      expect(ov.style.bottom).toBe('24px');        // …and laid out to match
+      expect(ov.style.right).toBe('24px');
+    });
+
+    it('NEGATIVE CONTROL: a known position is still applied verbatim', async () => {
+      // Proves the fallback above is the allowlist rejecting an unknown value, not
+      // renderQrOverlay having stopped honouring position altogether.
+      await importFresh();
+      const ov = domElements.get('qr-overlay')!;
+      triggerSocketEvent('config', {
+        qrOverlay: { enabled: true, url: 'https://e.com', position: 'top-left', margin: 24 },
+      });
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(ov.className).toBe('top-left');
+      expect(ov.style.top).toBe('24px');
+      expect(ov.style.left).toBe('24px');
+    });
+
     it('applies size, margin, backgroundColor, opacity', async () => {
       await importFresh();
       const ov = domElements.get('qr-overlay')!;
@@ -4842,9 +4874,17 @@ describe('Client correctness & security residuals — siblings (B3–B7)', () =>
         ? { status: 200, data: { data: pairedPayload } }
         : { status: 404, data: {} };
 
-      await vi.advanceTimersByTimeAsync(2100);          // tick 1 parks inside the persist
-      for (let j = 0; j < 40; j++) await Promise.resolve();
-      await vi.advanceTimersByTimeAsync(6300);          // ticks 2-4 land on top of it
+      // Tick until the first commit is genuinely PARKED inside the persist. A single
+      // fixed advance was the arrange here, and it did not reliably reach the persist
+      // — roughly 2 runs in 7 the window under test was never entered and the assert
+      // below read 0 socket connects. Same robust loop-until-settled shape every
+      // other B6 test gets from pollToPaired; the assertions are unchanged.
+      for (let round = 0; round < 30 && firstCommit; round++) {
+        await vi.advanceTimersByTimeAsync(2100);
+        for (let j = 0; j < 40; j++) await Promise.resolve();
+      }
+      expect(firstCommit).toBe(false);                  // the arrange really did park
+      await vi.advanceTimersByTimeAsync(6300);          // further ticks land on top of it
       for (let j = 0; j < 40; j++) await Promise.resolve();
       release();
       for (let j = 0; j < 60; j++) await Promise.resolve();

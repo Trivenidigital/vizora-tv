@@ -193,6 +193,143 @@ describe('tenant binding at init', () => {
   });
 });
 
+describe('tenant change racing an in-flight init', () => {
+  /** Seed a tenant-a cache with one entry. */
+  function seedTenantA() {
+    store.meta = { tenantId: 'tenant-a' };
+    store.entries.set('c1', {
+      contentId: 'c1', blob: new Blob(['zzzz']), size: 4, mimeType: 'image/jpeg',
+      lastAccessed: Date.now(), downloadedAt: Date.now(),
+    });
+  }
+
+  /** Park doInit inside listEntries — i.e. AFTER the tenant comparison, BEFORE the
+   *  `initialized = true` that concludes it. */
+  function gateListEntries() {
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const inCall = new Promise<void>(r => { entered = r; });
+    const original = store.listEntries.bind(store);
+    store.listEntries = async () => { entered(); await gate; return original(); };
+    return { entered: inCall, release, restore: () => { store.listEntries = original; } };
+  }
+
+  it('a tenant change landing INSIDE an in-flight init is not swallowed', async () => {
+    // setExpectedTenant re-arms the purge by clearing `initialized`, but doInit sets
+    // it back to true at the end regardless of whether the tenant moved under it. A
+    // change landing in this window is silently absorbed and the purge NEVER runs —
+    // so tenant-b is served tenant-a's blob for the life of the process.
+    seedTenantA();
+    const m = manager();
+    m.setExpectedTenant('tenant-a');
+
+    const { entered, release, restore } = gateListEntries();
+    const pending = m.init();
+    await entered;
+    m.setExpectedTenant('tenant-b');   // lands past the tenant comparison
+    release();
+    await pending;
+    restore();
+
+    expect(await m.getCachedUri('c1')).toBeNull();
+    expect(store.entries.size).toBe(0);
+    expect(store.meta).toBeNull();
+  });
+
+  it('NEGATIVE CONTROL: the same gated init keeps the cache when the tenant does not move', async () => {
+    // Same gate, same parking point, tenant untouched. Proves the purge above comes
+    // from the tenant change and not from the gate defeating init.
+    seedTenantA();
+    const m = manager();
+    m.setExpectedTenant('tenant-a');
+
+    const { entered, release, restore } = gateListEntries();
+    const pending = m.init();
+    await entered;
+    release();
+    await pending;
+    restore();
+
+    expect(await m.getCachedUri('c1')).toBe('blob:mock-1');
+    expect(store.entries.size).toBe(1);
+    expect(store.meta).toEqual({ tenantId: 'tenant-a' });
+  });
+});
+
+describe('init tenant purge goes through clearCache', () => {
+  // doInit called this.store.clearAll() directly rather than this.clearCache(), so
+  // the init purge skipped BOTH of clearCache's other jobs: revoking live object
+  // URLs and bumping clearGeneration. AndroidCacheManager.doInit already calls
+  // clearCache, and with setExpectedTenant re-arming init this branch is reachable
+  // mid-session, with live URLs and in-flight downloads in play.
+
+  function seedTenantA(id = 'c1') {
+    store.meta = { tenantId: 'tenant-a' };
+    store.entries.set(id, {
+      contentId: id, blob: new Blob(['zzzz']), size: 4, mimeType: 'image/jpeg',
+      lastAccessed: Date.now(), downloadedAt: Date.now(),
+    });
+  }
+
+  it('revokes object URLs already minted for the purged tenant', async () => {
+    seedTenantA();
+    const m = manager();
+    m.setExpectedTenant('tenant-a');
+    await m.init();
+    expect(await m.getCachedUri('c1')).toBe('blob:mock-1'); // live URL on the glass
+
+    // Re-arm, then let the purge be triggered by the NEW tenant asking for its own
+    // content — which is what actually happens next on a re-paired device. Asking
+    // for 'c1' again would revoke it via getCachedUri's own missing-entry path and
+    // tell us nothing about whether the purge did it.
+    m.setExpectedTenant('tenant-b');
+    expect(await m.getCachedUri('tenant-b-item')).toBeNull();
+
+    // tenant-a's image is still on the glass with this URL as its src. The purge has
+    // to kill it, not merely decline to re-issue it.
+    expect(revoked).toContain('blob:mock-1');
+  });
+
+  it('blocks an in-flight download from writing the purged tenant back', async () => {
+    seedTenantA('old');
+    const m = manager();
+    m.setExpectedTenant('tenant-a');
+    await m.init();
+
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    const inFetch = new Promise<void>(r => { entered = r; });
+    vi.stubGlobal('fetch', vi.fn(async () => { entered(); await gate; return makeFetchResponse(4); }));
+
+    const pending = m.downloadContent('c1', 'https://cdn/x.jpg', 'image/jpeg');
+    await inFetch;                             // download is in flight under tenant-a
+
+    m.setExpectedTenant('tenant-b');
+    await m.init();                            // doInit purges tenant-a's cache
+    release();
+
+    expect(await pending).toBeNull();
+    expect(store.entries.has('c1')).toBe(false);
+    expect(store.entries.size).toBe(0);
+    expect(store.meta).toBeNull();
+  });
+
+  it('NEGATIVE CONTROL: a same-tenant init purges nothing and revokes nothing', async () => {
+    seedTenantA();
+    const m = manager();
+    m.setExpectedTenant('tenant-a');
+    await m.init();
+    expect(await m.getCachedUri('c1')).toBe('blob:mock-1');
+
+    m.setExpectedTenant('tenant-a'); // no-op
+    expect(await m.getCachedUri('c1')).toBe('blob:mock-1');
+    expect(revoked).toEqual([]);
+    expect(store.entries.size).toBe(1);
+  });
+});
+
 describe('LRU eviction', () => {
   it('evicts oldest-accessed entries beyond the max size', async () => {
     const m = manager(10); // 10-byte budget, 4-byte blobs

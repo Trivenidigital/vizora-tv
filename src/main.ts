@@ -2265,6 +2265,11 @@ class VizoraAndroidTV {
 
   // ==================== QR OVERLAY ====================
 
+  /** The only class names the server is allowed to put on the overlay element. */
+  private static readonly QR_POSITIONS: readonly string[] = [
+    'top-left', 'top-right', 'bottom-left', 'bottom-right',
+  ];
+
   private async renderQrOverlay(config: QrOverlayConfig | undefined) {
     const overlay = document.getElementById('qr-overlay');
     if (!overlay) return;
@@ -2275,7 +2280,14 @@ class VizoraAndroidTV {
       return;
     }
     overlay.innerHTML = '';
-    overlay.className = config.position || 'bottom-right';
+    // `position` is typed as a union but arrives from the server unvalidated, and this
+    // is the overlay's ONLY className write — a push of `"hidden"` would apply the
+    // app's hide rule and suppress the QR overlay entirely (and any other class name
+    // in the stylesheet is equally assignable). Validate against the known values.
+    const position = VizoraAndroidTV.QR_POSITIONS.includes(config.position as string)
+      ? (config.position as 'top-left' | 'top-right' | 'bottom-left' | 'bottom-right')
+      : 'bottom-right';
+    overlay.className = position;
     overlay.style.backgroundColor = config.backgroundColor || '#ffffff';
     overlay.style.opacity = String(config.opacity ?? 1);
 
@@ -2288,9 +2300,9 @@ class VizoraAndroidTV {
     overlay.style.left = 'auto';
     overlay.style.right = 'auto';
 
-    if (config.position === 'top-left') { overlay.style.top = margin + 'px'; overlay.style.left = margin + 'px'; }
-    else if (config.position === 'top-right') { overlay.style.top = margin + 'px'; overlay.style.right = margin + 'px'; }
-    else if (config.position === 'bottom-left') { overlay.style.bottom = margin + 'px'; overlay.style.left = margin + 'px'; }
+    if (position === 'top-left') { overlay.style.top = margin + 'px'; overlay.style.left = margin + 'px'; }
+    else if (position === 'top-right') { overlay.style.top = margin + 'px'; overlay.style.right = margin + 'px'; }
+    else if (position === 'bottom-left') { overlay.style.bottom = margin + 'px'; overlay.style.left = margin + 'px'; }
     else { overlay.style.bottom = margin + 'px'; overlay.style.right = margin + 'px'; }
 
     // `size` is declared `number` but arrives from the server unvalidated, and it is

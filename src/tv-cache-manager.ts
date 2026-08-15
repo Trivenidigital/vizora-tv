@@ -187,6 +187,13 @@ export class TvCacheManager {
    * into a cleared, unstamped store.
    */
   private clearGeneration = 0;
+  /**
+   * Bumped by setExpectedTenant. doInit captures it on entry and refuses to declare
+   * itself initialized if it moved underneath — otherwise a tenant change landing
+   * inside an in-flight init is absorbed by that init's final `initialized = true`
+   * and the mismatch purge never runs at all. Same counter in AndroidCacheManager.
+   */
+  private tenantGeneration = 0;
 
   // Default is lower than AndroidCacheManager's 500 MB: real TV IndexedDB
   // quotas are typically well under that, and it's better for the LRU
@@ -200,6 +207,7 @@ export class TvCacheManager {
   setExpectedTenant(tenantId: string | null): void {
     if (tenantId === this.expectedTenant) return; // no-op call must not re-run doInit
     this.expectedTenant = tenantId;
+    this.tenantGeneration++;
     // Re-arm the tenant-mismatch purge. It lives inside doInit(), which init()
     // early-returns past once initialized, so re-pairing to a DIFFERENT tenant in the
     // same process left the previous tenant's blobs in IndexedDB and servable. That
@@ -224,15 +232,28 @@ export class TvCacheManager {
       return;
     }
 
+    // Snapshot the tenant this init is running FOR — see tenantGeneration. Anything
+    // that lands after a checkpoint leaves init incomplete so the next call retries it.
+    const tenantGen = this.tenantGeneration;
+
     try {
       const meta = await this.store.getMeta();
       if (meta?.tenantId && this.expectedTenant && meta.tenantId !== this.expectedTenant) {
         console.warn('[TvCache] Cache belongs to a different tenant — clearing');
-        await this.store.clearAll();
+        // clearCache(), not store.clearAll(): the direct store call skipped the
+        // clearGeneration bump (so in-flight downloads could write the purged tenant's
+        // blobs straight back) and skipped revoking live object URLs (so already-minted
+        // blob: URLs for the purged tenant's content stayed resolvable). With
+        // setExpectedTenant re-arming init, this branch is now reachable mid-session
+        // with both of those in play. AndroidCacheManager.doInit already calls
+        // clearCache. A rejection here falls into the catch below, which leaves
+        // `initialized` false — reads return null and the purge is retried.
+        await this.clearCache();
       }
       const entries = await this.store.listEntries();
       this.statsItemCount = entries.length;
       this.statsTotalBytes = entries.reduce((sum, e) => sum + e.size, 0);
+      if (tenantGen !== this.tenantGeneration) return;
       this.initialized = true;
     } catch (err) {
       // NOT latched: a transient IndexedDB hiccup at boot must not disable
