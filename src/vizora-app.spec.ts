@@ -5801,4 +5801,68 @@ describe('deliveryAck — delivery-guaranteed emits (client capability)', () => 
     expect(urls.some(u => u.includes('/devices/auth/check'))).toBe(false);
     expect(window.location.reload).not.toHaveBeenCalled();
   });
+
+  // ======================================================================
+  // A7. The heartbeat ack's commands array is not a second-class delivery door
+  // ======================================================================
+  //
+  // There are TWO doors into handleCommand — the `command` socket event and the
+  // heartbeat ack's commands array — and they must not differ on what happens when
+  // the handler rejects. The socket door wraps it in .catch and reports it; this one
+  // was a bare `forEach(cmd => this.handleCommand(cmd))`, so the identical failure
+  // became an unhandled rejection with no telemetry, depending only on which door
+  // the command happened to arrive through.
+
+  it('A7: a throwing handler delivered through the HEARTBEAT ack is reported, not left floating', async () => {
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    await vi.advanceTimersByTimeAsync(200);
+
+    const { Preferences } = await import('@capacitor/preferences');
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    // update_config persists each accepted URL; a rejecting store makes handleCommand
+    // reject for real rather than simulating the rejection.
+    (Preferences.set as Mock).mockRejectedValue(new Error('simulated Preferences.set failure'));
+
+    const hb = currentMockSocket.emit.mock.calls.find((c: unknown[]) => c[0] === 'heartbeat');
+    (hb![2] as (r: unknown) => void)({
+      success: true,
+      data: {
+        commands: [{ type: 'update_config', apiUrl: 'https://cdn.vizora.io', timestamp: 'ts-a7' }],
+        nextHeartbeatIn: 15000,
+      },
+      timestamp: '2026-08-15T00:00:00.000Z',
+    });
+    await vi.advanceTimersByTimeAsync(50);
+
+    const events = await reportedEvents();
+    expect(events).toContain('command_handler_failed');
+    // Not the allowlist refusing the URL before the throwing line was reached.
+    expect(events).not.toContain('config_rejected');
+  });
+
+  // ======================================================================
+  // A8. The dedupe ring is pairing-bound state and dies with the pairing
+  // ======================================================================
+
+  it('A8: a confirmed revocation purges the PERSISTED command-dedupe ring', async () => {
+    await connectAndCommit(); // default handler: auth-check 404 → legacy carve-out
+    triggerSocketEvent('command', { type: 'clear_override', timestamp: 'ts-a8' });
+    await vi.advanceTimersByTimeAsync(50);
+    // Baseline: there is ring state on disk to purge.
+    expect(preferencesStore.get('seen_command_keys')).toContain('ts-a8');
+
+    triggerSocketEvent('command', { type: 'unpair', timestamp: 'ts-a8-unpair' });
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(200);
+
+    // Baseline for the purge itself, so this cannot pass because no purge ran.
+    expect(secureStorageStore.has('device_token')).toBe(false);
+    // The ring is delivery state for the pairing that just ended. Left behind, it can
+    // suppress a genuinely new command for whatever tenant is paired next, and it
+    // leaves the revoked tenant's command history readable on the device.
+    expect(preferencesStore.has('seen_command_keys')).toBe(false);
+  });
 });

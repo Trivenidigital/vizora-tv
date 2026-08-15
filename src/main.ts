@@ -1186,7 +1186,17 @@ class VizoraAndroidTV {
           void this.confirmRevocation('heartbeat_ack');
         }
         if (ack && ack.commands) {
-          ack.commands.forEach((cmd) => this.handleCommand(cmd));
+          // Same rejection handling as the `command` socket handler. Bare, this was a
+          // floating promise: handleCommand is async and can reject (a throwing
+          // update_config persist, a push that blows up), and the two delivery doors
+          // must not differ on what happens then — one surfaced it, the other made it
+          // an unhandled rejection with no telemetry.
+          ack.commands.forEach((cmd) => {
+            void this.handleCommand(cmd).catch((error) => {
+              console.error('[Vizora] Command handler failed:', error);
+              reportEvent('command_handler_failed', { type: (cmd as { type?: unknown })?.type ?? null });
+            });
+          });
         }
         // T2 heartbeat-reconcile: the server saw our contentVersion drift from the
         // authoritative version → re-pull (self-heal without a disconnect). Fails safe.
@@ -1798,6 +1808,10 @@ class VizoraAndroidTV {
     this.deviceToken = null;
     this.deviceId = null;
     this.tenantId = null;
+    // The dedupe ring is delivery state for THIS pairing. Left behind it outlives the
+    // de-pair in memory as well as on disk, and rememberCommand would write the old
+    // tenant's keys straight back out on the next command after re-pairing.
+    this.seenCommandKeys = [];
     // Unbind the cache too. Nulling only `this.tenantId` left the cache manager still
     // expecting the purged tenant, so its tenant-mismatch purge could not fire for
     // whatever is paired next.
@@ -1822,6 +1836,11 @@ class VizoraAndroidTV {
       SecureStorage.remove({ key: 'device_id' }),
       SecureStorage.remove({ key: 'tenant_id' }),
       Preferences.remove({ key: 'last_playlist' }),
+      // Command-dedupe state is bound to the pairing that produced it. Surviving a
+      // de-pair, it can suppress a genuinely new command for the NEXT tenant whose
+      // (type, timestamp) key happens to collide, and it leaves the revoked tenant's
+      // command history readable on the device.
+      Preferences.remove({ key: VizoraAndroidTV.COMMAND_DEDUPE_PREF_KEY }),
       this.cacheManager.clearCache(),
     ]);
 
@@ -2442,7 +2461,14 @@ class VizoraAndroidTV {
         break;
 
       default:
+        // A command type this build has never heard of. It is ACKED (rule 1 — the
+        // caller already sent the receipt) and then dropped, so without telemetry a
+        // NEW server-side command type rolled out ahead of the fleet is invisible:
+        // every dashboard says delivered, every device does nothing, and nothing
+        // anywhere records the version skew. `command_unsupported` is deliberately a
+        // different event — that one is a KNOWN type this client cannot implement.
         console.warn('[Vizora] Unknown command:', command.type);
+        reportEvent('command_unknown', { type: command.type ?? null });
     }
   }
 
