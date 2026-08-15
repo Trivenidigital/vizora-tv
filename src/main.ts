@@ -255,6 +255,23 @@ class VizoraAndroidTV {
   // handleCommand). PERSISTED — the whole point is surviving a reload.
   private static readonly COMMAND_DEDUPE_PREF_KEY = 'seen_command_keys';
   private static readonly COMMAND_DEDUPE_MAX = 20;
+  /**
+   * Ceiling on the ring write that gates a context-destroying dispatch. A wedged
+   * Capacitor bridge leaves Preferences.set pending forever — without a bound, the
+   * operator's `reload` simply never runs while the server (and the dashboard) hold
+   * an `{ ok: true }` receipt saying it did. Long enough that a healthy native
+   * round-trip is never cut short; short enough that a wedge does not become a
+   * silent no-op.
+   */
+  private static readonly COMMAND_DEDUPE_PERSIST_TIMEOUT_MS = 2000;
+  /**
+   * The commands that tear down the JS context (window.location.reload). These are
+   * the only ones a replay loop can be built from — a replayed `reboot` or
+   * `clear_override` costs one wasted execution, a replayed `reload` costs the
+   * device. Anything added here must be a command whose own dispatch can destroy
+   * the ring's chance to be read back.
+   */
+  private static readonly CONTEXT_DESTROYING_COMMANDS = new Set(['reload', 'restart', 'clear_cache']);
   private seenCommandKeys: string[] = [];
 
   private dpadHandler: ((event: KeyboardEvent) => void) | null = null;
@@ -1551,12 +1568,16 @@ class VizoraAndroidTV {
     this.socket.on('command', (command, ack?: DeliveryAck) => {
       // ACK BEFORE DISPATCH — not a style choice. `reload`, `restart` and
       // `clear_cache` call window.location.reload() synchronously inside
-      // handleCommand; an ack sent afterwards would never leave the device, the
-      // server would time out at 10s and requeue, and the device would reload →
-      // reconnect → replay → reload forever. See the ACK SEMANTICS block above
-      // handleCommand. Duplicate suppression lives inside handleCommand, AFTER this
-      // line, so a suppressed replay is still acked — otherwise the server just
-      // requeues the thing we deliberately ignored.
+      // handleCommand; an ack emitted after that call has no chance of leaving the
+      // device at all. Acking first is BEST-EFFORT, not a delivery guarantee: the
+      // frame can still be stranded in engine.io's writeBuffer (flush() bails while
+      // the transport is unwritable or upgrading) or aborted mid-XHR on the polling
+      // fallback, and the reload discards it either way. What terminates the
+      // resulting requeue → replay is the PERSISTED dedupe ring inside
+      // handleCommand — see rule 3 of the ACK SEMANTICS block above it before
+      // touching either half. Duplicate suppression lives inside handleCommand,
+      // AFTER this line, so a suppressed replay is still acked — otherwise the
+      // server just requeues the thing we deliberately ignored.
       VizoraAndroidTV.ackDelivery(ack);
       console.log('[Vizora] Received command:', command);
       void this.handleCommand(command).catch((error) => {
@@ -2241,10 +2262,24 @@ class VizoraAndroidTV {
   //     to the outcome of the work.
   //
   //  3. Ack BEFORE any dispatch that can destroy the JS context. `reload`,
-  //     `restart` and `clear_cache` call window.location.reload() synchronously. An
-  //     ack sent after that would never leave the device: the server times out at
-  //     10s, requeues, and the device reloads → reconnects → replays → reloads,
-  //     forever.
+  //     `restart` and `clear_cache` call window.location.reload() synchronously; an
+  //     ack emitted after that call has no chance at all of leaving the device.
+  //
+  //     Ordering is NECESSARY BUT NOT SUFFICIENT, and the difference matters — do
+  //     not read this rule as closing the loop on its own. On an established
+  //     WebSocket the emit does reach ws.send() synchronously, but engine.io-client's
+  //     flush() bails when `!transport.writable` or `this.upgrading`
+  //     (engine.io-client socket.js:342-346), leaving the frame sitting in
+  //     writeBuffer — which window.location.reload() then discards. On the polling
+  //     fallback the write is an XHR POST that the reload aborts. So acking first
+  //     BUYS a chance to flush; it does not guarantee delivery.
+  //
+  //     The thing that actually terminates the loop is the PERSISTED dedupe ring
+  //     (loadSeenCommands / rememberCommand): when the ack is lost, the server times
+  //     out at 10s and requeues, the device reconnects and the identical
+  //     (type, timestamp) arrives again — and the on-disk ring is what stops the
+  //     second execution. Deleting the ring on the strength of this ordering rule
+  //     would reintroduce reload → reconnect → replay → reload, forever.
   //
   //  4. EXACTLY ONCE on every path, including a throwing handler. A missed callback
   //     is a 10s server-side stall plus a requeue, and leaks an entry in the
@@ -2280,7 +2315,9 @@ class VizoraAndroidTV {
    * property a dedupe key needs.
    *
    * Returns null when the command carries no timestamp: an unkeyable command is
-   * EXECUTED (never suppressed on a guess) — and, as always, still acked.
+   * EXECUTED (never suppressed on a guess) — and, as always, still acked. That is a
+   * cross-repo invariant failing OPEN, so handleCommand reports it whenever the
+   * command is one that destroys the context; see the `else if` there.
    */
   private static commandDedupeKey(command: { type?: unknown; timestamp?: unknown }): string | null {
     const type = command?.type;
@@ -2301,6 +2338,12 @@ class VizoraAndroidTV {
    *
    * Fails OPEN: an unreadable ring suppresses nothing, which costs at most one
    * duplicate execution — strictly better than refusing to boot.
+   *
+   * But failing open here disarms the ONLY terminator a command-replay loop has, so
+   * it is reported, not merely logged. On Tizen/webOS the Preferences plugin falls
+   * through to its localStorage web implementation, where a storage fault takes out
+   * every read and every write at once — the exact state in which the loop runs and
+   * console output nobody is reading is the only trace.
    */
   private async loadSeenCommands(): Promise<void> {
     try {
@@ -2313,16 +2356,27 @@ class VizoraAndroidTV {
         .slice(-VizoraAndroidTV.COMMAND_DEDUPE_MAX);
     } catch (error) {
       console.warn('[Vizora] Could not restore command dedupe ring — duplicates may re-execute:', error);
+      // Distinct from the persist failure below: this one means the ring did not
+      // survive the restart, which is precisely the replay window it guards.
+      reportEvent('command_dedupe_ring_load_failed', { error: String(error) });
     }
   }
 
   /**
    * Record a key in the bounded ring and persist it, BEFORE the command is
-   * dispatched. Awaited on purpose: a `reload` dispatched first would race the
-   * write and could tear the context down before it landed — which is precisely
-   * the state the ring exists to prevent. A failed write is not fatal (the
+   * dispatched. Awaited by the caller on purpose: a `reload` dispatched first would
+   * race the write and could tear the context down before it landed — which is
+   * precisely the state the ring exists to prevent. A failed write is not fatal (the
    * in-memory entry still covers a same-session replay) and never blocks the
    * operator's command.
+   *
+   * Never rejects — the caller races this against a timeout and must be able to
+   * treat a settled promise as "the write is done trying".
+   *
+   * A failed write IS reported. It leaves the device with no on-disk terminator for
+   * the very next replay, and the one plausible cause (a QuotaExceededError from the
+   * localStorage web implementation on Tizen/webOS) fails EVERY subsequent write the
+   * same way — so the loop, once started, has nothing left to stop it.
    */
   private async rememberCommand(key: string): Promise<void> {
     this.seenCommandKeys.push(key);
@@ -2336,6 +2390,7 @@ class VizoraAndroidTV {
       });
     } catch (error) {
       console.warn('[Vizora] Could not persist command dedupe ring:', error);
+      reportEvent('command_dedupe_ring_persist_failed', { error: String(error) });
     }
   }
 
@@ -2352,7 +2407,36 @@ class VizoraAndroidTV {
         reportEvent('command_duplicate_suppressed', { type: command.type });
         return;
       }
-      await this.rememberCommand(dedupeKey);
+      // BOUNDED await. The await itself is required (see rememberCommand), but an
+      // UNBOUNDED one is its own failure: a wedged Capacitor bridge leaves the
+      // persist pending forever, and the operator's reload/restart/clear_cache then
+      // never runs at all — with `{ ok: true }` already sent, a dashboard row saying
+      // delivered, and no rejection to report, because the promise does not settle.
+      // On timeout we DISPATCH ANYWAY: losing the ring entry risks one duplicate
+      // execution, losing the command loses the operator's action outright.
+      const persist = await Promise.race([
+        this.rememberCommand(dedupeKey).then(() => 'persisted' as const),
+        this.timeoutAfter(VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS),
+      ]);
+      if (persist === 'timeout') {
+        console.warn(
+          `[Vizora] Dedupe ring persist did not settle in ${VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS}ms — dispatching ${command.type} unguarded`,
+        );
+        reportEvent('command_dedupe_persist_timeout', { type: command.type });
+      }
+    } else if (VizoraAndroidTV.CONTEXT_DESTROYING_COMMANDS.has(command.type)) {
+      // An unkeyable context-destroying command is the one shape this whole guard
+      // cannot cover: it executes (never suppressed on a guess) and records NOTHING,
+      // so a requeue after a lost ack replays it with no terminator at all. The
+      // scheme's safety rests on the gateway always stamping `timestamp` — one line
+      // in another repo, with no compiler between us. Failing open there is right;
+      // failing open SILENTLY is how it would first be discovered as a field loop.
+      console.warn(`[Vizora] ${command.type} arrived with no dedupe key — replay cannot be suppressed`);
+      reportEvent('command_dedupe_key_missing', { type: command.type });
+      // Give the ack frame the same task boundary the keyed path gets from its
+      // persist, so the tightest flush window does not land on exactly the case that
+      // also has no dedupe protection.
+      await this.timeoutAfter(0);
     }
 
     switch (command.type) {
