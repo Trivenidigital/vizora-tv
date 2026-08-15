@@ -3949,3 +3949,992 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
     });
   });
 });
+
+// ============================================================================
+// Client correctness & security residuals (S1–S6)
+// ============================================================================
+
+describe('Client correctness & security residuals (S1–S6)', () => {
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    resetCapacitorFakes();
+    resetDOM();
+    (window.location as { search: string }).search = '';
+    (window.location.reload as Mock).mockClear();
+    ioFactory.mockClear();
+    currentMockSocket = createMockSocket();
+    ioFactory.mockReturnValue(currentMockSocket);
+    mockCacheManager.getCachedUri.mockReset().mockResolvedValue(null);
+    mockCacheManager.downloadContent.mockReset().mockResolvedValue(null);
+    mockCacheManager.clearCache.mockReset().mockResolvedValue(undefined);
+    mockCacheManager.setExpectedTenant.mockClear();
+    qrToCanvasMock.mockReset().mockResolvedValue(undefined);
+    // Restore default SecureStorage behaviour — an earlier test may have overridden it.
+    const { SecureStorage } = await import('./secure-storage');
+    (SecureStorage.get as Mock).mockImplementation(async ({ key }: { key: string }) => ({
+      value: secureStorageStore.get(key) ?? null,
+    }));
+    (SecureStorage.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+      secureStorageStore.set(key, value);
+    });
+    (SecureStorage.remove as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      secureStorageStore.delete(key);
+    });
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    secureStorageStore.set('device_token', 'tok-123');
+    secureStorageStore.set('device_id', 'dev-123');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  const visibleScreens = () =>
+    ['loading-screen', 'pairing-screen', 'content-screen', 'holding-screen', 'error-screen']
+      .filter(id => {
+        const el = domElements.get(id);
+        return el && !el._classListSet.has('hidden');
+      });
+
+  const playlistPayload = {
+    playlist: { id: 'pl', name: 'PL', items: [{ id: 'it-1', contentId: 'c1', duration: 10, order: 0,
+      content: { id: 'c1', name: 'C', type: 'image', url: '/c1.jpg' } }], loopPlaylist: true },
+  };
+
+  const connectAndCommit = async () => {
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    triggerSocketEvent('playlist:update', playlistPayload);
+    await vi.advanceTimersByTimeAsync(1600);
+    expect(visibleScreens()).toEqual(['content-screen']);
+  };
+
+  const reportedEvents = async () => {
+    const { reportEvent } = await import('./crash-reporting');
+    return (reportEvent as Mock).mock.calls.map((c: unknown[]) => c[0]);
+  };
+
+  const revokedBackend = () => {
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
+      : { status: 200, data: { data: { status: 'pending' } } };
+  };
+
+  /** Fire device:revoked and let the confirm → purge → de-pair chain settle. */
+  const revokeAndSettle = async () => {
+    triggerSocketEvent('device:revoked', { reason: 'operator' });
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(200);
+  };
+
+  // -------- S1: purgeDeviceState is non-atomic --------
+  //
+  // The five removals ran as a sequential await chain, so the FIRST rejection
+  // skipped every removal after it and propagated out of purgeDeviceState. Every
+  // caller is `void this.confirmRevocation(...)`, so that rejection was unhandled:
+  // no telemetry, no retry, and — the part that reaches customer glass — the
+  // caller's startPairing() never ran. The revoked tenant's last frame stayed up,
+  // credentials intact, and a reboot resumed the revoked playlist.
+
+  it('S1: one failing SecureStorage.remove cannot skip the other removals', async () => {
+    revokedBackend();
+    await connectAndCommit();
+    expect(secureStorageStore.has('device_id')).toBe(true); // baseline: there is state to purge
+    expect(preferencesStore.has('last_playlist')).toBe(true);
+
+    const { SecureStorage } = await import('./secure-storage');
+    (SecureStorage.remove as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      // The real Java plugin rejects on failure and on SECURE_STORAGE_UNAVAILABLE.
+      if (key === 'device_token') throw new Error('SECURE_STORAGE_UNAVAILABLE');
+      secureStorageStore.delete(key);
+    });
+
+    await revokeAndSettle();
+
+    // The removals AFTER the failing one still ran — that is the whole fix.
+    expect(secureStorageStore.has('device_id')).toBe(false);
+    expect(secureStorageStore.has('tenant_id')).toBe(false);
+    expect(preferencesStore.has('last_playlist')).toBe(false);
+    expect(mockCacheManager.clearCache).toHaveBeenCalled();
+  });
+
+  it('S1: a failing removal still de-pairs the screen instead of freezing on the revoked frame', async () => {
+    revokedBackend();
+    await connectAndCommit();
+    const container = domElements.get('content-container')!;
+    const appendsBefore = (container.appendChild as Mock).mock.calls.length;
+
+    const { SecureStorage } = await import('./secure-storage');
+    (SecureStorage.remove as Mock).mockRejectedValue(new Error('SECURE_STORAGE_UNAVAILABLE'));
+
+    await revokeAndSettle();
+
+    expect(visibleScreens()).toEqual(['pairing-screen']);
+    // NEGATIVE: not one further frame of the revoked tenant's content.
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect((container.appendChild as Mock).mock.calls.length).toBe(appendsBefore);
+  });
+
+  it('S1: a residual purge failure is reported, not swallowed', async () => {
+    revokedBackend();
+    await connectAndCommit();
+    const { SecureStorage } = await import('./secure-storage');
+    (SecureStorage.remove as Mock).mockRejectedValue(new Error('SECURE_STORAGE_UNAVAILABLE'));
+
+    await revokeAndSettle();
+
+    expect(await reportedEvents()).toContain('device_purge_incomplete');
+  });
+
+  it('S1 NEGATIVE CONTROL: a clean purge reports no residual failure', async () => {
+    // Same layer, same entry point, storage healthy. Without this the telemetry
+    // assertion above would also pass against an event fired unconditionally.
+    revokedBackend();
+    await connectAndCommit();
+
+    await revokeAndSettle();
+
+    expect(secureStorageStore.has('device_token')).toBe(false);
+    expect(visibleScreens()).toEqual(['pairing-screen']);
+    expect(await reportedEvents()).not.toContain('device_purge_incomplete');
+  });
+
+  // -------- S2: update_config allowlist anchored to the COMPILED-IN defaults --------
+  //
+  // `private config = DEFAULT_CONFIG` was a reference, and loadConfig() mutates it
+  // from stored Preferences. So a single stored off-domain origin rewrote the very
+  // object isAllowedConfigUrl() measures candidates against: the attacker's
+  // registrable domain became part of the allowlist for every later update_config.
+
+  it('S2: a stored off-domain origin does NOT widen the update_config allowlist', async () => {
+    preferencesStore.set('config_api_url', 'https://attacker.example');
+    await importFresh();
+
+    triggerSocketEvent('command', { type: 'update_config', apiUrl: 'https://cdn.attacker.example' });
+    await vi.advanceTimersByTimeAsync(50);
+
+    // Rejected: the anchor is what the BUNDLE was compiled with, not where this
+    // device has since been pointed.
+    expect(preferencesStore.get('config_api_url')).toBe('https://attacker.example');
+    expect(window.location.reload).not.toHaveBeenCalled();
+    expect(await reportedEvents()).toContain('config_rejected');
+  });
+
+  it('S2 NEGATIVE CONTROL: the seeded origin really did reach the runtime config at boot', async () => {
+    // Without this, the test above would pass just as well if the Preferences seed
+    // never took effect — i.e. against a boot path that silently ignored it. It also
+    // pins the DOCUMENTED paired-device support path (CLAUDE.md): a stored origin is
+    // still applied at boot. Only the ALLOWLIST anchor is immune to it.
+    preferencesStore.set('config_api_url', 'https://attacker.example');
+    await importFresh();
+
+    const cfg = (console.log as Mock).mock.calls
+      .find((c: unknown[]) => String(c[0]).includes('Config loaded'))![1] as Record<string, string>;
+    expect(cfg.apiUrl).toBe('https://attacker.example');
+  });
+
+  it('S2 NEGATIVE CONTROL: the allowlist still accepts the compiled-in domain after the poisoning attempt', async () => {
+    // Proves the rejection above is the anchor holding, not update_config being
+    // globally broken by the seed.
+    preferencesStore.set('config_api_url', 'https://attacker.example');
+    await importFresh();
+
+    triggerSocketEvent('command', { type: 'update_config', apiUrl: 'https://cdn.vizora.io' });
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(preferencesStore.get('config_api_url')).toBe('https://cdn.vizora.io');
+  });
+
+  // -------- S3: the cache is unbound from a purged tenant --------
+
+  it('S3: a confirmed revocation unbinds the cache from the purged tenant', async () => {
+    secureStorageStore.set('tenant_id', 'tenant-A');
+    revokedBackend();
+    await connectAndCommit();
+    // Baseline: boot bound the cache to the live tenant, and nothing has unbound it.
+    expect(mockCacheManager.setExpectedTenant).toHaveBeenCalledWith('tenant-A');
+    expect(mockCacheManager.setExpectedTenant).not.toHaveBeenCalledWith(null);
+
+    await revokeAndSettle();
+
+    // Nulling only this.tenantId left the cache still expecting the purged tenant,
+    // so its tenant-mismatch purge could not fire for whatever is paired next.
+    expect(mockCacheManager.setExpectedTenant).toHaveBeenCalledWith(null);
+  });
+
+  // -------- S4: the webpage/url iframe cannot navigate the app away --------
+
+  const play = async (type: string, url: string) => {
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    triggerSocketEvent('playlist:update', {
+      playlist: { id: 'p1', name: 'T', items: [{ id: 'i1', contentId: 'c1', duration: 10, order: 0,
+        content: { id: 'c1', name: 'C', type, url } }], loopPlaylist: true },
+    });
+    await vi.advanceTimersByTimeAsync(50);
+  };
+
+  it('S4: the webpage iframe is sandboxed WITHOUT top-navigation', async () => {
+    // On the old Chromium these TVs ship, an un-sandboxed frame can run
+    // `top.location = '…'` with no user gesture and replace the app document:
+    // socket, heartbeat, state machine and the `reload` command all gone, with no
+    // onRenderProcessGone and nothing for the Java crash handler to see.
+    await play('webpage', 'https://example.com');
+    const iframes = findCreatedElements('iframe');
+    expect(iframes.length).toBeGreaterThan(0);
+    const iframe = iframes[iframes.length - 1];
+    const tokens = iframe.sandbox.add.mock.calls.flat();
+
+    expect(tokens).toContain('allow-scripts');
+    expect(tokens).toContain('allow-same-origin');
+    expect(tokens).not.toContain('allow-top-navigation');
+    expect(tokens).not.toContain('allow-top-navigation-by-user-activation');
+    expect(tokens).not.toContain('allow-top-navigation-to-custom-protocols');
+  });
+
+  it('S4: the url content type gets the same sandbox as webpage', async () => {
+    await play('url', 'https://example.com/page');
+    const iframes = findCreatedElements('iframe');
+    const iframe = iframes[iframes.length - 1];
+    const tokens = iframe.sandbox.add.mock.calls.flat();
+    expect(tokens).toContain('allow-scripts');
+    expect(tokens).not.toContain('allow-top-navigation');
+  });
+
+  it('S4 NEGATIVE CONTROL: the sandbox does not stop the page from being loaded', async () => {
+    // Same layer: proves the assertions above are not passing because the webpage
+    // branch stopped rendering altogether.
+    await play('webpage', 'https://example.com');
+    const iframes = findCreatedElements('iframe');
+    const iframe = iframes[iframes.length - 1];
+    expect(iframe.src).toContain('example.com');
+    expect(iframe.allow).toBe('autoplay; fullscreen');
+  });
+
+  // -------- S5: CSS injection via the QR overlay size --------
+
+  /**
+   * renderQrOverlay does `await import('qrcode')`, which does not settle under fake
+   * timers — mirror the real-timer dance the existing QR tests use.
+   */
+  const renderQrAndSettle = async (qrOverlay: Record<string, unknown>) => {
+    triggerSocketEvent('qr-overlay:update', { qrOverlay });
+    vi.useRealTimers();
+    await new Promise(r => setTimeout(r, 50));
+    const maxId = setTimeout(() => {}, 0) as unknown as number;
+    for (let i = 0; i <= maxId; i++) { clearInterval(i); clearTimeout(i); }
+    vi.useFakeTimers();
+  };
+
+  const lastQrWidth = () =>
+    (qrToCanvasMock.mock.calls[qrToCanvasMock.mock.calls.length - 1] as unknown as unknown[])[2] as
+      { width: unknown };
+
+  it('S5: a CSS-injecting size is coerced away instead of concatenated into cssText', async () => {
+    await importFresh();
+    await renderQrAndSettle({
+      enabled: true,
+      url: 'https://e.com',
+      label: 'Scan me!',
+      // `size` is declared `number` but arrives from the server unvalidated.
+      size: '1px;background:url(https://evil.example/beacon)',
+    });
+
+    const ov = domElements.get('qr-overlay')!;
+    const label = ov.children.find((c: ElementStub) => c.textContent === 'Scan me!');
+    expect(label).toBeDefined();
+    expect(label!.style.cssText).not.toContain('evil.example');
+    expect(label!.style.cssText).toContain('max-width:120px;');
+    // The same value also reaches the QR renderer — it must be a number there too.
+    expect(lastQrWidth().width).toBe(120);
+  });
+
+  it('S5: an out-of-range size is clamped', async () => {
+    await importFresh();
+    await renderQrAndSettle({ enabled: true, url: 'https://e.com', label: 'L', size: 100000 });
+    expect(lastQrWidth().width).toBe(512);
+
+    await renderQrAndSettle({ enabled: true, url: 'https://e.com', label: 'L', size: -5 });
+    expect(lastQrWidth().width).toBe(120);
+  });
+
+  it('S5 NEGATIVE CONTROL: a legitimate size still passes through unchanged', async () => {
+    // Same layer: proves the coercion is not just pinning everything to the default.
+    await importFresh();
+    await renderQrAndSettle({ enabled: true, url: 'https://e.com', label: 'Scan me!', size: 200 });
+
+    const ov = domElements.get('qr-overlay')!;
+    const label = ov.children.find((c: ElementStub) => c.textContent === 'Scan me!');
+    expect(label!.style.cssText).toContain('max-width:200px;');
+    expect(lastQrWidth().width).toBe(200);
+  });
+
+  // -------- S6: version poisoning --------
+  //
+  // applyPulledContent committed currentContentVersion BEFORE updatePlaylist.
+  // validatePlaylist only checks that `items` is an array, so a malformed item makes
+  // computePlaylistSignature throw inside updatePlaylist — leaving the device
+  // REPORTING a contentVersion it is not rendering. The server's heartbeat-reconcile
+  // then sees agreement and never self-heals: permanent silent drift.
+
+  /**
+   * What this device TELLS THE SERVER it is rendering. Read off a real heartbeat
+   * emit (15s interval) rather than off internal state — the drift only matters
+   * because the server believes this field.
+   */
+  const reportedContentVersion = async () => {
+    await vi.advanceTimersByTimeAsync(15_000);
+    const beats = currentMockSocket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'heartbeat');
+    return (beats[beats.length - 1][1] as { contentVersion: string }).contentVersion;
+  };
+
+  const goodV1 = {
+    version: '2026-01-01T00:00:00.000Z',
+    playlist: playlistPayload.playlist,
+  };
+
+  const poisonedV2 = {
+    version: '2026-06-06T00:00:00.000Z',
+    // Well-formed enough for validatePlaylist (`items` IS an array), not for the
+    // apply path: computePlaylistSignature reads i.content?.updatedAt and throws.
+    playlist: { id: 'pl-2', name: 'poison', items: [null], loopPlaylist: true },
+  };
+
+  const healedV2 = (name: string) => ({
+    version: '2026-06-06T00:00:00.000Z',
+    playlist: { id: 'pl-2', name, items: [{ id: 'it-2', contentId: 'c2', duration: 10, order: 0,
+      content: { id: 'c2', name: 'C2', type: 'image', url: '/c2.jpg' } }], loopPlaylist: true },
+  });
+
+  it('S6: a malformed item does not commit a contentVersion the device is not rendering', async () => {
+    await connectAndCommit();
+    triggerSocketEvent('playlist:update', goodV1);
+    await vi.advanceTimersByTimeAsync(1600);
+    expect(await reportedContentVersion()).toBe(goodV1.version);
+
+    triggerSocketEvent('playlist:update', poisonedV2);
+    await vi.advanceTimersByTimeAsync(1600);
+
+    // The reported version is still the one actually on glass.
+    expect(await reportedContentVersion()).toBe(goodV1.version);
+    expect(await reportedEvents()).toContain('content_apply_failed');
+    // …and the screen never went dark over it.
+    expect(visibleScreens()).toEqual(['content-screen']);
+  });
+
+  it('S6: the stale version keeps a later reconcile able to self-heal', async () => {
+    // The consequence that actually matters. If the poisoned version had been
+    // committed, the server would compare equal and never re-deliver.
+    await connectAndCommit();
+    triggerSocketEvent('playlist:update', goodV1);
+    await vi.advanceTimersByTimeAsync(1600);
+    triggerSocketEvent('playlist:update', poisonedV2);
+    await vi.advanceTimersByTimeAsync(1600);
+
+    // A well-formed re-delivery at the SAME version the poisoned push carried still
+    // applies, because the device never claimed that version.
+    triggerSocketEvent('playlist:update', healedV2('healed'));
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(await reportedContentVersion()).toBe('2026-06-06T00:00:00.000Z');
+    expect(findCreatedElements('img').some(i => i.src.includes('c2.jpg'))).toBe(true);
+  });
+
+  it('S6 NEGATIVE CONTROL: a well-formed newer version IS committed', async () => {
+    // Same layer, same entry point. Proves the heartbeat assertion observes the
+    // commit at all, and that the fix did not simply stop committing versions.
+    await connectAndCommit();
+    triggerSocketEvent('playlist:update', goodV1);
+    await vi.advanceTimersByTimeAsync(1600);
+
+    triggerSocketEvent('playlist:update', healedV2('ok'));
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(await reportedContentVersion()).toBe('2026-06-06T00:00:00.000Z');
+  });
+});
+
+// ============================================================================
+// Sibling instances of the S1–S6 defect patterns (B3–B7)
+// ============================================================================
+
+describe('Client correctness & security residuals — siblings (B3–B7)', () => {
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    resetCapacitorFakes();
+    resetDOM();
+    (window.location as { search: string }).search = '';
+    (window.location.reload as Mock).mockClear();
+    ioFactory.mockClear();
+    currentMockSocket = createMockSocket();
+    ioFactory.mockReturnValue(currentMockSocket);
+    mockCacheManager.getCachedUri.mockReset().mockResolvedValue(null);
+    mockCacheManager.downloadContent.mockReset().mockResolvedValue(null);
+    mockCacheManager.clearCache.mockReset().mockResolvedValue(undefined);
+    mockCacheManager.setExpectedTenant.mockClear();
+    qrToCanvasMock.mockReset().mockResolvedValue(undefined);
+    // Restore default storage behaviour — an earlier test may have overridden it.
+    const { SecureStorage } = await import('./secure-storage');
+    (SecureStorage.get as Mock).mockImplementation(async ({ key }: { key: string }) => ({
+      value: secureStorageStore.get(key) ?? null,
+    }));
+    (SecureStorage.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+      secureStorageStore.set(key, value);
+    });
+    (SecureStorage.remove as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      secureStorageStore.delete(key);
+    });
+    const { Preferences } = await import('@capacitor/preferences');
+    (Preferences.remove as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      preferencesStore.delete(key);
+    });
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  const visibleScreens = () =>
+    ['loading-screen', 'pairing-screen', 'content-screen', 'holding-screen', 'error-screen']
+      .filter(id => {
+        const el = domElements.get(id);
+        return el && !el._classListSet.has('hidden');
+      });
+
+  const reportedEvents = async () => {
+    const { reportEvent } = await import('./crash-reporting');
+    return (reportEvent as Mock).mock.calls.map((c: unknown[]) => c[0]);
+  };
+
+  // ------------------------------------------------------------------------
+  // B3: migrateCredentialsToSecureStorage can strand the plaintext token
+  // ------------------------------------------------------------------------
+  //
+  // F52 exists to get the device token OFF plaintext Preferences. The two
+  // SecureStorage.set calls and the two Preferences.remove calls ran as one
+  // sequential chain inside a single try, so a rejection on EITHER set skipped
+  // BOTH removes — a device_id write failure left the plaintext DEVICE TOKEN on
+  // disk, which is precisely the credential the migration exists to remove.
+
+  describe('B3: credential migration', () => {
+    const seedPlaintextCredentials = () => {
+      preferencesStore.set('device_token', 'plain-tok');
+      preferencesStore.set('device_id', 'plain-dev');
+    };
+
+    it('B3: a device_id write failure does NOT strand the plaintext device token', async () => {
+      seedPlaintextCredentials();
+      const { SecureStorage } = await import('./secure-storage');
+      (SecureStorage.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+        if (key === 'device_id') throw new Error('SECURE_STORAGE_UNAVAILABLE');
+        secureStorageStore.set(key, value);
+      });
+
+      await importFresh();
+
+      // The credential this migration exists to remove is gone from plaintext…
+      expect(preferencesStore.has('device_token')).toBe(false);
+      // …and its encrypted copy was written first, so it was never lost.
+      expect(secureStorageStore.get('device_token')).toBe('plain-tok');
+    });
+
+    it('B3: the ordering is NOT inverted — a failed encrypted write keeps the plaintext copy', async () => {
+      // The other direction of the safety rule: losing both copies is worse than
+      // stranding one. device_token's own set fails, so its plaintext must SURVIVE
+      // for the next boot to retry — while device_id still migrates independently.
+      seedPlaintextCredentials();
+      const { SecureStorage } = await import('./secure-storage');
+      (SecureStorage.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+        if (key === 'device_token') throw new Error('SECURE_STORAGE_UNAVAILABLE');
+        secureStorageStore.set(key, value);
+      });
+
+      await importFresh();
+
+      expect(preferencesStore.get('device_token')).toBe('plain-tok'); // not destroyed
+      expect(secureStorageStore.has('device_token')).toBe(false);
+      // Independent: the sibling key still completed its own write-then-remove.
+      expect(secureStorageStore.get('device_id')).toBe('plain-dev');
+      expect(preferencesStore.has('device_id')).toBe(false);
+    });
+
+    it('B3: a partial migration is reported, not swallowed', async () => {
+      seedPlaintextCredentials();
+      const { SecureStorage } = await import('./secure-storage');
+      (SecureStorage.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+        if (key === 'device_id') throw new Error('SECURE_STORAGE_UNAVAILABLE');
+        secureStorageStore.set(key, value);
+      });
+
+      await importFresh();
+
+      expect(await reportedEvents()).toContain('credential_migration_incomplete');
+    });
+
+    it('B3 NEGATIVE CONTROL: a healthy migration moves both keys and reports nothing', async () => {
+      // Same layer, same entry point, storage healthy. Without this the assertions
+      // above would also pass against a migration that had stopped running at all.
+      seedPlaintextCredentials();
+
+      await importFresh();
+
+      expect(secureStorageStore.get('device_token')).toBe('plain-tok');
+      expect(secureStorageStore.get('device_id')).toBe('plain-dev');
+      expect(preferencesStore.has('device_token')).toBe(false);
+      expect(preferencesStore.has('device_id')).toBe(false);
+      expect(await reportedEvents()).not.toContain('credential_migration_incomplete');
+    });
+  });
+
+  // ------------------------------------------------------------------------
+  // B4: the boot tenant-mismatch purge is the same non-atomic pair as S1
+  // ------------------------------------------------------------------------
+
+  describe('B4: boot tenant-mismatch purge', () => {
+    const seedForeignPlaylist = () => {
+      secureStorageStore.set('device_token', 'tok-123');
+      secureStorageStore.set('device_id', 'dev-123');
+      secureStorageStore.set('tenant_id', 'tenant-B');
+      preferencesStore.set('last_playlist', JSON.stringify({
+        tenantId: 'tenant-A',
+        deviceId: 'dev-123',
+        savedAt: Date.now(),
+        playlist: { id: 'pl-A', name: 'A', items: [], loopPlaylist: true },
+      }));
+    };
+
+    /** Reject only the last_playlist removal — the credential-migration cleanup
+     *  removes other Preferences keys on the same boot and must stay healthy. */
+    const failLastPlaylistRemoval = async () => {
+      const { Preferences } = await import('@capacitor/preferences');
+      (Preferences.remove as Mock).mockImplementation(async ({ key }: { key: string }) => {
+        if (key === 'last_playlist') throw new Error('Preferences unavailable');
+        preferencesStore.delete(key);
+      });
+    };
+
+    it('B4: a failing last_playlist removal does NOT skip the cache clear', async () => {
+      seedForeignPlaylist();
+      await failLastPlaylistRemoval();
+
+      await importFresh();
+
+      // As a sequential await chain the first rejection skipped this entirely,
+      // leaving the foreign tenant's downloaded assets on the device.
+      expect(mockCacheManager.clearCache).toHaveBeenCalled();
+    });
+
+    it('B4: a partial tenant purge is reported, not mislabelled as a restore failure', async () => {
+      seedForeignPlaylist();
+      await failLastPlaylistRemoval();
+
+      await importFresh();
+
+      const events = await reportedEvents();
+      expect(events).toContain('tenant_mismatch_purge');
+      expect(events).toContain('tenant_mismatch_purge_incomplete');
+    });
+
+    it('B4: a failing cache clear is reported too, and the foreign playlist never renders', async () => {
+      // clearCache now REJECTS on a failed purge (B1), so this arm is reachable.
+      seedForeignPlaylist();
+      mockCacheManager.clearCache.mockRejectedValue(new Error('rmdir failed'));
+
+      await importFresh();
+
+      expect(await reportedEvents()).toContain('tenant_mismatch_purge_incomplete');
+      // Never-wrong-tenant holds regardless: nothing from tenant-A reaches glass.
+      expect(visibleScreens()).not.toContain('content-screen');
+    });
+
+    it('B4 NEGATIVE CONTROL: a clean tenant purge reports no residual failure', async () => {
+      seedForeignPlaylist();
+
+      await importFresh();
+
+      expect(preferencesStore.has('last_playlist')).toBe(false);
+      expect(mockCacheManager.clearCache).toHaveBeenCalled();
+      const events = await reportedEvents();
+      expect(events).toContain('tenant_mismatch_purge');
+      expect(events).not.toContain('tenant_mismatch_purge_incomplete');
+    });
+
+    it('B4 NEGATIVE CONTROL: a SAME-tenant cached playlist is restored, not purged', async () => {
+      // Proves the purge above is driven by the tenant mismatch and not by the boot
+      // path having started discarding every stored playlist.
+      secureStorageStore.set('device_token', 'tok-123');
+      secureStorageStore.set('device_id', 'dev-123');
+      secureStorageStore.set('tenant_id', 'tenant-A');
+      preferencesStore.set('last_playlist', JSON.stringify({
+        tenantId: 'tenant-A',
+        deviceId: 'dev-123',
+        savedAt: Date.now(),
+        playlist: { id: 'pl-A', name: 'A', items: [], loopPlaylist: true },
+      }));
+
+      await importFresh();
+
+      expect(mockCacheManager.clearCache).not.toHaveBeenCalled();
+      expect(preferencesStore.has('last_playlist')).toBe(true);
+      expect(await reportedEvents()).not.toContain('tenant_mismatch_purge');
+    });
+  });
+
+  // ------------------------------------------------------------------------
+  // B5: the legacy unversioned push path had an unhandled rejection
+  // ------------------------------------------------------------------------
+
+  describe('B5: legacy unversioned playlist push', () => {
+    const goodPlaylist = {
+      playlist: { id: 'pl', name: 'PL', items: [{ id: 'it-1', contentId: 'c1', duration: 10, order: 0,
+        content: { id: 'c1', name: 'C', type: 'image', url: '/c1.jpg' } }], loopPlaylist: true },
+    };
+    // Well-formed enough for validatePlaylist (`items` IS an array), not for the
+    // apply path: computePlaylistSignature reads i.content?.updatedAt and throws.
+    const poisonedLegacyPush = {
+      playlist: { id: 'pl-2', name: 'poison', items: [null], loopPlaylist: true },
+    };
+
+    const connectAndCommit = async () => {
+      secureStorageStore.set('device_token', 'tok-123');
+      secureStorageStore.set('device_id', 'dev-123');
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+      triggerSocketEvent('playlist:update', goodPlaylist);
+      await vi.advanceTimersByTimeAsync(1600);
+      expect(visibleScreens()).toEqual(['content-screen']);
+    };
+
+    it('B5: a malformed LEGACY (unversioned) push does not produce an unhandled rejection', async () => {
+      await connectAndCommit();
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => unhandled.push(reason);
+      process.on('unhandledRejection', onUnhandled);
+      try {
+        // No `version` field -> the legacy branch, which called updatePlaylist bare.
+        triggerSocketEvent('playlist:update', poisonedLegacyPush);
+        await vi.advanceTimersByTimeAsync(1600);
+      } finally {
+        process.off('unhandledRejection', onUnhandled);
+      }
+      expect(unhandled).toEqual([]);
+    });
+
+    it('B5: a malformed LEGACY push is reported and keeps last-known-good on the glass', async () => {
+      await connectAndCommit();
+      const container = domElements.get('content-container')!;
+      const appendsBefore = (container.appendChild as Mock).mock.calls.length;
+
+      triggerSocketEvent('playlist:update', poisonedLegacyPush);
+      await vi.advanceTimersByTimeAsync(1600);
+
+      expect(await reportedEvents()).toContain('content_apply_failed');
+      expect(visibleScreens()).toEqual(['content-screen']);
+      expect((container.appendChild as Mock).mock.calls.length).toBeGreaterThanOrEqual(appendsBefore);
+      // Last-known-good really is still the committed playlist: the poisoned push
+      // threw before updatePlaylist could replace it or persist it.
+      const persisted = JSON.parse(preferencesStore.get('last_playlist')!);
+      expect(persisted.playlist.id).toBe('pl');
+    });
+
+    it('B5 NEGATIVE CONTROL: a well-formed LEGACY push still applies', async () => {
+      // Same layer, same entry point. Proves the catch did not turn the legacy
+      // branch into a no-op.
+      await connectAndCommit();
+
+      triggerSocketEvent('playlist:update', {
+        playlist: { id: 'pl-3', name: 'next', items: [{ id: 'it-2', contentId: 'c2', duration: 10, order: 0,
+          content: { id: 'c2', name: 'C2', type: 'image', url: '/c2.jpg' } }], loopPlaylist: true },
+      });
+      await vi.advanceTimersByTimeAsync(1600);
+
+      expect(findCreatedElements('img').some(i => i.src.includes('c2.jpg'))).toBe(true);
+      expect(await reportedEvents()).not.toContain('content_apply_failed');
+    });
+  });
+
+  // ------------------------------------------------------------------------
+  // B6: pairing committed credentials in memory BEFORE persisting them
+  // ------------------------------------------------------------------------
+  //
+  // The inverse of the rule handleTokenRefresh documents. On a keystore failure the
+  // poller was already stopped and pairingCode already null, so a dead code stayed
+  // on the glass, connectToRealtime() was skipped and the token was never written:
+  // bricked until a human power-cycles the screen.
+  //
+  // This path was also the repo's worst test gap — nothing asserted that tenant_id
+  // was persisted or that setExpectedTenant was called, so deleting either line left
+  // the suite green while every newly paired device ran with tenantId = null.
+
+  describe('B6: pairing success', () => {
+    const pairedPayload = {
+      status: 'paired', deviceToken: 'tok-new', deviceId: 'dev-new', tenantId: 'tenant-A',
+    };
+
+    /**
+     * Drive the REAL 2s pairing poll to a `paired` response.
+     *
+     * The poll is a setInterval registered inside main.ts's async init chain, and
+     * how far that chain has progressed when a test starts advancing the clock
+     * varies run to run (this is the same fake-timer/resetModules interaction that
+     * got the suite's original polling block skipped). So: alternate macro advances
+     * with microtask flushes, generously, instead of assuming a fixed tick count.
+     */
+    const pollToPaired = async (
+      payload: Record<string, unknown> = pairedPayload,
+      settled: () => boolean = () => secureStorageStore.has('device_token'),
+    ) => {
+      httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
+        ? { status: 200, data: { data: payload } }
+        : { status: 404, data: {} };
+      for (let round = 0; round < 30; round++) {
+        await vi.advanceTimersByTimeAsync(2100);
+        for (let j = 0; j < 40; j++) await Promise.resolve();
+        if (settled()) {
+          // Give the commit that follows the persist its own turns to run.
+          await vi.advanceTimersByTimeAsync(50);
+          for (let j = 0; j < 40; j++) await Promise.resolve();
+          return;
+        }
+      }
+    };
+
+    /** Boot with no credentials and wait for the real pairing request to land. */
+    const bootToPairingScreen = async () => {
+      await importFresh();
+      for (let round = 0; round < 10; round++) {
+        if (domElements.get('pairing-code')!.textContent === 'ABCD1234') break;
+        await vi.advanceTimersByTimeAsync(200);
+        for (let j = 0; j < 40; j++) await Promise.resolve();
+      }
+      expect(domElements.get('pairing-code')!.textContent).toBe('ABCD1234');
+    };
+
+    it('B6: persists device_token', async () => {
+      await bootToPairingScreen();
+      await pollToPaired();
+      expect(secureStorageStore.get('device_token')).toBe('tok-new');
+    });
+
+    it('B6: persists device_id', async () => {
+      await bootToPairingScreen();
+      await pollToPaired();
+      expect(secureStorageStore.get('device_id')).toBe('dev-new');
+    });
+
+    it('B6: persists tenant_id', async () => {
+      // Nothing asserted this before. Deleting the write left the suite green while
+      // every newly paired device booted forever after in tenant grace mode.
+      await bootToPairingScreen();
+      await pollToPaired();
+      expect(secureStorageStore.get('tenant_id')).toBe('tenant-A');
+    });
+
+    it('B6: binds the cache to the paired tenant', async () => {
+      // Likewise unasserted. Without this call the cache's tenant-mismatch purge
+      // cannot fire, silently downgrading cross-tenant isolation to legacy grace.
+      await bootToPairingScreen();
+      await pollToPaired();
+      expect(mockCacheManager.setExpectedTenant).toHaveBeenCalledWith('tenant-A');
+    });
+
+    it('B6: connects to realtime with the NEWLY paired token', async () => {
+      // Asserted on the handshake argument rather than a call count: the token that
+      // reaches the socket is the thing that matters, and it is not sensitive to how
+      // many connect attempts the harness happens to schedule.
+      await bootToPairingScreen();
+      await pollToPaired();
+      const authTokens = ioFactory.mock.calls.map(
+        (c: unknown[]) => (c[1] as { auth?: { token?: string } } | undefined)?.auth?.token,
+      );
+      expect(authTokens).toContain('tok-new');
+    });
+
+    it('B6: a keystore failure does NOT strand the device on a dead pairing code', async () => {
+      await bootToPairingScreen();
+      const { SecureStorage } = await import('./secure-storage');
+      (SecureStorage.set as Mock).mockRejectedValue(new Error('SECURE_STORAGE_UNAVAILABLE'));
+      const { CapacitorHttp } = await import('@capacitor/core');
+      const countBefore = (CapacitorHttp.get as Mock).mock.calls.length;
+
+      await pollToPaired(pairedPayload, () => false);
+
+      // Nothing committed…
+      expect(ioFactory.mock.calls.length).toBe(0);
+      expect(await reportedEvents()).toContain('pairing_persist_failed');
+      // …and the poller is STILL RUNNING across many ticks, which is what makes
+      // this recoverable rather than a screen bricked until someone power-cycles it.
+      // Committing first stopped the poller before the persist could fail, leaving
+      // exactly ONE poll and a dead code on the glass forever.
+      expect((CapacitorHttp.get as Mock).mock.calls.length).toBeGreaterThan(countBefore + 3);
+      expect(domElements.get('pairing-code')!.textContent).toBe('ABCD1234');
+    });
+
+    it('B6: pairing completes on a later poll once the keystore recovers', async () => {
+      // The recoverable direction, proven end to end.
+      await bootToPairingScreen();
+      const { SecureStorage } = await import('./secure-storage');
+      (SecureStorage.set as Mock).mockRejectedValue(new Error('SECURE_STORAGE_UNAVAILABLE'));
+      await pollToPaired(pairedPayload, () => false);
+      expect(secureStorageStore.has('device_token')).toBe(false);
+
+      (SecureStorage.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+        secureStorageStore.set(key, value);
+      });
+      await pollToPaired();
+
+      expect(secureStorageStore.get('device_token')).toBe('tok-new');
+      expect(secureStorageStore.get('tenant_id')).toBe('tenant-A');
+      expect(mockCacheManager.setExpectedTenant).toHaveBeenCalledWith('tenant-A');
+      expect(ioFactory.mock.calls.length).toBeGreaterThan(0);
+    });
+
+    it('B6: a tenant_id write failure blocks the commit — no half-paired grace-mode device', async () => {
+      // All three writes gate the commit on purpose: persisting the token but not
+      // tenant_id would boot the device in grace mode forever after.
+      await bootToPairingScreen();
+      const { SecureStorage } = await import('./secure-storage');
+      (SecureStorage.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+        if (key === 'tenant_id') throw new Error('SECURE_STORAGE_UNAVAILABLE');
+        secureStorageStore.set(key, value);
+      });
+
+      await pollToPaired(pairedPayload, () => secureStorageStore.has('tenant_id'));
+
+      expect(ioFactory.mock.calls.length).toBe(0);
+      expect(mockCacheManager.setExpectedTenant).not.toHaveBeenCalledWith('tenant-A');
+      expect(await reportedEvents()).toContain('pairing_persist_failed');
+    });
+
+    it('B6: an overlapping poll cannot commit the pairing twice', async () => {
+      // Moving the persist AHEAD of `pairingCode = null` widened the window the
+      // poll's own comment guards ("only the first wins, otherwise the success path
+      // runs twice and churns the socket connection") from zero awaits to three
+      // keystore writes. Park the first commit inside that window and let further
+      // 2s ticks fire on top of it.
+      await bootToPairingScreen();
+      const { SecureStorage } = await import('./secure-storage');
+      let release!: () => void;
+      const gate = new Promise<void>(r => { release = r; });
+      let firstCommit = true;
+      (SecureStorage.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+        if (key === 'device_token' && firstCommit) {
+          firstCommit = false;
+          await gate;
+        }
+        secureStorageStore.set(key, value);
+      });
+      httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
+        ? { status: 200, data: { data: pairedPayload } }
+        : { status: 404, data: {} };
+
+      await vi.advanceTimersByTimeAsync(2100);          // tick 1 parks inside the persist
+      for (let j = 0; j < 40; j++) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(6300);          // ticks 2-4 land on top of it
+      for (let j = 0; j < 40; j++) await Promise.resolve();
+      release();
+      for (let j = 0; j < 60; j++) await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(50);
+      for (let j = 0; j < 60; j++) await Promise.resolve();
+
+      const tokenWrites = (SecureStorage.set as Mock).mock.calls
+        .filter((c: unknown[]) => (c[0] as { key: string }).key === 'device_token');
+      expect(tokenWrites.length).toBe(1);
+      expect(ioFactory.mock.calls.length).toBe(1);
+      expect(secureStorageStore.get('device_token')).toBe('tok-new');
+    });
+
+    it('B6 NEGATIVE CONTROL: a healthy pairing reports no persist failure', async () => {
+      await bootToPairingScreen();
+      await pollToPaired();
+      expect(await reportedEvents()).not.toContain('pairing_persist_failed');
+    });
+
+    it('B6 NEGATIVE CONTROL: a legacy backend with no tenantId still pairs', async () => {
+      // Proves the all-or-nothing persist did not make tenant_id mandatory.
+      await bootToPairingScreen();
+      await pollToPaired({ status: 'paired', deviceToken: 'tok-legacy', deviceId: 'dev-legacy' });
+
+      expect(secureStorageStore.get('device_token')).toBe('tok-legacy');
+      expect(secureStorageStore.has('tenant_id')).toBe(false);
+      expect(mockCacheManager.setExpectedTenant).toHaveBeenCalledWith(null);
+      expect(ioFactory.mock.calls.length).toBeGreaterThan(0);
+    });
+  });
+
+  // ------------------------------------------------------------------------
+  // B7: allow-same-origin must not be granted on the plain-web platform
+  // ------------------------------------------------------------------------
+
+  describe('B7: webpage iframe sandbox is platform-conditional', () => {
+    afterEach(() => {
+      // Restore the suite-wide Android baseline.
+      (window as { Capacitor?: unknown }).Capacitor = { isNativePlatform: () => true };
+    });
+
+    const playWebpage = async () => {
+      secureStorageStore.set('device_token', 'tok-123');
+      secureStorageStore.set('device_id', 'dev-123');
+      await importFresh();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+      triggerSocketEvent('playlist:update', {
+        playlist: { id: 'p1', name: 'T', items: [{ id: 'i1', contentId: 'c1', duration: 10, order: 0,
+          content: { id: 'c1', name: 'C', type: 'webpage', url: 'https://example.com' } }], loopPlaylist: true },
+      });
+      await vi.advanceTimersByTimeAsync(50);
+      const iframes = findCreatedElements('iframe');
+      expect(iframes.length).toBeGreaterThan(0);
+      return iframes[iframes.length - 1].sandbox.add.mock.calls.flat();
+    };
+
+    it('B7: on the web platform allow-same-origin is NOT granted', async () => {
+      // Only here can the app DOCUMENT's origin equal a content origin. Such a
+      // frame, granted allow-same-origin, can reach `parent`, strip this very
+      // sandbox attribute and reload itself unsandboxed — giving back everything
+      // S4 took away.
+      delete (window as { Capacitor?: unknown }).Capacitor;
+
+      const tokens = await playWebpage();
+
+      expect(tokens).not.toContain('allow-same-origin');
+      // Still sandboxed against the failure S4 fixed.
+      expect(tokens).toContain('allow-scripts');
+      expect(tokens).not.toContain('allow-top-navigation');
+    });
+
+    it('B7 NEGATIVE CONTROL: on a real TV platform allow-same-origin IS still granted', async () => {
+      // Most real signage pages break under an opaque origin, so the grant must
+      // survive everywhere the app origin can never equal a content origin.
+      delete (window as { Capacitor?: unknown }).Capacitor;
+      (window as { tizen?: unknown }).tizen = {};
+      try {
+        const tokens = await playWebpage();
+        expect(tokens).toContain('allow-same-origin');
+        expect(tokens).toContain('allow-scripts');
+      } finally {
+        delete (window as { tizen?: unknown }).tizen;
+      }
+    });
+
+    it('B7 NEGATIVE CONTROL: on Capacitor (Android) allow-same-origin IS still granted', async () => {
+      const tokens = await playWebpage();
+      expect(tokens).toContain('allow-same-origin');
+      expect(tokens).toContain('allow-scripts');
+    });
+  });
+});

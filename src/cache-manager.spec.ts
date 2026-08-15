@@ -121,6 +121,15 @@ function seedManifest(entries: Record<string, any>): void {
   getFsTree()[p] = { type: 'file', data: JSON.stringify(manifest), size: 100 };
 }
 
+/** Seed a manifest carrying a tenant stamp (used by the tenant-binding and clear tests). */
+function seedTenantManifest(tenantId: string, entries: Record<string, any>): void {
+  getFsTree()['DATA/content-cache/manifest.json'] = {
+    type: 'file',
+    data: JSON.stringify({ entries, version: 1, tenantId }),
+    size: 100,
+  };
+}
+
 function seedFile(fileName: string, size: number): void {
   const p = `DATA/content-cache/${fileName}`;
   getFsTree()[p] = { type: 'file', data: 'x'.repeat(size), size };
@@ -202,20 +211,26 @@ describe('AndroidCacheManager', () => {
       expect(fs.mkdir).toHaveBeenCalledTimes(1);
       expect(fs.readFile).toHaveBeenCalledTimes(1);
     });
+
+    it('serializes CONCURRENT init() calls — the boot render/preload race loads the manifest once', async () => {
+      // The idempotency test above only covers sequential calls. Concurrently, every
+      // caller passed the `initialized` guard, so each ran its own loadManifest() and
+      // the last one to land overwrote this.manifest — clobbering entries an earlier
+      // one had already recorded. TvCacheManager already serializes via initPromise.
+      seedManifest({ abc: makeEntry('abc', 'abc.png', 500) });
+
+      const cm = new AndroidCacheManager();
+      await Promise.all([cm.init(), cm.init(), cm.init()]);
+
+      expect(fs.readFile).toHaveBeenCalledTimes(1);
+      expect(cm.getCacheStats().itemCount).toBe(1);
+    });
   });
 
   // -----------------------------------------------------------------------
   // 1b. Tenant binding (P0-2 — docs/design/revocation-contract.md §2)
   // -----------------------------------------------------------------------
   describe('Tenant Binding', () => {
-    const seedTenantManifest = (tenantId: string, entries: Record<string, any>) => {
-      getFsTree()['DATA/content-cache/manifest.json'] = {
-        type: 'file',
-        data: JSON.stringify({ entries, version: 1, tenantId }),
-        size: 100,
-      };
-    };
-
     it('purges the whole cache when the manifest belongs to a different tenant', async () => {
       seedTenantManifest('tenant-A', { abc: makeEntry('abc', 'abc.png', 500) });
       seedFile('abc.png', 500);
@@ -258,6 +273,43 @@ describe('AndroidCacheManager', () => {
       const manifestFile = getFsTree()['DATA/content-cache/manifest.json'];
       expect(manifestFile).toBeDefined();
       expect(JSON.parse(manifestFile.data!).tenantId).toBe('tenant-A');
+    });
+
+    it('setExpectedTenant RE-ARMS the purge — re-pairing to a new tenant in the same process purges', async () => {
+      // The purge lives inside init(), which early-returns once initialized. So
+      // setExpectedTenant() after first use was a silent no-op for purge purposes:
+      // a device re-paired to a different tenant kept serving the previous tenant's
+      // assets for the life of the process.
+      seedTenantManifest('tenant-A', { abc: makeEntry('abc', 'abc.png', 500) });
+      seedFile('abc.png', 500);
+
+      const cm = new AndroidCacheManager();
+      cm.setExpectedTenant('tenant-A');
+      await cm.init();
+      expect(cm.getCacheStats().itemCount).toBe(1); // baseline: tenant-A's cache is live
+
+      cm.setExpectedTenant('tenant-B'); // re-pair, same process
+
+      // Through a real public entry point, not by re-calling init() by hand.
+      expect(await cm.getCachedUri('abc')).toBeNull();
+      expect(cm.getCacheStats().itemCount).toBe(0);
+    });
+
+    it('NEGATIVE CONTROL: re-setting the SAME tenant does not re-arm the purge', async () => {
+      // Proves the purge above came from the tenant CHANGING, not from
+      // setExpectedTenant blindly discarding the cache on every call.
+      seedTenantManifest('tenant-A', { abc: makeEntry('abc', 'abc.png', 500) });
+      seedFile('abc.png', 500);
+
+      const cm = new AndroidCacheManager();
+      cm.setExpectedTenant('tenant-A');
+      await cm.init();
+
+      cm.setExpectedTenant('tenant-A');
+
+      expect(await cm.getCachedUri('abc')).toBe('file://DATA/content-cache/abc.png');
+      expect(cm.getCacheStats().itemCount).toBe(1);
+      expect(fs.readFile).toHaveBeenCalledTimes(1); // init did not re-run
     });
   });
 
@@ -613,19 +665,164 @@ describe('AndroidCacheManager', () => {
       expect(manifestWriteCount()).toBeGreaterThanOrEqual(1);
     });
 
-    it('handles rmdir failure gracefully and logs error', async () => {
+    it('REJECTS on rmdir failure and logs the error', async () => {
+      // Was `resolves.toBeUndefined()`. Swallowing here is what defeated
+      // purgeDeviceState's Promise.allSettled telemetry: a failed cache clear was
+      // recorded as fulfilled, so `device_purge_incomplete` never fired for it.
       (fs.rmdir as Mock).mockRejectedValueOnce(new Error('Permission denied'));
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
 
       const cm = new AndroidCacheManager();
       await cm.init();
 
-      await expect(cm.clearCache()).resolves.toBeUndefined();
+      await expect(cm.clearCache()).rejects.toThrow('Permission denied');
       expect(errorSpy).toHaveBeenCalledWith(
         expect.stringContaining('Failed to clear cache'),
         expect.any(Error),
       );
       errorSpy.mockRestore();
+    });
+
+    it('a FAILED purge still empties the manifest — no entry stays servable', async () => {
+      // The manifest was reset INSIDE the try, AFTER the rmdir, so a failing rmdir
+      // left every entry in place and still servable through getCachedUri.
+      seedManifest({ clr1: makeEntry('clr1', 'clr1.png', 500) });
+      seedFile('clr1.png', 500);
+      (fs.rmdir as Mock).mockRejectedValueOnce(new Error('Permission denied'));
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const cm = new AndroidCacheManager();
+      await cm.init();
+      expect(cm.getCacheStats().itemCount).toBe(1); // baseline: there is something to purge
+
+      await expect(cm.clearCache()).rejects.toThrow('Permission denied');
+
+      expect(cm.getCacheStats().itemCount).toBe(0);
+      // Through a real public entry point, not by reading internal state.
+      expect(await cm.getCachedUri('clr1')).toBeNull();
+    });
+
+    it('a PERSISTENTLY failing purge still refuses to serve the purged tenant after re-pairing', async () => {
+      // The consequence that reaches glass. rmdir fails on EVERY attempt, so the
+      // on-disk residue survives and the next init reloads it from disk — the only
+      // thing standing between the purged tenant's assets and the new tenant's
+      // screen is clearCache emptying the manifest in memory. Resetting it AFTER
+      // the rmdir (the defect) left the entry loaded, stamped and servable.
+      seedTenantManifest('tenant-A', { clr1: makeEntry('clr1', 'clr1.png', 500) });
+      seedFile('clr1.png', 500);
+      (fs.rmdir as Mock).mockRejectedValue(new Error('Permission denied'));
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const cm = new AndroidCacheManager();
+      cm.setExpectedTenant('tenant-A');
+      await cm.init();
+      expect(await cm.getCachedUri('clr1')).toBe('file://DATA/content-cache/clr1.png'); // baseline
+
+      await expect(cm.clearCache()).rejects.toThrow('Permission denied');
+
+      // Re-pair to a different tenant, then read through a real public entry point.
+      cm.setExpectedTenant('tenant-B');
+      expect(await cm.getCachedUri('clr1')).toBeNull();
+      expect(cm.getCacheStats().itemCount).toBe(0);
+    });
+
+    it('NEGATIVE CONTROL: a healthy purge resolves', async () => {
+      // Same layer, same entry point, filesystem healthy. Proves the rejections
+      // above come from the rmdir failure and not from clearCache now rejecting
+      // unconditionally.
+      seedManifest({ clr1: makeEntry('clr1', 'clr1.png', 500) });
+      seedFile('clr1.png', 500);
+
+      const cm = new AndroidCacheManager();
+      await cm.init();
+
+      await expect(cm.clearCache()).resolves.toBeUndefined();
+      expect(cm.getCacheStats().itemCount).toBe(0);
+    });
+
+    it('a failing tenant purge at init does NOT reject init() — reads still degrade to null', async () => {
+      // getCachedUri/downloadContent await init() OUTSIDE their try blocks, so if
+      // doInit let clearCache's rejection escape, a failed disk purge would become a
+      // rendering failure (an unhandled rejection out of the render path) instead of
+      // a cache miss.
+      seedTenantManifest('tenant-A', { clr1: makeEntry('clr1', 'clr1.png', 500) });
+      seedFile('clr1.png', 500);
+      (fs.rmdir as Mock).mockRejectedValueOnce(new Error('Permission denied'));
+      vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      const cm = new AndroidCacheManager();
+      cm.setExpectedTenant('tenant-B'); // mismatch -> init purges
+
+      await expect(cm.init()).resolves.toBeUndefined();
+      expect(await cm.getCachedUri('clr1')).toBeNull();
+      expect(cm.getCacheStats().itemCount).toBe(0);
+    });
+  });
+
+  // -----------------------------------------------------------------------
+  // 6b. Purge race (clear-generation guard — mirrors TvCacheManager)
+  // -----------------------------------------------------------------------
+  describe('Purge Race', () => {
+    /**
+     * Park a download inside the HTTP call. `entered` resolves once the request is
+     * in flight — i.e. once downloadContent has already captured its generation —
+     * so the clearCache() below genuinely lands MID-download rather than before it.
+     */
+    const gatedDownload = () => {
+      let release!: () => void;
+      let entered!: () => void;
+      const gate = new Promise<void>(r => { release = r; });
+      const inFlight = new Promise<void>(r => { entered = r; });
+      setHttpFactory((() => {
+        entered();
+        return gate.then(() => ({ status: 200, data: 'binary-blob' }));
+      }) as unknown as (url: string) => { status: number; data: any });
+      return { inFlight, release };
+    };
+
+    it('an in-flight download across clearCache never resurrects purged content', async () => {
+      // clearCache() is the confirmed-revocation purge path (purgeDeviceState §3.4).
+      // Without the generation guard the download completed AFTERWARDS, re-created
+      // the directory, wrote the asset and re-stamped the manifest with the tenant
+      // that had just been purged.
+      const { inFlight, release } = gatedDownload();
+
+      const cm = new AndroidCacheManager();
+      cm.setExpectedTenant('tenant-A');
+      await cm.init();
+
+      const pending = cm.downloadContent('c1', 'https://cdn/x.png', 'image/png');
+      await inFlight;
+      await cm.clearCache(); // revocation purge lands mid-download
+      release();
+
+      expect(await pending).toBeNull();
+      // NEGATIVE: nothing written back, and the manifest was not re-stamped.
+      expect(getFsTree()['DATA/content-cache/c1.png']).toBeUndefined();
+      expect(JSON.parse(getFsTree()['DATA/content-cache/manifest.json'].data!).tenantId)
+        .toBeUndefined();
+      expect(cm.getCacheStats().itemCount).toBe(0);
+      expect(await cm.getCachedUri('c1')).toBeNull();
+    });
+
+    it('NEGATIVE CONTROL: the same gated download completes normally with no purge', async () => {
+      // Same harness, same gate, no clearCache. Proves the nulls above come from the
+      // generation guard and not from the gate breaking the download outright.
+      const { inFlight, release } = gatedDownload();
+
+      const cm = new AndroidCacheManager();
+      cm.setExpectedTenant('tenant-A');
+      await cm.init();
+
+      const pending = cm.downloadContent('c1', 'https://cdn/x.png', 'image/png');
+      await inFlight;
+      release();
+
+      expect(await pending).toBe('file://DATA/content-cache/c1.png');
+      expect(getFsTree()['DATA/content-cache/c1.png']).toBeDefined();
+      expect(JSON.parse(getFsTree()['DATA/content-cache/manifest.json'].data!).tenantId)
+        .toBe('tenant-A');
+      expect(cm.getCacheStats().itemCount).toBe(1);
     });
   });
 

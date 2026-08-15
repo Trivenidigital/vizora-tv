@@ -198,7 +198,14 @@ export class TvCacheManager {
 
   /** Tenant binding — same contract as AndroidCacheManager.setExpectedTenant. */
   setExpectedTenant(tenantId: string | null): void {
+    if (tenantId === this.expectedTenant) return; // no-op call must not re-run doInit
     this.expectedTenant = tenantId;
+    // Re-arm the tenant-mismatch purge. It lives inside doInit(), which init()
+    // early-returns past once initialized, so re-pairing to a DIFFERENT tenant in the
+    // same process left the previous tenant's blobs in IndexedDB and servable. That
+    // is reachable today: a confirmed revocation calls startPairing() WITHOUT a
+    // reload, so tenant A → tenant B happens in one process.
+    this.initialized = false;
   }
 
   async init(): Promise<void> {
@@ -359,13 +366,19 @@ export class TvCacheManager {
       this.revokeObjectUrl(id);
     }
     this.lastAccessOverlay.clear();
+    this.statsItemCount = 0;
+    this.statsTotalBytes = 0;
     try {
       await this.store.clearAll();
-      this.statsItemCount = 0;
-      this.statsTotalBytes = 0;
       console.log('[TvCache] Cache cleared');
     } catch (err) {
+      // REJECT, matching AndroidCacheManager: purgeDeviceState collects this call in
+      // a Promise.allSettled, so swallowing here recorded a failed cache clear as
+      // fulfilled and `device_purge_incomplete` never fired on Tizen/webOS. The two
+      // managers are used interchangeably by main.ts, so their failure contracts
+      // have to match or the telemetry is only honest on Android.
       console.error('[TvCache] Failed to clear cache:', err);
+      throw err;
     }
   }
 

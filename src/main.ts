@@ -26,6 +26,7 @@ import { io, Socket } from 'socket.io-client';
 import { AndroidCacheManager } from './cache-manager';
 import { TvCacheManager } from './tv-cache-manager';
 import {
+  detectPlatform,
   initTvPlatform,
   isNativeCapacitor,
   isTvBackKey,
@@ -73,12 +74,19 @@ declare const __RELEASE_ORIGINS_JSON__: string;
 (globalThis as Record<string, unknown>).__VIZORA_RELEASE_ORIGINS__ =
   typeof __RELEASE_ORIGINS_JSON__ !== 'undefined' ? __RELEASE_ORIGINS_JSON__ : '';
 
-// Configuration - can be overridden via URL params or stored preferences
-const DEFAULT_CONFIG = {
+// Configuration - can be overridden via URL params or stored preferences.
+//
+// FROZEN on purpose. This object is the ANCHOR isAllowedConfigUrl() measures every
+// update_config candidate against, so it has to keep describing what the bundle was
+// COMPILED with, not where the device has since been pointed. Freezing makes a
+// regression that writes through to it fail loudly (module scope is strict mode, so
+// the assignment throws) instead of silently widening the allowlist. Nothing writes
+// here today — the runtime config is a COPY (see `private config` below).
+const DEFAULT_CONFIG = Object.freeze({
   apiUrl: import.meta.env.VITE_API_URL || 'http://localhost:3000',
   realtimeUrl: import.meta.env.VITE_REALTIME_URL || 'http://localhost:3002',
   dashboardUrl: import.meta.env.VITE_DASHBOARD_URL || 'http://localhost:3001',
-};
+});
 
 interface Config {
   apiUrl: string;
@@ -166,9 +174,15 @@ class VizoraAndroidTV {
   private pairingCountdownInterval: ReturnType<typeof setInterval> | null = null;
   private pairingExpiresAt: number = 0;
   private pairingCheckInterval: ReturnType<typeof setInterval> | null = null;
+  /** Held across the pairing credential persist — see startPairingCheck. */
+  private pairingCommitInFlight = false;
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
   private offlineTimeout: ReturnType<typeof setTimeout> | null = null;
-  private config: Config = DEFAULT_CONFIG;
+  // A COPY, never a reference: loadConfig() mutates this from URL params and stored
+  // Preferences, and aliasing DEFAULT_CONFIG meant one stored off-domain origin
+  // rewrote the compiled-in anchor isAllowedConfigUrl() reads — so a single poisoned
+  // origin bootstrapped a wider allowlist for every later update_config.
+  private config: Config = { ...DEFAULT_CONFIG };
   private startTime: number = Date.now();
   private currentContentId: string | null = null;
   private contentStartTime: number = 0;
@@ -360,8 +374,22 @@ class VizoraAndroidTV {
           if (envelope.tenantId && this.tenantId && envelope.tenantId !== this.tenantId) {
             console.warn('[Vizora] Cached playlist belongs to a different tenant — purging (F4)');
             reportEvent('tenant_mismatch_purge', { cachedTenant: envelope.tenantId });
-            await Preferences.remove({ key: 'last_playlist' });
-            await this.cacheManager.clearCache();
+            // Independent removals, same treatment as purgeDeviceState. As a
+            // sequential await chain a failing Preferences.remove skipped the cache
+            // clear entirely, and either failure landed in the outer catch below —
+            // which logs "Failed to restore last playlist", a message that says
+            // nothing about a HALF-PURGED foreign tenant. The device correctly does
+            // not render the foreign playlist either way; what was missing is the
+            // operator ever learning the purge did not complete.
+            const purge = await Promise.allSettled([
+              Preferences.remove({ key: 'last_playlist' }),
+              this.cacheManager.clearCache(),
+            ]);
+            const purgeFailures = purge.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+            if (purgeFailures.length > 0) {
+              console.error('[Vizora] Tenant-mismatch purge incomplete:', purgeFailures.map(f => f.reason));
+              reportEvent('tenant_mismatch_purge_incomplete', { failed: purgeFailures.length });
+            }
           } else if (envelope.tenantId && tenantReadFailed) {
             // The cache is tenant-BOUND but our tenant is UNVERIFIABLE (read
             // failed) — fail closed (F4): do NOT render it. Leave currentPlaylist
@@ -648,18 +676,41 @@ class VizoraAndroidTV {
 
       if (plainToken.value) {
         console.log('[Vizora] Migrating credentials to secure storage...');
-        await SecureStorage.set({ key: 'device_token', value: plainToken.value });
-        if (plainDeviceId.value) {
-          await SecureStorage.set({ key: 'device_id', value: plainDeviceId.value });
+        // Per-key and INDEPENDENT. As one sequential chain, a SecureStorage.set
+        // rejection on EITHER key skipped BOTH Preferences.remove calls — so a
+        // device_id write failure stranded the plaintext device_token on disk,
+        // defeating the exact thing this migration exists to accomplish.
+        const results = await Promise.allSettled([
+          this.migrateOneCredential('device_token', plainToken.value),
+          ...(plainDeviceId.value
+            ? [this.migrateOneCredential('device_id', plainDeviceId.value)]
+            : []),
+        ]);
+        const failures = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+        if (failures.length > 0) {
+          // Surface, never swallow: the plaintext copy of whatever failed is still
+          // on disk, and the next boot retries it.
+          console.error('[Vizora] Credential migration incomplete:', failures.map(f => f.reason));
+          reportEvent('credential_migration_incomplete', { failed: failures.length });
+        } else {
+          console.log('[Vizora] Credential migration complete');
         }
-        // Remove plaintext credentials
-        await Preferences.remove({ key: 'device_token' });
-        await Preferences.remove({ key: 'device_id' });
-        console.log('[Vizora] Credential migration complete');
       }
     } catch (error) {
       console.error('[Vizora] Credential migration failed:', error);
     }
+  }
+
+  /**
+   * Migrate ONE credential. Ordering rule: the encrypted copy is written FIRST and
+   * the plaintext copy is removed only after that write resolves — losing both
+   * copies is worse than stranding one, and a stranded plaintext key is retried by
+   * the idempotent cleanup at the top of the next boot. Each credential is its own
+   * unit so one key's failure can never strand another key's plaintext.
+   */
+  private async migrateOneCredential(key: string, value: string): Promise<void> {
+    await SecureStorage.set({ key, value });
+    await Preferences.remove({ key });
   }
 
   // ==================== HTTP ====================
@@ -902,29 +953,56 @@ class VizoraAndroidTV {
         // Overlapping poll continuations can resume after pairing already
         // succeeded (async interval callbacks are not serialized) — only the
         // first wins, otherwise the success path runs twice and churns the
-        // socket connection.
-        if (!this.pairingCode) return;
+        // socket connection. `pairingCode` alone stopped covering this once the
+        // credential persist moved AHEAD of clearing it (persist-then-commit): the
+        // success path now awaits three keystore writes before `pairingCode` goes
+        // null, and a second poll could enter that window. The latch closes it
+        // without re-introducing the brick — it is released on failure, so the next
+        // poll still retries.
+        if (!this.pairingCode || this.pairingCommitInFlight) return;
 
         if (data.status === 'paired' && typeof data.deviceToken === 'string' && data.deviceToken) {
           console.log('[Vizora] Device paired successfully!');
+
+          const deviceId = typeof data.deviceId === 'string' ? data.deviceId : this.deviceId;
+          // Tenant identity binds the cache/playlist (contract §2). Absent on
+          // the legacy backend — the load-time check degrades to grace mode.
+          const tenantId = typeof data.tenantId === 'string' && data.tenantId ? data.tenantId : null;
+
+          // PERSIST FIRST, COMMIT SECOND — the rule handleTokenRefresh documents and
+          // follows. Committing in memory first meant a keystore failure left the
+          // poller stopped, a now-dead pairing code on the glass, connectToRealtime()
+          // skipped and the token never written: bricked until a human power-cycles
+          // the screen. All THREE writes gate the commit — persisting the token but
+          // not tenant_id would silently boot the device in grace mode forever after,
+          // downgrading cross-tenant cache isolation.
+          this.pairingCommitInFlight = true;
+          try {
+            await SecureStorage.set({ key: 'device_token', value: data.deviceToken });
+            await SecureStorage.set({ key: 'device_id', value: deviceId || '' });
+            if (tenantId) {
+              await SecureStorage.set({ key: 'tenant_id', value: tenantId });
+            }
+          } catch (error) {
+            // Fail RECOVERABLE: nothing is committed and the poller is untouched, so
+            // the very next poll retries this same still-valid code, and if it does
+            // expire the 404 branch requests a fresh one. The device stays pairable.
+            console.error('[Vizora] Failed to persist pairing credentials — will retry on the next poll:', error);
+            reportEvent('pairing_persist_failed', {});
+            return;
+          } finally {
+            this.pairingCommitInFlight = false;
+          }
+
           this.pairingCode = null;
           this.stopPairingCheck();
           this.stopPairingCountdown();
           this.pairingRetryCount = 0;
 
           this.deviceToken = data.deviceToken;
-          if (typeof data.deviceId === 'string') {
-            this.deviceId = data.deviceId;
-          }
-
-          // Store credentials in encrypted storage
-          await SecureStorage.set({ key: 'device_token', value: data.deviceToken });
-          await SecureStorage.set({ key: 'device_id', value: this.deviceId || '' });
-          // Tenant identity binds the cache/playlist (contract §2). Absent on
-          // the legacy backend — the load-time check degrades to grace mode.
-          if (typeof data.tenantId === 'string' && data.tenantId) {
-            this.tenantId = data.tenantId;
-            await SecureStorage.set({ key: 'tenant_id', value: data.tenantId });
+          this.deviceId = deviceId;
+          if (tenantId) {
+            this.tenantId = tenantId;
           }
           this.cacheManager.setExpectedTenant(this.tenantId);
           setCrashReportingDevice(this.deviceId);
@@ -1098,7 +1176,7 @@ class VizoraAndroidTV {
       }
       const body = response.data;
       const payload = body?.data ?? body; // unwrap { success, data } envelope
-      this.applyPulledContent(payload);
+      await this.applyPulledContent(payload);
     } catch (error) {
       // Fail safe: a reconcile/pull failure NEVER blanks the screen — keep last-known-good.
       console.warn('[Vizora] pullContent failed — keeping last-known-good:', error);
@@ -1112,18 +1190,31 @@ class VizoraAndroidTV {
    * the CLIENT so the whole coherence model is closed end-to-end). A different playlist
    * (schedule boundary / reassignment) or a newer version applies.
    */
-  private applyPulledContent(
+  private async applyPulledContent(
     payload: { version?: string; playlist?: Playlist | null } | null | undefined,
-  ): void {
+  ): Promise<void> {
     if (!payload) return;
     const incoming = { playlistId: payload.playlist?.id ?? null, version: payload.version ?? '' };
     const current = { playlistId: this.currentContentPlaylistId, version: this.currentContentVersion };
     if (!shouldApplyContent(incoming, current)) return; // stale/duplicate → no-op, no re-flash
+    if (payload.playlist) {
+      try {
+        await this.updatePlaylist(payload.playlist);
+      } catch (error) {
+        // validatePlaylist only checks that `items` is an array, so a malformed item
+        // (e.g. a null entry) makes computePlaylistSignature throw inside updatePlaylist.
+        // The version is committed AFTER the apply for exactly this case: committing
+        // first left the device REPORTING a contentVersion it was not rendering, and
+        // the server's heartbeat-reconcile then saw agreement and never self-healed —
+        // permanent silent drift. Fail safe: keep last-known-good AND keep the old
+        // version, so the next reconcile still sees the drift and re-delivers.
+        console.warn('[Vizora] Failed to apply content — keeping last-known-good:', error);
+        reportEvent('content_apply_failed', { playlistId: incoming.playlistId });
+        return;
+      }
+    }
     this.currentContentVersion = incoming.version;
     this.currentContentPlaylistId = incoming.playlistId;
-    if (payload.playlist) {
-      this.updatePlaylist(payload.playlist);
-    }
   }
 
   // ==================== REALTIME CONNECTION ====================
@@ -1312,9 +1403,17 @@ class VizoraAndroidTV {
       // re-apply (no re-flash). A legacy push without a version falls back to
       // updatePlaylist, whose signature no-op still absorbs an identical re-send (PD-1).
       if (typeof data?.version === 'string' && data.version) {
-        this.applyPulledContent({ version: data.version, playlist });
+        void this.applyPulledContent({ version: data.version, playlist });
       } else {
-        this.updatePlaylist(playlist);
+        // Same failure handling as the versioned path above (which gets it via
+        // applyPulledContent's try). validatePlaylist only checks that `items` is an
+        // array, so a malformed item makes computePlaylistSignature throw inside
+        // updatePlaylist — bare, that was an unhandled rejection. Fail safe: keep
+        // last-known-good on the glass and report it.
+        void this.updatePlaylist(playlist).catch((error) => {
+          console.warn('[Vizora] Failed to apply content — keeping last-known-good:', error);
+          reportEvent('content_apply_failed', { playlistId: playlist.id ?? null });
+        });
       }
     });
 
@@ -1382,11 +1481,17 @@ class VizoraAndroidTV {
     const status = await this.runAuthCheck();
 
     if (status === 410) {
-      await this.purgeDeviceState(`revocation_confirmed:${source}`);
-      if (source === 'unpair_command') {
-        window.location.reload();
-      } else {
-        this.startPairing();
+      // The de-pair transition is UNCONDITIONAL. Revocation is confirmed at this point;
+      // whether the storage wipe fully succeeded or not, the one thing that must not
+      // happen is the device sitting on the revoked tenant's last frame forever.
+      try {
+        await this.purgeDeviceState(`revocation_confirmed:${source}`);
+      } finally {
+        if (source === 'unpair_command') {
+          window.location.reload();
+        } else {
+          this.startPairing();
+        }
       }
       return;
     }
@@ -1558,6 +1663,10 @@ class VizoraAndroidTV {
     this.deviceToken = null;
     this.deviceId = null;
     this.tenantId = null;
+    // Unbind the cache too. Nulling only `this.tenantId` left the cache manager still
+    // expecting the purged tenant, so its tenant-mismatch purge could not fire for
+    // whatever is paired next.
+    this.cacheManager.setExpectedTenant(null);
     setCrashReportingDevice(null);
 
     if (this.socket) {
@@ -1567,11 +1676,27 @@ class VizoraAndroidTV {
       this.socket = null;
     }
 
-    await SecureStorage.remove({ key: 'device_token' });
-    await SecureStorage.remove({ key: 'device_id' });
-    await SecureStorage.remove({ key: 'tenant_id' });
-    await Preferences.remove({ key: 'last_playlist' });
-    await this.cacheManager.clearCache();
+    // Every removal is INDEPENDENT. SecureStorage.remove genuinely rejects (the Java
+    // plugin rejects on failure and on SECURE_STORAGE_UNAVAILABLE), and as a sequential
+    // await chain the first rejection skipped every removal after it AND propagated out
+    // of purgeDeviceState — where every caller is `void this.confirmRevocation(...)`, so
+    // it became an unhandled rejection with no telemetry and no de-pair transition. A
+    // revoked device kept its credentials and froze on the revoked tenant's last frame.
+    const results = await Promise.allSettled([
+      SecureStorage.remove({ key: 'device_token' }),
+      SecureStorage.remove({ key: 'device_id' }),
+      SecureStorage.remove({ key: 'tenant_id' }),
+      Preferences.remove({ key: 'last_playlist' }),
+      this.cacheManager.clearCache(),
+    ]);
+
+    const failures = results.filter((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (failures.length > 0) {
+      // Surface, never swallow: a partial purge is a device still holding some tenant
+      // state, and the operator has to be able to see that it happened.
+      console.error('[Vizora] Device purge incomplete:', failures.map(f => f.reason));
+      reportEvent('device_purge_incomplete', { reason, failed: failures.length });
+    }
   }
 
   private showAuthDegradedBadge() {
@@ -1947,7 +2072,17 @@ class VizoraAndroidTV {
         break;
 
       case 'clear_cache':
-        await this.cacheManager.clearCache();
+        // The reload is UNCONDITIONAL. clearCache now rejects on a failed disk purge
+        // (so purgeDeviceState's telemetry is honest); here that rejection must not
+        // escape — handleCommand is invoked bare from the socket handler and from the
+        // heartbeat ack, so it would be an unhandled rejection AND would skip the
+        // restart the operator asked for. The in-memory cache is empty either way.
+        try {
+          await this.cacheManager.clearCache();
+        } catch (error) {
+          console.error('[Vizora] clear_cache purge incomplete:', error);
+          reportEvent('clear_cache_incomplete', {});
+        }
         window.location.reload();
         break;
 
@@ -2158,7 +2293,14 @@ class VizoraAndroidTV {
     else if (config.position === 'bottom-left') { overlay.style.bottom = margin + 'px'; overlay.style.left = margin + 'px'; }
     else { overlay.style.bottom = margin + 'px'; overlay.style.right = margin + 'px'; }
 
-    const size = config.size || 120;
+    // `size` is declared `number` but arrives from the server unvalidated, and it is
+    // concatenated into the label's style.cssText below — a string like
+    // "1px;background:url(https://x/)" would inject CSS declarations. Coerce to a
+    // number and clamp: anything non-numeric or out of range falls back to the default.
+    const rawSize = Number(config.size);
+    const size = Number.isFinite(rawSize) && rawSize > 0
+      ? Math.min(Math.max(Math.round(rawSize), 32), 512)
+      : 120;
     try {
       const QRCode = await import('qrcode');
       const canvas = document.createElement('canvas');
@@ -2381,6 +2523,29 @@ class VizoraAndroidTV {
       case 'webpage':
       case 'url': {
         const iframe = document.createElement('iframe');
+        // `allow-top-navigation` is DELIBERATELY excluded. This build targets old
+        // Chromium (Tizen 4 ≈ 56, webOS 4 ≈ 53), where an un-sandboxed frame can run
+        // `top.location = '…'` with no user gesture and replace the app document —
+        // socket, heartbeat, state machine and the `reload` command all gone, with no
+        // onRenderProcessGone and nothing for the Java crash handler to see. Recovery
+        // would be a manual power cycle. allow-scripts + allow-same-origin keeps
+        // ordinary signage pages (dashboards, widgets) working — most real pages
+        // break outright under an opaque origin, so dropping it is not an option on
+        // the TV platforms.
+        iframe.sandbox.add('allow-scripts');
+        // …but NOT on the plain-web platform. There, and only there, the DOCUMENT's
+        // own origin can equal a content origin — the app is served over http(s)
+        // from a host a `webpage` item can also point at. Granted allow-same-origin,
+        // such a frame is same-origin with the app document: it can reach `parent`,
+        // strip this very sandbox attribute and reload itself unsandboxed, which
+        // gives back everything S4 took away. It is also the case where
+        // transformContentUrl has already appended the device JWT (it does so for
+        // any content URL whose origin matches apiUrl). On capacitor/tizen/webos the
+        // app document is served from a local app scheme no remote URL can match, so
+        // the grant cannot produce a same-origin frame there.
+        if (detectPlatform() !== 'web') {
+          iframe.sandbox.add('allow-same-origin');
+        }
         iframe.src = contentUrl;
         iframe.allow = 'autoplay; fullscreen';
         iframe.style.cssText = 'width:100%;height:100%;border:none;';

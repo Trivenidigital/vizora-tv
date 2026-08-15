@@ -147,6 +147,50 @@ describe('tenant binding at init', () => {
     await m.init();
     expect(store.entries.size).toBe(1);
   });
+
+  it('setExpectedTenant RE-ARMS the purge — re-pairing to a new tenant in the same process purges', async () => {
+    // The purge lives inside doInit(), which init() early-returns past once
+    // initialized, so setExpectedTenant() after first use was a silent no-op for
+    // purge purposes. Reachable today: a confirmed revocation calls startPairing()
+    // WITHOUT a reload, so tenant A -> tenant B happens in one process and tenant
+    // A's IndexedDB blobs survived it.
+    store.meta = { tenantId: 'tenant-a' };
+    store.entries.set('old', {
+      contentId: 'old', blob: new Blob(['zzzz']), size: 4, mimeType: 'image/jpeg',
+      lastAccessed: Date.now(), downloadedAt: Date.now(),
+    });
+    const m = manager();
+    m.setExpectedTenant('tenant-a');
+    await m.init();
+    expect(await m.getCachedUri('old')).toBe('blob:mock-1'); // baseline: tenant-a's cache is live
+
+    m.setExpectedTenant('tenant-b'); // re-pair, same process
+
+    // Through a real public entry point, not by re-calling init() by hand.
+    expect(await m.getCachedUri('old')).toBeNull();
+    expect(store.entries.size).toBe(0);
+    expect(store.meta).toBeNull();
+  });
+
+  it('NEGATIVE CONTROL: re-setting the SAME tenant does not re-arm the purge', async () => {
+    // Proves the purge above came from the tenant CHANGING, not from
+    // setExpectedTenant blindly discarding the cache on every call.
+    store.meta = { tenantId: 'tenant-a' };
+    store.entries.set('old', {
+      contentId: 'old', blob: new Blob(['zzzz']), size: 4, mimeType: 'image/jpeg',
+      lastAccessed: Date.now(), downloadedAt: Date.now(),
+    });
+    const m = manager();
+    m.setExpectedTenant('tenant-a');
+    await m.init();
+    const getMetaSpy = vi.spyOn(store, 'getMeta');
+
+    m.setExpectedTenant('tenant-a');
+
+    expect(await m.getCachedUri('old')).toBe('blob:mock-1');
+    expect(store.entries.size).toBe(1);
+    expect(getMetaSpy).not.toHaveBeenCalled(); // doInit did not re-run
+  });
 });
 
 describe('LRU eviction', () => {
@@ -195,6 +239,22 @@ describe('clearCache', () => {
     expect(store.entries.size).toBe(0);
     expect(revoked).toContain('blob:mock-1');
     expect(m.getCacheStats().itemCount).toBe(0);
+  });
+
+  it('REJECTS when the store clear fails, but still revokes the purged tenant URLs', async () => {
+    // purgeDeviceState collects this call in a Promise.allSettled, so swallowing
+    // recorded a failed cache clear as fulfilled and `device_purge_incomplete` never
+    // fired on Tizen/webOS. Revoking first keeps the failure in the safe direction.
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const m = manager();
+    await m.downloadContent('c1', 'https://cdn/x.jpg', 'image/jpeg');
+    store.clearAll = async () => { throw new Error('idb clear failed'); };
+
+    await expect(m.clearCache()).rejects.toThrow('idb clear failed');
+
+    expect(revoked).toContain('blob:mock-1');
+    expect(m.getCacheStats().itemCount).toBe(0);
+    errorSpy.mockRestore();
   });
 });
 

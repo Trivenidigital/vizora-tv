@@ -23,11 +23,17 @@ export class AndroidCacheManager {
   private maxCacheSizeMB: number;
   private downloadingSet: Set<string> = new Set();
   private initialized = false;
+  private initPromise: Promise<void> | null = null;
   private manifestDirty = false;
   private debounceSaveTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly DEBOUNCE_INTERVAL = 60000;
 
   private expectedTenant: string | null = null;
+  /**
+   * Bumped by clearCache(). An operation that started before the bump must not
+   * write, nor hand out a URI, after it — same contract as TvCacheManager.
+   */
+  private clearGeneration = 0;
 
   constructor(maxCacheSizeMB = 500) {
     this.maxCacheSizeMB = maxCacheSizeMB;
@@ -39,12 +45,26 @@ export class AndroidCacheManager {
    * wholesale at load time, regardless of how it got here.
    */
   setExpectedTenant(tenantId: string | null): void {
+    if (tenantId === this.expectedTenant) return;
     this.expectedTenant = tenantId;
+    // Re-arm the tenant-mismatch purge. It lives inside init(), which early-returns
+    // once initialized, so re-pairing to a DIFFERENT tenant in the same process left
+    // the previous tenant's assets in place and servable.
+    this.initialized = false;
   }
 
   async init(): Promise<void> {
     if (this.initialized) return;
+    // Serialize concurrent initializers (render + preload race at boot): two callers
+    // both running loadManifest() would each overwrite this.manifest, and whichever
+    // landed second could clobber entries the first had already recorded.
+    if (!this.initPromise) {
+      this.initPromise = this.doInit().finally(() => { this.initPromise = null; });
+    }
+    return this.initPromise;
+  }
 
+  private async doInit(): Promise<void> {
     try {
       await Filesystem.mkdir({
         path: this.cacheDir,
@@ -60,7 +80,18 @@ export class AndroidCacheManager {
     if (this.manifest.tenantId && this.expectedTenant && this.manifest.tenantId !== this.expectedTenant) {
       console.warn('[AndroidCache] Cache belongs to a different tenant — clearing');
       this.initialized = true; // clearCache() re-enters via public API paths
-      await this.clearCache();
+      try {
+        await this.clearCache();
+      } catch (err) {
+        // clearCache REJECTS on a failed disk purge so purgeDeviceState's telemetry
+        // is honest — but that rejection must not escape init(): getCachedUri and
+        // downloadContent await init() OUTSIDE their try blocks, so propagating here
+        // would turn a failed disk purge into a rendering failure. The in-memory
+        // manifest is already empty (clearCache resets it before touching the
+        // filesystem), so the tenant purge has still failed closed: nothing can name
+        // the residual files.
+        console.error('[AndroidCache] Tenant purge left residue on disk (cache is empty in memory):', err);
+      }
       return;
     }
 
@@ -115,6 +146,7 @@ export class AndroidCacheManager {
     if (existing) return existing;
 
     this.downloadingSet.add(id);
+    const gen = this.clearGeneration;
 
     try {
       const ext = this.getExtension(url, mimeType);
@@ -129,6 +161,12 @@ export class AndroidCacheManager {
       if (response.status !== 200) {
         throw new Error(`HTTP ${response.status}`);
       }
+
+      // A clearCache() — i.e. the confirmed-revocation purge (purgeDeviceState §3.4) —
+      // that landed while this download was in flight must win. Writing now would
+      // re-create the directory, write the asset back and re-stamp the manifest with
+      // the tenant that was just purged.
+      if (gen !== this.clearGeneration) return null;
 
       // Write to filesystem
       await Filesystem.writeFile({
@@ -157,6 +195,10 @@ export class AndroidCacheManager {
 
       await this.saveManifest();
       await this.enforceMaxCacheSize();
+
+      // Re-check after the persist awaits: a concurrent clear wipes what we just
+      // wrote, and we must not hand out a live URI for purged content either.
+      if (gen !== this.clearGeneration) return null;
 
       // Get the URI for the cached file and convert for WebView access
       const uriResult = await Filesystem.getUri({
@@ -231,14 +273,34 @@ export class AndroidCacheManager {
     await this.saveManifest();
   }
 
+  /**
+   * Purge the cache. Two properties, both load-bearing on the confirmed-revocation
+   * path (purgeDeviceState §3.4) that is the only reason this method exists:
+   *
+   *  - The in-memory manifest is reset BEFORE the filesystem is touched, so a
+   *    failure fails in the SAFE direction — the same shape as TvCacheManager.
+   *    clearCache revoking its object URLs before its try. Resetting it AFTER the
+   *    rmdir meant a failing rmdir left the manifest populated AND still stamped
+   *    with the tenant that was just purged: the entries stayed servable, and the
+   *    surviving stamp also dodged the next init's tenant-mismatch purge. Once the
+   *    manifest is empty nothing can name the residual files, so the cache is
+   *    fail-closed even when the disk purge does not complete.
+   *  - It REJECTS on failure. purgeDeviceState collects this call in a
+   *    Promise.allSettled, so swallowing the error recorded a failed cache clear as
+   *    fulfilled and `device_purge_incomplete` never fired for it. Every caller is
+   *    rejection-safe on purpose — see doInit() below (init() is awaited by
+   *    getCachedUri/downloadContent OUTSIDE their try blocks) and
+   *    handleCommand('clear_cache') in main.ts.
+   */
   async clearCache(): Promise<void> {
+    this.clearGeneration++;
+    this.manifest = { entries: {}, version: 1 };
     try {
       await Filesystem.rmdir({
         path: this.cacheDir,
         directory: Directory.Data,
         recursive: true,
       });
-      this.manifest = { entries: {}, version: 1 };
       await Filesystem.mkdir({
         path: this.cacheDir,
         directory: Directory.Data,
@@ -248,6 +310,7 @@ export class AndroidCacheManager {
       console.log('[AndroidCache] Cache cleared');
     } catch (error) {
       console.error('[AndroidCache] Failed to clear cache:', error);
+      throw error;
     }
   }
 
