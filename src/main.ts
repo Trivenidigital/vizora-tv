@@ -1119,17 +1119,32 @@ class VizoraAndroidTV {
       this.displayPairingCode(data.code);
       this.startPairingCountdown();
 
-      // Generate/display QR code
+      // Start polling for pairing completion BEFORE the QR render, and never after it.
+      //
+      // The QR is COSMETIC — an operator can always type the code that is already on
+      // the glass — while the poll is the only functional path off this screen. Ordered
+      // the other way, the functional path sat downstream of the decorative one behind
+      // `await this.generateQRCode()`, which awaits a dynamic import('qrcode'). A
+      // REJECTING import is handled (generateQRCode catches and renders a text
+      // fallback), but an import that never SETTLES never returns, so the poll was
+      // never armed at all. That is unrecoverable rather than merely degraded: the only
+      // thing that replaces an expired code is the poll's own 404 branch, so the device
+      // sits on a pairing screen showing a dead code until someone visits it.
+      //
+      // A timeout bound on the render would only shorten that stall; it leaves the
+      // dependency in place. Ordering removes it. Safe in both directions: `pairingCode`
+      // is assigned above, so the callback's `!this.pairingCode` guard cannot fire, and
+      // startPairingCheck() clears any existing interval first, so arming earlier cannot
+      // double-arm on a re-request.
+      this.startPairingCheck();
+      this.updateStatus('connecting', 'Waiting for pairing...');
+
+      // Generate/display QR code — decorative, and deliberately last.
       if (data.qrCode) {
         this.displayQRCode(data.qrCode);
       } else {
         await this.generateQRCode(data.code);
       }
-
-      // Start polling for pairing completion
-      this.startPairingCheck();
-
-      this.updateStatus('connecting', 'Waiting for pairing...');
     } catch (error) {
       console.error('[Vizora] Pairing request failed:', error);
       // Stay on the pairing screen — status line reports the retry.
@@ -2888,7 +2903,7 @@ class VizoraAndroidTV {
    * localStorage web implementation on Tizen/webOS) fails EVERY subsequent write the
    * same way — so the loop, once started, has nothing left to stop it.
    */
-  private async rememberCommand(key: string): Promise<void> {
+  private rememberCommandLocally(key: string): boolean {
     this.seenCommandKeys.push(key);
     if (this.seenCommandKeys.length > VizoraAndroidTV.COMMAND_DEDUPE_MAX) {
       this.seenCommandKeys = this.seenCommandKeys.slice(-VizoraAndroidTV.COMMAND_DEDUPE_MAX);
@@ -2896,38 +2911,105 @@ class VizoraAndroidTV {
 
     // SYNCHRONOUS durable write FIRST, before anything asynchronous can be raced or
     // wedged. This is the write that actually terminates the replay loop: it has
-    // landed by the time this function yields, so the 2s bound below, a rejecting
-    // bridge and a reload() firing on the next turn can none of them leave the
-    // dispatch unrecorded. The Preferences write below stays — it is the copy that
-    // survives a webview storage clear — but it is no longer the only one.
-    this.writeLocalRing();
+    // landed by the time this function yields, so the 2s bound, a rejecting bridge and
+    // a reload() firing on the next turn can none of them leave the dispatch
+    // unrecorded. The Preferences write stays — it is the copy that survives a webview
+    // storage clear — but it is no longer the only one.
+    return this.writeLocalRing();
+  }
 
+  /** Persist the ring through the bridge. Never rejects; reports what it returns. */
+  private async persistCommandRing(): Promise<boolean> {
     try {
       await Preferences.set({
         key: VizoraAndroidTV.COMMAND_DEDUPE_PREF_KEY,
         value: JSON.stringify(this.seenCommandKeys),
       });
+      return true;
     } catch (error) {
       console.warn('[Vizora] Could not persist command dedupe ring:', error);
       reportEvent('command_dedupe_ring_persist_failed', { error: String(error) });
+      return false;
     }
   }
 
   /**
-   * Write the ring to localStorage. Synchronous, bridge-free, survives
-   * window.location.reload(). Reported on failure for the same reason the
-   * Preferences write is: when BOTH homes are unwritable the device has no
-   * terminator at all, and that state has to be visible to us.
+   * Record `key` and answer the only question the dispatch decision needs: did a home
+   * that SURVIVES window.location.reload() accept it?
+   *
+   * The in-memory entry is added unconditionally either way — it still suppresses a
+   * same-process replay, which is the common case and does not depend on any disk.
+   *
+   * The two homes are independent on ANDROID (native SharedPreferences vs WebView
+   * localStorage) and NOT independent on Tizen/webOS: @capacitor/preferences 6.0.4's
+   * web implementation is literally `window.localStorage` under a `CapacitorStorage.`
+   * prefix (dist/esm/web.js — `get impl() { return window.localStorage; }`). One quota
+   * failure therefore takes BOTH out on exactly the platforms where the quota failure
+   * was the motivating scenario. The sync write still closes the timing hole and the
+   * wedged-bridge hole everywhere; what it cannot do there is be a SECOND store. So the
+   * caller has to be told, rather than assuming two homes means two chances.
    */
-  private writeLocalRing(): void {
+  private async recordCommandDurably(key: string, type: string): Promise<boolean> {
+    const localAccepted = this.rememberCommandLocally(key);
+    // BOUNDED. A wedged Capacitor bridge leaves Preferences.set pending forever;
+    // without the bound the operator's command would never run at all, with `{ ok: true }`
+    // already sent and no rejection to report because the promise does not settle.
+    const persist = await Promise.race([
+      this.persistCommandRing().then((ok): 'persisted' | 'failed' => (ok ? 'persisted' : 'failed')),
+      this.timeoutAfter(VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS),
+    ]);
+    if (persist === 'timeout') {
+      console.warn(
+        `[Vizora] Dedupe ring persist did not settle in ${VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS}ms — ${type} is guarded by the local copy alone`,
+      );
+      reportEvent('command_dedupe_persist_timeout', { type });
+    }
+    return localAccepted || persist === 'persisted';
+  }
+
+  /**
+   * FAIL CLOSED, and only here: a context-destroying command whose dedupe record no
+   * durable store would accept is REFUSED rather than dispatched.
+   *
+   * The asymmetry is the whole argument. Dispatching it risks the unterminated loop —
+   * reload → ack lost → requeue → replay → reload at a ~3-5s period, a screen that
+   * never reaches content and a truck roll to fix. Refusing it leaves the device doing
+   * exactly what it was already doing, which is at worst stale, and puts the event in
+   * telemetry where we can see it. The loop is strictly worse than the refusal, so when
+   * we cannot prove we would be able to suppress the replay, we decline the command.
+   *
+   * Deliberately narrow: only when NEITHER home accepted (one is enough), and only for
+   * the context-destroying set. Every other command still runs — a replayed
+   * `clear_override` costs one wasted execution, not the device — and the normal path,
+   * where at least one store works, is untouched.
+   */
+  private refuseUndurableCommand(type: string): void {
+    console.error(`[Vizora] ${type} REFUSED — no durable store accepted its dedupe record, so a replay could not be stopped`);
+    reportEvent('command_refused_no_durable_dedupe', { type });
+  }
+
+  /**
+   * Write the ring to localStorage. Synchronous, bridge-free, survives
+   * window.location.reload(). Returns whether the write actually landed — a missing
+   * store (no localStorage at all) counts as a failure, not a success.
+   *
+   * Reported on failure for the same reason the Preferences write is: when BOTH homes
+   * are unwritable the device has no terminator at all, and that state has to be
+   * visible to us.
+   */
+  private writeLocalRing(): boolean {
     try {
-      VizoraAndroidTV.localStore()?.setItem(
+      const store = VizoraAndroidTV.localStore();
+      if (!store) return false;
+      store.setItem(
         VizoraAndroidTV.COMMAND_DEDUPE_LOCAL_KEY,
         JSON.stringify(this.seenCommandKeys),
       );
+      return true;
     } catch (error) {
       console.warn('[Vizora] Could not persist the local command dedupe ring:', error);
       reportEvent('command_dedupe_local_persist_failed', { error: String(error) });
+      return false;
     }
   }
 
@@ -2944,22 +3026,14 @@ class VizoraAndroidTV {
         reportEvent('command_duplicate_suppressed', { type: command.type });
         return;
       }
-      // BOUNDED await. The await itself is required (see rememberCommand), but an
-      // UNBOUNDED one is its own failure: a wedged Capacitor bridge leaves the
-      // persist pending forever, and the operator's reload/restart/clear_cache then
-      // never runs at all — with `{ ok: true }` already sent, a dashboard row saying
-      // delivered, and no rejection to report, because the promise does not settle.
-      // On timeout we DISPATCH ANYWAY: losing the ring entry risks one duplicate
-      // execution, losing the command loses the operator's action outright.
-      const persist = await Promise.race([
-        this.rememberCommand(dedupeKey).then(() => 'persisted' as const),
-        this.timeoutAfter(VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS),
-      ]);
-      if (persist === 'timeout') {
-        console.warn(
-          `[Vizora] Dedupe ring persist did not settle in ${VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS}ms — dispatching ${command.type} unguarded`,
-        );
-        reportEvent('command_dedupe_persist_timeout', { type: command.type });
+      // The await is required (see recordCommandDurably) and is bounded there. A
+      // timeout or a rejecting bridge is NOT by itself a reason to drop the operator's
+      // command — the synchronous local copy still guards the replay, and losing the
+      // command loses the operator's action outright. Only losing BOTH homes is.
+      const durable = await this.recordCommandDurably(dedupeKey, command.type);
+      if (!durable && VizoraAndroidTV.CONTEXT_DESTROYING_COMMANDS.has(command.type)) {
+        this.refuseUndurableCommand(command.type);
+        return; // still acked by the caller — a nack would only requeue it
       }
     } else if (VizoraAndroidTV.CONTEXT_DESTROYING_COMMANDS.has(command.type)) {
       // An unkeyable context-destroying command was the one shape this guard could not
@@ -2994,20 +3068,13 @@ class VizoraAndroidTV {
       reportEvent('command_dedupe_key_missing', { type: command.type });
 
       const synthetic = VizoraAndroidTV.syntheticUnkeyedKey(command.type, now);
-      if (synthetic !== null) {
-        // Bounded exactly like the keyed path, and dispatching anyway on timeout for
-        // the same reason: losing the record risks one duplicate execution, losing the
-        // command loses the operator's action outright.
-        const persist = await Promise.race([
-          this.rememberCommand(synthetic).then(() => 'persisted' as const),
-          this.timeoutAfter(VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS),
-        ]);
-        if (persist === 'timeout') {
-          console.warn(
-            `[Vizora] Synthetic dedupe record did not settle in ${VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS}ms — dispatching ${command.type} unguarded`,
-          );
-          reportEvent('command_dedupe_persist_timeout', { type: command.type });
-        }
+      // Same fail-closed rule as the keyed path above, for the same reason — and this
+      // path needs it more, since an unkeyable command has no exact key to fall back
+      // on. A key we could not even build counts as undurable.
+      const durable = synthetic !== null && await this.recordCommandDurably(synthetic, command.type);
+      if (!durable) {
+        this.refuseUndurableCommand(command.type);
+        return; // still acked by the caller
       }
       // Give the ack frame the same task boundary the keyed path gets from its
       // persist, so the tightest flush window does not land on exactly the case that

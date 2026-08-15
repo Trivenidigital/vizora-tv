@@ -1121,7 +1121,11 @@ describe('VizoraAndroidTV', () => {
     });
 
     it('generates QR code with dashboard URL + code', async () => {
-      await importFresh();
+      // The QR render is gated on a REAL dynamic import('qrcode') that fake timers do
+      // not drive. importFresh's DEFAULT settle budget is a fixed round count, which is
+      // a budget that shrinks exactly when the machine is loaded — so pass the
+      // predicate and let it bound on REAL elapsed time and THROW if it never holds.
+      await importFresh(() => qrToCanvasMock.mock.calls.length > 0);
       expect(qrToCanvasMock).toHaveBeenCalled();
       const url = qrToCanvasMock.mock.calls[0][1] as string;
       expect(url).toContain('/pair?code=ABCD1234');
@@ -1145,7 +1149,25 @@ describe('VizoraAndroidTV', () => {
 
     it('starts polling for pairing status', async () => {
       const { CapacitorHttp } = await import('@capacitor/core');
-      await importFresh();
+      // startPairingCheck() is sequenced AFTER `await this.generateQRCode()`
+      // (main.ts:1126-1130), which awaits a REAL dynamic import('qrcode') that fake
+      // timers do not drive. Waiting a FIXED number of rounds for that was a CI-only
+      // failure of this test: when the import settles PARTWAY THROUGH the single fixed
+      // advance below, the interval is armed with less than one full 2s period left
+      // inside the window, so no poll fires at all and the assertion reads
+      // "expected false to be true". Reproduced locally two ways — starving
+      // importFresh's round budget, and settling the QR gate at fake t=500 of the
+      // 2000ms advance.
+      //
+      // Wait for the thing that actually gates the interval, bounded on REAL elapsed
+      // time and THROWING if it never happens. The assertion itself is unchanged and
+      // just as strict: one full interval period must produce a poll.
+      await importFresh(() => domElements.get('qr-code')!.children.length > 0);
+      // Precondition asserted, not hoped for — if a refactor ever moves the gate, this
+      // fails loudly instead of going quietly vacuous.
+      expect(domElements.get('qr-code')!.children.length).toBeGreaterThan(0);
+      for (let i = 0; i < 20; i++) await Promise.resolve(); // let startPairingCheck() run
+
       (CapacitorHttp.get as Mock).mockClear();
       await vi.advanceTimersByTimeAsync(2000);
       expect((CapacitorHttp.get as Mock).mock.calls.some(c => c[0].url.includes('/pairing/status/'))).toBe(true);
@@ -2663,19 +2685,21 @@ describe('VizoraAndroidTV', () => {
     });
 
     it('displays label text below QR code', async () => {
-      // renderQrOverlay does `await import('qrcode')` which needs real timers to resolve.
-      // Use real timers briefly, then clean up leaked intervals.
+      // renderQrOverlay does `await import('qrcode')`, which fake timers do not drive.
+      // The old shape here was a FIXED 50ms real sleep plus a clear-every-timer sweep:
+      // the sleep is a budget that shrinks exactly when the machine is loaded, and
+      // uninstalling the fake clock DISCARDS every pending fake timer (see realYield).
+      // Wait for the render itself instead, bounded on REAL elapsed time and throwing
+      // if it never lands — without ever leaving the fake clock.
       await importFresh();
       triggerSocketEvent('qr-overlay:update', { qrOverlay: { enabled: true, url: 'https://e.com', label: 'Scan me!' } });
-      vi.useRealTimers();
-      await new Promise(r => setTimeout(r, 50));
-      // Clean up leaked real-timer intervals before reinstalling fake timers
-      const maxId = setTimeout(() => {}, 0) as unknown as number;
-      for (let i = 0; i <= maxId; i++) { clearInterval(i); clearTimeout(i); }
-      vi.useFakeTimers();
-      const ov = domElements.get('qr-overlay')!;
-      const labelChild = ov.children.find((c: ElementStub) => c.textContent === 'Scan me!');
-      expect(labelChild).toBeDefined();
+      const labelOf = () => domElements.get('qr-overlay')!.children
+        .find((c: ElementStub) => c.textContent === 'Scan me!');
+      // tickMs so the waiter drives BOTH real-loop work (the dynamic import) and
+      // anything fake-timer-gated on the way — a waiter that only yields to the real
+      // loop stalls forever on a fake timer, which is the mirror of the bug being fixed.
+      await waitUntil('the QR overlay label render', () => labelOf() !== undefined, { tickMs: 20 });
+      expect(labelOf()).toBeDefined();
     });
 
     it('hides overlay when enabled is false', async () => {
@@ -2696,15 +2720,14 @@ describe('VizoraAndroidTV', () => {
     });
 
     it('falls back when QRCode.toCanvas rejects', async () => {
+      // Same fixed-real-sleep shape as above, same replacement.
       await importFresh();
       qrToCanvasMock.mockRejectedValueOnce(new Error('canvas fail'));
       triggerSocketEvent('config', { qrOverlay: { enabled: true, url: 'https://e.com' } });
-      vi.useRealTimers();
-      await new Promise(r => setTimeout(r, 50));
-      const maxId = setTimeout(() => {}, 0) as unknown as number;
-      for (let i = 0; i <= maxId; i++) { clearInterval(i); clearTimeout(i); }
-      vi.useFakeTimers();
-      expect((console.error as Mock).mock.calls.some(c => String(c[0]).includes('QR code generation failed'))).toBe(true);
+      const failed = () => (console.error as Mock).mock.calls
+        .some(c => String(c[0]).includes('QR code generation failed'));
+      await waitUntil('the QR overlay failure path', failed, { tickMs: 20 });
+      expect(failed()).toBe(true);
     });
   });
 
@@ -4007,16 +4030,16 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
   it('F45: the QR fallback renders the pair URL via textContent, not interpolated innerHTML', async () => {
     secureStorageStore.clear(); // no creds → pairing flow
     qrToCanvasMock.mockReset().mockRejectedValue(new Error('qr fail'));
-    await importFresh();
-    // The QR path does a dynamic import('qrcode') — let it settle on real timers,
-    // then clear any dangling pairing intervals (mirrors the QR-overlay reject test).
-    vi.useRealTimers();
-    await new Promise(r => setTimeout(r, 50));
-    const maxId = setTimeout(() => {}, 0) as unknown as number;
-    for (let i = 0; i <= maxId; i++) { clearInterval(i); clearTimeout(i); }
-    vi.useFakeTimers();
+    // The QR path does a dynamic import('qrcode') that fake timers do not drive. This
+    // was a FIXED 50ms real sleep plus a clear-every-timer sweep — a budget that
+    // shrinks under load, and an uninstall that DISCARDS pending fake timers (see
+    // realYield). Wait for the fallback itself, bounded on REAL elapsed time and
+    // throwing if it never lands, without leaving the fake clock.
+    const fallbackOf = () => domElements.get('qr-code')!.children
+      .find(c => c.tagName === 'DIV' && c.textContent.includes('pair?code='));
+    await importFresh(() => fallbackOf() !== undefined);
     const qr = domElements.get('qr-code')!;
-    const fallback = qr.children.find(c => c.tagName === 'DIV' && c.textContent.includes('pair?code='));
+    const fallback = fallbackOf();
     expect(fallback).toBeDefined();
     expect(fallback!.textContent).toContain('ABCD1234');
     // NEGATIVE: never assembled as a raw HTML string
@@ -4625,12 +4648,15 @@ describe('Client correctness & security residuals (S1–S6)', () => {
    * timers — mirror the real-timer dance the existing QR tests use.
    */
   const renderQrAndSettle = async (qrOverlay: Record<string, unknown>) => {
+    // The overlay render awaits a REAL dynamic import('qrcode') that fake timers do not
+    // drive. This was a FIXED 50ms real sleep plus a clear-every-timer sweep — a budget
+    // that shrinks exactly when the machine is loaded, and an uninstall that DISCARDS
+    // every pending fake timer (see realYield). Wait for the render to actually reach
+    // toCanvas, bounded on REAL elapsed time, and never leave the fake clock. Counted
+    // from a BEFORE snapshot so repeat calls in one test cannot see the previous render.
+    const before = qrToCanvasMock.mock.calls.length;
     triggerSocketEvent('qr-overlay:update', { qrOverlay });
-    vi.useRealTimers();
-    await new Promise(r => setTimeout(r, 50));
-    const maxId = setTimeout(() => {}, 0) as unknown as number;
-    for (let i = 0; i <= maxId; i++) { clearInterval(i); clearTimeout(i); }
-    vi.useFakeTimers();
+    await waitUntil('the QR overlay render', () => qrToCanvasMock.mock.calls.length > before, { tickMs: 20 });
   };
 
   const lastQrWidth = () =>
@@ -6649,31 +6675,51 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     expect(await reportedEvents()).toContain('command_duplicate_suppressed');
   });
 
-  it('B1 NEGATIVE CONTROL: with BOTH stores dead the replay executes — and says so', async () => {
-    // Proves the suppression above comes from the durable write and not from the
-    // replay never being delivered. Also pins the fail-OPEN direction: an unreadable
-    // ring must never refuse to boot or refuse the operator's command.
+  it('B1 NEGATIVE CONTROL: with BOTH stores dead the command is REFUSED, not looped', async () => {
+    // Two properties, and the second CHANGED when the fail-closed rule landed.
+    //
+    // (1) The control, unchanged: B1's suppression really does come from the durable
+    //     write. With both stores dead nothing is recorded, so nothing here could be
+    //     producing that suppression.
+    // (2) The consequence. This used to assert that the replay EXECUTED — "the loop,
+    //     unterminated" — because that was the behaviour, and it was written when the
+    //     two homes were believed independent. They are not on Tizen/webOS:
+    //     @capacitor/preferences 6.0.4's web implementation IS window.localStorage
+    //     (dist/esm/web.js, `get impl()`), so ONE QuotaExceededError produces exactly
+    //     this both-dead state on the platform where quota failure is the motivating
+    //     scenario. Dispatching into it is the unterminated reload loop with no
+    //     terminator anywhere — a screen that never reaches content and a truck roll.
+    //     The device now declines the command: recoverable, and visible in telemetry.
     await connectAndCommit();
     await breakRingPreferences(() => Promise.reject(new Error('QuotaExceededError')));
     localStorageThrowOn.setItem = true;
     localStorageThrowOn.getItem = true;
 
-    triggerSocketEvent('command', { type: 'reload', timestamp: 'b1-none' }, vi.fn());
+    const ack = vi.fn();
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'b1-none' }, ack);
     await vi.advanceTimersByTimeAsync(50);
-    expect(window.location.reload).toHaveBeenCalledTimes(1);
-    expect(await reportedEvents()).toContain('command_dedupe_local_persist_failed');
 
+    expect(window.location.reload).not.toHaveBeenCalled();
+    // Still acked — a nack would only requeue the delivery we just declined.
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+    expect(await reportedEvents()).toContain('command_dedupe_local_persist_failed');
+    expect(await reportedEvents()).toContain('command_refused_no_durable_dedupe');
+    // The control property itself: neither store took anything.
+    expect(localStorageStore.has(LOCAL_RING_KEY)).toBe(false);
+    expect(preferencesStore.has('seen_command_keys')).toBe(false);
+
+    // And a device in this state must still BOOT — failing closed on a command must
+    // never become failing closed on startup (the fail-OPEN direction the original
+    // test pinned, kept).
     currentMockSocket = createMockSocket();
     ioFactory.mockReturnValue(currentMockSocket);
     await importFresh();
-    (window.location.reload as Mock).mockClear();
     currentMockSocket.connected = true;
     triggerSocketEvent('connect');
-
     triggerSocketEvent('command', { type: 'reload', timestamp: 'b1-none' }, vi.fn());
     await vi.advanceTimersByTimeAsync(50);
 
-    expect(window.location.reload).toHaveBeenCalledTimes(1); // the loop, unterminated
+    expect(window.location.reload).not.toHaveBeenCalled();
     expect(await reportedEvents()).toContain('command_dedupe_ring_load_failed');
   });
 
@@ -7414,6 +7460,222 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     const imgs = findCreatedElements('img');
     expect(imgs.length).toBeGreaterThan(0);
     expect(imgs[imgs.length - 1].src).toContain('token=tok-123');
+  });
+
+  // ======================================================================
+  // D1. THE TWO RING HOMES ARE ONE STORE ON TIZEN/webOS — FAIL CLOSED THERE
+  // ======================================================================
+  //
+  // The durability argument for B1 assumed two independent homes. That holds on
+  // Android (native SharedPreferences vs WebView localStorage) and does NOT hold on
+  // Tizen/webOS, where Capacitor falls through to web implementations and
+  // @capacitor/preferences 6.0.4's is literally window.localStorage under a
+  // `CapacitorStorage.` prefix (node_modules/@capacitor/preferences/dist/esm/web.js —
+  // `get impl() { return window.localStorage; }`). One QuotaExceededError takes out
+  // both writes at once, on exactly the platform where that failure was the motivating
+  // scenario, leaving a context-destroying command with no terminator at all.
+  //
+  // So for that set only, and only when NEITHER home accepted, the command is refused.
+  // Dispatching risks an unterminated reload loop (a screen that never reaches content,
+  // a truck roll); refusing leaves the device doing what it was already doing and puts
+  // the event in telemetry. The loop is strictly worse.
+
+  /** Kill BOTH durable homes — the single-store quota failure, as seen on TV. */
+  const killBothRingStores = async () => {
+    await breakRingPreferences(() => Promise.reject(new Error('QuotaExceededError')));
+    localStorageThrowOn.setItem = true;
+  };
+
+  it('D1: with NEITHER home accepting, a context-destroying command is refused and reported', async () => {
+    await connectAndCommit();
+    await killBothRingStores();
+    const ack = vi.fn();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'd1' }, ack);
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).not.toHaveBeenCalled();
+    expect(ack).toHaveBeenCalledWith({ ok: true }); // never a nack, per the ack contract
+    const refused = (await reportedEventCalls()).find(c => c[0] === 'command_refused_no_durable_dedupe');
+    expect(refused).toBeDefined();
+    expect((refused![1] as { type?: string }).type).toBe('reload');
+  });
+
+  it('D1: the UNKEYABLE context-destroying command is refused on the same rule', async () => {
+    // This path needs it more than the keyed one: with no timestamp there is no exact
+    // key to fall back on, so an undurable synthetic record leaves nothing at all.
+    await connectAndCommit();
+    await killBothRingStores();
+    const ack = vi.fn();
+
+    triggerSocketEvent('command', { type: 'clear_cache' }, ack); // no timestamp
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).not.toHaveBeenCalled();
+    expect(mockCacheManager.clearCache).not.toHaveBeenCalled();
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+    expect(await reportedEvents()).toContain('command_refused_no_durable_dedupe');
+  });
+
+  it('D1 THE OTHER DIRECTION: with EITHER home working the command still executes', async () => {
+    // One home is enough — the rule must be "neither accepted", never "one failed", or
+    // every device with a busy bridge stops taking reloads.
+    await connectAndCommit();
+
+    // (a) Preferences dead, localStorage alive.
+    await breakRingPreferences(() => Promise.reject(new Error('QuotaExceededError')));
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'd1-local-only' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(localRing()).toContain('reload@d1-local-only');
+
+    // (b) localStorage dead, Preferences alive.
+    const { Preferences } = await import('@capacitor/preferences');
+    (Preferences.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+      preferencesStore.set(key, value);
+    });
+    localStorageThrowOn.setItem = true;
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'd1-prefs-only' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(2);
+    expect(preferencesStore.get('seen_command_keys')).toContain('reload@d1-prefs-only');
+
+    expect(await reportedEvents()).not.toContain('command_refused_no_durable_dedupe');
+  });
+
+  it('D1 NEGATIVE CONTROL: a HARMLESS command is unaffected when both stores are dead', async () => {
+    // The refusal is scoped to the context-destroying set. A replayed `clear_override`
+    // or `reboot` costs one wasted execution, not the device, so declining those would
+    // be pure loss — the operator's command dropped for no safety gain.
+    await connectAndCommit();
+    await killBothRingStores();
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    const ack = vi.fn();
+
+    triggerSocketEvent('command', { type: 'reboot', timestamp: 'd1-harmless' }, ack);
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(await reportedEvents()).toContain('command_unsupported'); // it RAN
+    expect(await reportedEvents()).not.toContain('command_refused_no_durable_dedupe');
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+  });
+
+  it('D1: the IN-MEMORY ring still suppresses a same-process replay while both stores are dead', async () => {
+    // The degraded state must not also lose the common case. The disk write is what a
+    // replay ACROSS a reload needs; a replay within this process is covered by the
+    // in-memory entry, which is added whether or not any store accepted it.
+    await connectAndCommit();
+    await killBothRingStores();
+
+    // A harmless command, so the first delivery genuinely executes and is recorded.
+    triggerSocketEvent('command', { type: 'reboot', timestamp: 'd1-mem' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect((await reportedEventCalls()).filter(c => c[0] === 'command_unsupported')).toHaveLength(1);
+
+    triggerSocketEvent('command', { type: 'reboot', timestamp: 'd1-mem' }, vi.fn()); // replay
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect((await reportedEventCalls()).filter(c => c[0] === 'command_unsupported')).toHaveLength(1);
+    expect(await reportedEvents()).toContain('command_duplicate_suppressed');
+  });
+
+  // ======================================================================
+  // P1. THE PAIRING POLL IS NOT DOWNSTREAM OF THE COSMETIC QR RENDER
+  // ======================================================================
+  //
+  // startPairingCheck() used to be sequenced AFTER `await this.generateQRCode()`, which
+  // awaits a dynamic import('qrcode'). A REJECTING import was always survivable —
+  // generateQRCode catches it and renders a text fallback — but an import that never
+  // SETTLES never returns, and the poll was then never armed. That is not a degraded
+  // screen, it is a dead one: the ONLY thing that replaces an expired pairing code is
+  // the poll's own 404 branch (main.ts:1245-1248), so the device sits showing a code
+  // nobody can use until a human visits it. A decorative render must not gate the one
+  // functional path off the pairing screen.
+
+  /** Did the device actually poll the pairing-status endpoint? */
+  const polledStatus = async () => {
+    const { CapacitorHttp } = await import('@capacitor/core');
+    return (CapacitorHttp.get as Mock).mock.calls.some(
+      (c: unknown[]) => (c[0] as { url: string }).url.includes('/pairing/status/'),
+    );
+  };
+
+  it('P1: a QR render that NEVER settles still leaves the pairing poll running', async () => {
+    // The hang case, driven through the real seam: the render parks forever inside the
+    // awaited cosmetic step. Before the reorder this armed nothing at all.
+    secureStorageStore.clear(); // no credentials → pairing flow
+    qrToCanvasMock.mockReset().mockImplementation(() => new Promise<void>(() => {}));
+    const { CapacitorHttp } = await import('@capacitor/core');
+
+    await importFresh(() => domElements.get('pairing-code')!.textContent === 'ABCD1234');
+    (CapacitorHttp.get as Mock).mockClear();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(await polledStatus()).toBe(true);
+  });
+
+  it('P1: a REJECTING QR render also leaves the poll running (pinning the existing catch)', async () => {
+    // generateQRCode's own try/catch always made the reject case SURVIVABLE
+    // (main.ts:1212-1221) — but survivable is not the same as prompt: under the old
+    // ordering the poll was still armed only after the dynamic import settled, which
+    // this window catches (the ordering mutation turns this test red too). What is
+    // pinned here is that neither QR outcome delays the functional path at all.
+    secureStorageStore.clear();
+    qrToCanvasMock.mockReset().mockRejectedValue(new Error('qr fail'));
+    const { CapacitorHttp } = await import('@capacitor/core');
+
+    await importFresh(() => domElements.get('pairing-code')!.textContent === 'ABCD1234');
+    (CapacitorHttp.get as Mock).mockClear();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(await polledStatus()).toBe(true);
+  });
+
+  it('P1 NEGATIVE CONTROL: a healthy QR render polls too, and renders the QR', async () => {
+    // Same seam, working render. Proves the two assertions above belong to the ordering
+    // and not to the poll being unconditional in some way that would also survive the
+    // render being broken outright — and that the reorder did not cost us the QR.
+    secureStorageStore.clear();
+    const { CapacitorHttp } = await import('@capacitor/core');
+
+    await importFresh(() => qrToCanvasMock.mock.calls.length > 0);
+    expect(qrToCanvasMock.mock.calls[0][1] as string).toContain('/pair?code=ABCD1234');
+    (CapacitorHttp.get as Mock).mockClear();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(await polledStatus()).toBe(true);
+  });
+
+  it('P1: an EXPIRED code self-heals — the 404 branch requests a fresh one', async () => {
+    // This is the property that makes the ordering fix worth having: with polling armed,
+    // an expired code is replaced. Without it the device is stuck forever, which is why
+    // a hung render was unrecoverable rather than cosmetic.
+    secureStorageStore.clear();
+    let requests = 0;
+    httpPostHandler = () => {
+      requests++;
+      return {
+        status: 200,
+        data: { data: { code: requests === 1 ? 'ABCD1234' : 'WXYZ9999', deviceId: 'dev-1', expiresInSeconds: 300 } },
+      };
+    };
+    await importFresh(() => domElements.get('pairing-code')!.textContent === 'ABCD1234');
+    expect(requests).toBe(1);
+
+    // The server now says the code is gone.
+    httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
+      ? { status: 404, data: {} }
+      : { status: 200, data: { data: { status: 'pending' } } };
+
+    await waitUntil(
+      'the re-requested pairing code',
+      () => domElements.get('pairing-code')!.textContent === 'WXYZ9999',
+      { tickMs: 2000 },
+    );
+
+    expect(requests).toBeGreaterThan(1);
+    expect(domElements.get('pairing-code')!.textContent).toBe('WXYZ9999');
   });
 
   // ======================================================================
