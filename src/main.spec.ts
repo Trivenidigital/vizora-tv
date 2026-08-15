@@ -4,7 +4,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature, shouldApplyContent, parseCrashLoopMarker } from './utils';
-import { scrubUrl } from './crash-reporting';
+import { scrubUrl, scrubBreadcrumb, scrubEvent, crashReportingOptions } from './crash-reporting';
 
 describe('scrubUrl (F51 — Sentry credential scrubbing)', () => {
   it('strips a token query param entirely', () => {
@@ -36,6 +36,100 @@ describe('scrubUrl (F51 — Sentry credential scrubbing)', () => {
 
   it('handles empty input', () => {
     expect(scrubUrl('')).toBe('');
+  });
+});
+
+// ============================================================================
+// S2: the Sentry scrubbers cover free TEXT, not only structured URL fields
+// ============================================================================
+//
+// Bound to crashReportingOptions() — the object initCrashReporting() actually hands
+// to Sentry.init — rather than to the exported functions on their own. A test that
+// imports `scrubEvent` and exercises it proves a function works; it does not prove
+// that function is the one installed. `import.meta.env.VITE_SENTRY_DSN` is replaced
+// at build time, so a test cannot make Sentry.init run at all; the factory is the
+// construction site the assertion can still reach.
+
+describe('Sentry scrubbing (S2 — free-text paths)', () => {
+  const opts = crashReportingOptions('https://key@o0.ingest.sentry.io/1');
+  const TOKENED = 'https://api.vizora.io/dev-content/9/file?token=eyJhbGciOi.SECRET.sig';
+
+  it('installs the scrubbers on the options handed to Sentry.init', () => {
+    expect(typeof opts.beforeBreadcrumb).toBe('function');
+    expect(typeof opts.beforeSend).toBe('function');
+    expect(opts.beforeBreadcrumb).toBe(scrubBreadcrumb);
+    expect(opts.beforeSend).toBe(scrubEvent);
+  });
+
+  it('scrubs breadcrumb.message — where the console integration puts a logged URL', () => {
+    // Sentry's default integrations capture console output verbatim. This client logs
+    // asset URLs through console.warn/console.error on failure paths, so a single
+    // `console.error('… ' + urlWithToken)` shipped the device JWT while the structured
+    // data.url beside it was spotless.
+    const out = opts.beforeBreadcrumb!(
+      { category: 'console', level: 'error', message: `[Vizora] Content failed: ${TOKENED}` },
+      {},
+    );
+    expect(out!.message).not.toContain('SECRET');
+    expect(out!.message).toContain('/dev-content/9/file'); // still diagnosable
+  });
+
+  it('scrubs event.message — the payload of every reportEvent/captureMessage', () => {
+    const out = opts.beforeSend!(
+      { message: `pullContent failed for ${TOKENED}` } as Parameters<NonNullable<typeof opts.beforeSend>>[0],
+      {},
+    ) as { message: string };
+    expect(out.message).not.toContain('SECRET');
+  });
+
+  it('scrubs event.exception.values[].value — where a thrown Error puts the URL', () => {
+    const out = opts.beforeSend!(
+      {
+        exception: {
+          values: [
+            { type: 'TypeError', value: `Failed to fetch ${TOKENED}` },
+            { type: 'Error', value: `retry of ${TOKENED} failed` },
+          ],
+        },
+      } as Parameters<NonNullable<typeof opts.beforeSend>>[0],
+      {},
+    ) as { exception: { values: Array<{ value: string }> } };
+    for (const v of out.exception.values) {
+      expect(v.value).not.toContain('SECRET');
+    }
+  });
+
+  it('still scrubs the structured fields it always covered', () => {
+    const bc = opts.beforeBreadcrumb!(
+      { category: 'navigation', data: { url: TOKENED, to: TOKENED, from: TOKENED } },
+      {},
+    );
+    const data = bc!.data as Record<string, string>;
+    expect(`${data.url}${data.to}${data.from}`).not.toContain('SECRET');
+
+    const ev = opts.beforeSend!(
+      {
+        request: { url: TOKENED, headers: { Authorization: 'Bearer eyJ.SECRET.sig', 'X-Trace': 'keep-me' } },
+      } as Parameters<NonNullable<typeof opts.beforeSend>>[0],
+      {},
+    ) as { request: { url: string; headers: Record<string, string> } };
+    expect(ev.request.url).not.toContain('SECRET');
+    expect(ev.request.headers.Authorization).toBe('REDACTED');
+    expect(ev.request.headers['X-Trace']).toBe('keep-me');
+  });
+
+  it('NEGATIVE CONTROL: token-free text is passed through unchanged', () => {
+    // Proves the scrubbers are not just blanking every string they are handed —
+    // an event body that has been emptied is as useless as one that leaked.
+    const msg = '[Vizora] playback_holding reason=no_renderable_content playlistId=pl-7';
+    const bc = opts.beforeBreadcrumb!({ category: 'console', message: msg }, {});
+    expect(bc!.message).toBe(msg);
+    const ev = opts.beforeSend!(
+      { message: msg, exception: { values: [{ value: 'boom, no url here' }] } } as Parameters<NonNullable<typeof opts.beforeSend>>[0],
+      {},
+    ) as { message: string; exception: { values: Array<{ value: string }> } };
+    expect(ev.message).toBe(msg);
+    expect(ev.exception.values[0].value).toBe('boom, no url here');
   });
 });
 

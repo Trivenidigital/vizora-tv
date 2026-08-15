@@ -80,6 +80,17 @@ export class ScreenStateMachine {
       console.warn(`[ScreenState] REFUSED ${this.current} -> playing (${reason}): no renderable playlist`);
       return false;
     }
+    // HOLDING was the one unguarded transition, and PAIRING is the one state it must
+    // not be able to overwrite. A stale advance() continuation resuming after a
+    // revocation has already called startPairing() fires enterHolding('no_playlist')
+    // and replaces a live pairing code with "Waiting for content…" — for up to the
+    // five minutes until the code expires and a new one is requested. There is
+    // nothing to hold FOR while unpaired: pairing is the terminal screen until
+    // credentials exist, and canPair() already refuses the reverse direction.
+    if (to === 'holding' && this.current === 'pairing') {
+      console.warn(`[ScreenState] REFUSED pairing -> holding (${reason}): a pairing code owns the screen`);
+      return false;
+    }
 
     const rec: TransitionRecord = { from: this.current, to, reason, at: Date.now() };
     this.current = to;

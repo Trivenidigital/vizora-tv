@@ -107,14 +107,54 @@ describe('ScreenStateMachine', () => {
 
   it('records transitions and notifies the observer', () => {
     const seen: TransitionRecord[] = [];
+    // Uses boot→holding→playing rather than boot→pairing→holding: the pair chosen
+    // here is incidental to what this test asserts (that transitions are recorded and
+    // observed), and pairing→holding is now a REFUSED transition — see the guard test
+    // below. No assertion is weakened; a two-hop unguarded path is still exercised.
     const m = new ScreenStateMachine(guards(true, true), rec => seen.push(rec));
-    m.transition('pairing', 'r1');
-    m.transition('holding', 'r2');
+    m.transition('holding', 'r1');
+    m.transition('playing', 'r2');
     expect(seen.map(r => `${r.from}>${r.to}:${r.reason}`)).toEqual([
-      'boot>pairing:r1',
-      'pairing>holding:r2',
+      'boot>holding:r1',
+      'holding>playing:r2',
     ]);
     expect(m.transitions.length).toBe(2);
+  });
+
+  // -------- C6: HOLDING must not be able to replace a live pairing code --------
+
+  it('C6: REFUSES pairing -> holding — a pairing code is not replaced by "Waiting for content…"', () => {
+    // A stale advance() continuation resuming after a revocation has already called
+    // startPairing() fires enterHolding('no_playlist'). Unguarded, that swapped a live
+    // pairing code for the holding screen for up to the five minutes until the code
+    // expired — on a device an installer is standing in front of.
+    const seen: TransitionRecord[] = [];
+    const m = new ScreenStateMachine(guards(true, true), rec => seen.push(rec));
+    m.transition('pairing', 'pairing_requested');
+    seen.length = 0;
+
+    expect(m.transition('holding', 'no_playlist')).toBe(false);
+
+    expect(m.state).toBe('pairing');
+    expect(visible()).toEqual(['pairing-screen']);
+    expect(seen).toEqual([]);          // refused transitions are not recorded
+    expect(m.transitions.length).toBe(1); // …only the pairing hop
+  });
+
+  it('C6 NEGATIVE CONTROL: holding is still reachable from every other state', () => {
+    // Same layer. Proves the guard is scoped to the pairing screen and did not turn
+    // the never-black terminal into an unreachable state.
+    for (const from of ['boot', 'playing', 'recovering'] as const) {
+      screens = new Map(
+        ['loading-screen', 'pairing-screen', 'content-screen', 'holding-screen', 'error-screen']
+          .map(id => [id, makeScreen(id)]),
+      );
+      const m = new ScreenStateMachine(guards(true, true));
+      if (from !== 'boot') expect(m.transition(from, 'setup')).toBe(true);
+      expect(m.transition('holding', 'no_playlist')).toBe(true);
+      expect(m.state).toBe('holding');
+      expect(visible()).toEqual(['holding-screen']);
+    }
   });
 
   it('refused transitions are not recorded and do not notify', () => {

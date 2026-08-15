@@ -181,8 +181,41 @@ function resetDOM() {
   });
 }
 
+// ======================== localStorage FAKE ========================
+//
+// The command-dedupe ring's SYNCHRONOUS durable half lives here (B1). Real on the
+// TV runtimes and inside the Android WebView alike, so the suite models it rather
+// than leaving `window.localStorage` undefined — which would silently disable the
+// terminator under test.
+let localStorageStore: Map<string, string>;
+/** Set to make the corresponding localStorage operation throw (QuotaExceededError). */
+let localStorageThrowOn: { getItem?: boolean; setItem?: boolean };
+
+function resetLocalStorage() {
+  localStorageStore = new Map();
+  localStorageThrowOn = {};
+}
+resetLocalStorage();
+
+const localStorageFake = {
+  getItem: (key: string) => {
+    if (localStorageThrowOn.getItem) throw new Error('QuotaExceededError');
+    return localStorageStore.has(key) ? localStorageStore.get(key)! : null;
+  },
+  setItem: (key: string, value: string) => {
+    if (localStorageThrowOn.setItem) throw new Error('QuotaExceededError');
+    localStorageStore.set(key, value);
+  },
+  removeItem: (key: string) => { localStorageStore.delete(key); },
+};
+
 vi.stubGlobal('window', {
-  location: { search: '', reload: vi.fn() },
+  // href/origin are what src/main.ts resolves a content frame's URL against (B2).
+  // The Capacitor build's app document really is served from https://localhost —
+  // capacitor.config.ts sets androidScheme: 'https' with no hostname — so that is
+  // the origin the suite has to model.
+  location: { search: '', reload: vi.fn(), href: 'https://localhost/', origin: 'https://localhost' },
+  localStorage: localStorageFake,
   screen: { width: 1920, height: 1080, colorDepth: 24 },
   devicePixelRatio: 1,
   // Native Capacitor bridge marker: platform detection (src/platform.ts) must
@@ -230,6 +263,7 @@ let networkConnected: boolean;
 function resetCapacitorFakes() {
   preferencesStore = new Map();
   secureStorageStore = new Map();
+  resetLocalStorage();
   preferencesFailNext = false;
   networkListeners = new Map();
   appListeners = new Map();
@@ -289,6 +323,10 @@ vi.mock('./crash-reporting', () => ({
   initCrashReporting: vi.fn(),
   setCrashReportingDevice: vi.fn(),
   reportEvent: vi.fn(),
+  // Default TRUE: the baseline for the suite is a build whose telemetry works, so a
+  // test that does not care about the DSN gets the reporting-enabled behaviour.
+  // The tests that DO care (S5) drive it to false explicitly.
+  isCrashReportingEnabled: vi.fn(() => true),
 }));
 
 vi.mock('@capacitor/core', () => ({
@@ -413,17 +451,92 @@ function triggerAppStateChange(isActive: boolean) {
   (appListeners.get('appStateChange') || []).forEach(cb => cb({ isActive }));
 }
 
-async function importFresh() {
+// The REAL event-loop primitives and the REAL clock, captured before any test can
+// install fake timers. vi.useFakeTimers() replaces the globals; these references
+// keep working and are how a waiter reaches the real loop without uninstalling it.
+const realSetImmediate: typeof setImmediate = setImmediate;
+const realDateNow: () => number = Date.now.bind(Date);
+
+/**
+ * Give the REAL event loop one full turn, WITHOUT touching the fake clock.
+ *
+ * Why this is needed at all: main.ts does `await import('qrcode')` on the pairing
+ * path. That import settles on the real event loop, which fake timers do not drive.
+ * A waiter built only from `await Promise.resolve()` chains and
+ * advanceTimersByTimeAsync never lets the loop run at all — microtasks are drained
+ * to completion before control returns to it — so the import can still be pending
+ * when a fixed-count waiter gives up. That is the ~16% full-suite failure this file
+ * used to show under worker-parallel load: the resolution simply takes longer when
+ * the machine is busy, and the waiter's budget did not grow with it.
+ *
+ * Why NOT the vi.useRealTimers() dance renderQrAndSettle uses: uninstalling the fake
+ * clock DISCARDS every fake timer the app has pending — the 2s pairing poll, the
+ * countdown, the playback timer. That is tolerable inside renderQrAndSettle's narrow
+ * window and fatal in a general-purpose waiter. setImmediate runs in the check phase,
+ * i.e. after the poll phase has run I/O callbacks, so awaiting it yields a complete
+ * loop turn while the fake clock stays installed.
+ *
+ * Returns the REAL milliseconds spent so callers can bound on elapsed time rather
+ * than on a round count — a fixed count is a budget that shrinks exactly when the
+ * machine is loaded.
+ */
+async function realYield(): Promise<number> {
+  const t0 = realDateNow();
+  await new Promise<void>(resolve => { realSetImmediate(resolve); });
+  return Math.max(realDateNow() - t0, 1);
+}
+
+/**
+ * Advance the app until `settled()` holds, or FAIL saying so.
+ *
+ * The failure mode this replaces: a helper that returns silently when its rounds
+ * elapse, so the test carries on and blows up somewhere downstream on
+ * `expected undefined to be 'tok-new'` — a message that says nothing about pairing
+ * never having settled.
+ *
+ * `budgetMs` is REAL time; `tickMs` is how much FAKE time each round advances (the
+ * app's own intervals — the 2s pairing poll, the 15s heartbeat — only run on the
+ * fake clock).
+ */
+async function waitUntil(
+  label: string,
+  settled: () => boolean,
+  opts: { budgetMs?: number; tickMs?: number } = {},
+): Promise<void> {
+  const budgetMs = opts.budgetMs ?? 5000;
+  const tickMs = opts.tickMs ?? 0;
+  let elapsed = 0;
+  while (elapsed < budgetMs) {
+    if (settled()) return;
+    if (tickMs > 0) await vi.advanceTimersByTimeAsync(tickMs);
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+    elapsed += await realYield();
+  }
+  if (settled()) return;
+  throw new Error(`waitUntil(${label}) never settled within ${budgetMs}ms of real time`);
+}
+
+/**
+ * Import main.ts fresh and let its async init() settle.
+ *
+ * We can't use runAllTimersAsync (infinite loop from recurring timers). The init
+ * chain is loadConfig -> loadSeenCommands -> setupCapacitor -> reportCrashLoopMarker
+ * -> migrateCredentials -> startPairing/connectToRealtime, each await needing a
+ * turn — so alternate microtask flushes, fake-time advances and REAL-loop yields
+ * (see realYield). Pass `settled` when the test depends on a specific post-init
+ * state; it is asserted rather than hoped for.
+ */
+async function importFresh(settled?: () => boolean) {
   vi.resetModules();
   await import('./main');
-  // Let async init() settle — flush microtasks aggressively then advance time.
-  // We can't use runAllTimersAsync (infinite loop from recurring timers).
-  // The init chain: loadConfig -> setupCapacitor -> migrateCredentials ->
-  // startPairing/connectToRealtime -> various awaits. Each await needs a microtask turn.
-  // Use alternating timer advances and microtask flushes.
-  for (let round = 0; round < 5; round++) {
+  let elapsed = 0;
+  for (let round = 0; round < 5 || (settled && !settled() && elapsed < 5000); round++) {
     for (let i = 0; i < 20; i++) await Promise.resolve();
     await vi.advanceTimersByTimeAsync(20);
+    elapsed += await realYield();
+  }
+  if (settled && !settled()) {
+    throw new Error('importFresh: init never reached the expected state within 5000ms of real time');
   }
 }
 
@@ -707,6 +820,71 @@ describe('VizoraAndroidTV', () => {
       await importFresh();
 
       expect(preferencesStore.has('crash_loop_capped')).toBe(false);
+    });
+
+    // -------- S5: the marker is only destroyed once it has actually been reported --------
+
+    it('S5: KEEPS the marker when crash reporting is disabled — nothing was reported', async () => {
+      // reportEvent is a total no-op in a build with no VITE_SENTRY_DSN, which is
+      // every build made from this repo today. The marker is a once-ever breadcrumb
+      // written by a process that was dying; deleting it on the strength of a call
+      // that sent nothing destroys the only record the device ever crash-looped.
+      const { isCrashReportingEnabled } = await import('./crash-reporting');
+      (isCrashReportingEnabled as Mock).mockReturnValue(false);
+      preferencesStore.set('crash_loop_capped', '1700000000000:4:uncaught_exception');
+
+      await importFresh();
+
+      expect(preferencesStore.get('crash_loop_capped')).toBe('1700000000000:4:uncaught_exception');
+      (isCrashReportingEnabled as Mock).mockReturnValue(true);
+    });
+
+    it('S5 NEGATIVE CONTROL: with reporting disabled the marker is still READ and surfaced', async () => {
+      // Same seam, same boot. Proves the keep is a deferred delete and not the whole
+      // marker path going dark — the console line is the only channel left, so it has
+      // to still be produced.
+      const { isCrashReportingEnabled } = await import('./crash-reporting');
+      (isCrashReportingEnabled as Mock).mockReturnValue(false);
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      preferencesStore.set('crash_loop_capped', '1700000000000:4:uncaught_exception');
+
+      await importFresh();
+
+      expect(warnSpy.mock.calls.some(c => String(c[0]).includes('Recovered from a native crash loop'))).toBe(true);
+      expect(warnSpy.mock.calls.some(c => String(c[0]).includes('Keeping the crash-loop marker'))).toBe(true);
+      (isCrashReportingEnabled as Mock).mockReturnValue(true);
+    });
+
+    // -------- S6: the log line follows the reason the native side wrote --------
+
+    it('S6: a renderer_recovery_storm is NOT described as the slow restart rung', async () => {
+      // The device kept recovering; no restart delay changed. Telling an operator it
+      // "degraded to the slow restart rung" describes a different incident.
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      preferencesStore.set('crash_loop_capped', '1700000000000:6:renderer_recovery_storm');
+
+      await importFresh();
+
+      const line = warnSpy.mock.calls
+        .map(c => String(c[0]))
+        .find(m => m.includes('Recovered from a native crash loop'));
+      expect(line).toBeDefined();
+      expect(line).toContain('renderer was dying and being recovered repeatedly');
+      expect(line).not.toContain('slow restart rung');
+    });
+
+    it('S6 NEGATIVE CONTROL: an uncaught_exception marker still says slow restart rung', async () => {
+      // Same layer. Proves the wording FOLLOWS the reason rather than having been
+      // globally reworded — the restart-ladder cap is a real thing this must still say.
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      preferencesStore.set('crash_loop_capped', '1700000000000:4:uncaught_exception');
+
+      await importFresh();
+
+      const line = warnSpy.mock.calls
+        .map(c => String(c[0]))
+        .find(m => m.includes('Recovered from a native crash loop'));
+      expect(line).toContain('slow restart rung');
     });
 
     it('reports nothing on a device that never crash-looped', async () => {
@@ -3632,17 +3810,104 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
     expect(await reportedEvents()).toContain('tenant_unsuspended');
   });
 
-  it('F41: tenant:suspended then a reconnect (no resumed event) clears the latch on connect', async () => {
+  // -------- C1: a reconnect is NOT evidence that the tenant is active --------
+  //
+  // REPLACES an F41 test that asserted the opposite ("a fresh handshake must itself
+  // clear the latch"). That test encoded a behaviour that is wrong against the
+  // deployed gateway: its handshake verifies token revocation, device existence, org
+  // match, isDisabled and token currency, and contains NO tenant-suspension check —
+  // the only suspension code there is the outbound `tenant:suspended` emitter, and
+  // TENANT_SUSPENDED is produced solely by the REST auth/check. So the assumption the
+  // old assertion rested on ("a successful handshake means the tenant is active") is
+  // false, and on a 24/7 screen the inevitable reconnect silently resumed a suspended
+  // tenant's content, permanently, with no probe loop left running.
+  //
+  // The RECOVERABLE direction the old test also cared about is not lost — it is the
+  // test below, now driven by the evidence that actually establishes it.
+
+  it('C1: a reconnect while suspended does NOT clear the latch (auth-check does not say 200)', async () => {
     await connectAndCommit();
     triggerSocketEvent('tenant:suspended');
     await vi.advanceTimersByTimeAsync(100);
     expect(visibleScreens()).toEqual(['holding-screen']);
+
     triggerSocketEvent('disconnect', 'transport close');
-    // A fresh handshake (no tenant:resumed) must itself clear the latch.
     triggerSocketEvent('connect');
     await vi.advanceTimersByTimeAsync(1600);
+
+    // Still held, and the latch is still latched.
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    expect(await reportedEvents()).not.toContain('tenant_unsuspended');
+    expect(await reportedEvents()).toContain('tenant_suspension_confirmed');
+    // The suspended tenant's content is genuinely NOT back on glass.
+    expect(domElements.get('content-screen')!._classListSet.has('hidden')).toBe(true);
+  });
+
+  it('C1: a reconnect DOES clear the latch when auth-check answers 200', async () => {
+    // The recoverable direction, on the evidence that actually establishes it. Without
+    // this the fix could have created a state the device cannot leave when the tenant
+    // IS resumed.
+    await connectAndCommit();
+    triggerSocketEvent('tenant:suspended');
+    await vi.advanceTimersByTimeAsync(100);
+    expect(visibleScreens()).toEqual(['holding-screen']);
+
+    httpGetHandler = (opts: { url: string }) => opts.url.includes('/devices/auth/check')
+      ? { status: 200, data: {} }
+      : { status: 200, data: { data: { status: 'pending' } } };
+
+    triggerSocketEvent('disconnect', 'transport close');
+    triggerSocketEvent('connect');
+    await vi.advanceTimersByTimeAsync(1600);
+
     expect(visibleScreens()).toEqual(['content-screen']);
     expect(await reportedEvents()).toContain('tenant_unsuspended');
+  });
+
+  it('C1: the suspension latch is DURABLE — a reboot re-enters holding, it does not resume', async () => {
+    // last_playlist is still written while suspended, so with an in-memory-only latch
+    // a power cycle put the suspended tenant's cached loop straight back on customer
+    // glass with no probe running. Nothing else stops that.
+    await connectAndCommit();
+    expect(preferencesStore.has('last_playlist')).toBe(true);
+    triggerSocketEvent('tenant:suspended');
+    await vi.advanceTimersByTimeAsync(100);
+    expect(preferencesStore.get('tenant_suspended')).toBe('1');
+
+    // Reboot: fresh module, same disk. auth-check stays 404 (this block's default),
+    // so nothing clears the latch.
+    currentMockSocket = createMockSocket();
+    ioFactory.mockReturnValue(currentMockSocket);
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    // findCreatedElements reads the createElement mock's accumulated results, and the
+    // pre-reboot phase above already rendered c1.jpg. Without this the "not rendered"
+    // assertion below would read the PREVIOUS boot's element and fail on a correct fix.
+    (document.createElement as Mock).mockClear();
+    await importFresh();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    expect(findCreatedElements('img').some(i => i.src.includes('c1.jpg'))).toBe(false);
+    const suspendCalls = (reportEvent as Mock).mock.calls.filter(c => c[0] === 'tenant_suspended');
+    expect(suspendCalls.length).toBeGreaterThan(0);
+    expect((suspendCalls[0][1] as { source?: string }).source).toBe('restored_latch');
+  });
+
+  it('C1 NEGATIVE CONTROL: with no latch on disk a reboot resumes the cached playlist', async () => {
+    // Same seam, same reboot. Proves the hold above belongs to the persisted latch and
+    // not to the reboot path having stopped rendering.
+    await connectAndCommit();
+    expect(preferencesStore.has('tenant_suspended')).toBe(false);
+
+    currentMockSocket = createMockSocket();
+    ioFactory.mockReturnValue(currentMockSocket);
+    (document.createElement as Mock).mockClear(); // same window as the test above
+    await importFresh();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(visibleScreens()).toEqual(['content-screen']);
+    expect(findCreatedElements('img').some(i => i.src.includes('c1.jpg'))).toBe(true);
   });
 
   // -------- F42: unguarded tenant_id read --------
@@ -4830,30 +5095,39 @@ describe('Client correctness & security residuals — siblings (B3–B7)', () =>
     const pollToPaired = async (
       payload: Record<string, unknown> = pairedPayload,
       settled: () => boolean = () => secureStorageStore.has('device_token'),
+      opts: { expectSettled?: boolean; budgetMs?: number } = {},
     ) => {
-      httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
+      httpGetHandler = (opts2) => opts2.url.includes('/pairing/status/')
         ? { status: 200, data: { data: payload } }
         : { status: 404, data: {} };
-      for (let round = 0; round < 30; round++) {
-        await vi.advanceTimersByTimeAsync(2100);
-        for (let j = 0; j < 40; j++) await Promise.resolve();
-        if (settled()) {
-          // Give the commit that follows the persist its own turns to run.
-          await vi.advanceTimersByTimeAsync(50);
-          for (let j = 0; j < 40; j++) await Promise.resolve();
-          return;
-        }
+      // Bounded on REAL elapsed time with a real-loop yield per round (see
+      // waitUntil/realYield): a fixed round count is a budget that shrinks exactly
+      // when the machine is loaded, and the pairing path is gated on a genuine
+      // `await import('qrcode')` that fake timers cannot drive.
+      const expectSettled = opts.expectSettled ?? true;
+      try {
+        await waitUntil('pollToPaired', settled, { tickMs: 2100, budgetMs: opts.budgetMs });
+      } catch (err) {
+        // Callers that deliberately drive an UNSETTLEABLE case (a rejecting keystore)
+        // pass expectSettled:false; for everyone else, not settling is the failure and
+        // it must say so here rather than surfacing downstream as an opaque
+        // "expected undefined to be 'tok-new'".
+        if (expectSettled) throw err;
+        return;
       }
+      // Give the commit that follows the persist its own turns to run.
+      await vi.advanceTimersByTimeAsync(50);
+      for (let j = 0; j < 40; j++) await Promise.resolve();
     };
 
     /** Boot with no credentials and wait for the real pairing request to land. */
     const bootToPairingScreen = async () => {
       await importFresh();
-      for (let round = 0; round < 10; round++) {
-        if (domElements.get('pairing-code')!.textContent === 'ABCD1234') break;
-        await vi.advanceTimersByTimeAsync(200);
-        for (let j = 0; j < 40; j++) await Promise.resolve();
-      }
+      await waitUntil(
+        'bootToPairingScreen',
+        () => domElements.get('pairing-code')!.textContent === 'ABCD1234',
+        { tickMs: 200 },
+      );
       expect(domElements.get('pairing-code')!.textContent).toBe('ABCD1234');
     };
 
@@ -4904,7 +5178,7 @@ describe('Client correctness & security residuals — siblings (B3–B7)', () =>
       const { CapacitorHttp } = await import('@capacitor/core');
       const countBefore = (CapacitorHttp.get as Mock).mock.calls.length;
 
-      await pollToPaired(pairedPayload, () => false);
+      await pollToPaired(pairedPayload, () => false, { expectSettled: false, budgetMs: 150 });
 
       // Nothing committed…
       expect(ioFactory.mock.calls.length).toBe(0);
@@ -4922,7 +5196,7 @@ describe('Client correctness & security residuals — siblings (B3–B7)', () =>
       await bootToPairingScreen();
       const { SecureStorage } = await import('./secure-storage');
       (SecureStorage.set as Mock).mockRejectedValue(new Error('SECURE_STORAGE_UNAVAILABLE'));
-      await pollToPaired(pairedPayload, () => false);
+      await pollToPaired(pairedPayload, () => false, { expectSettled: false, budgetMs: 150 });
       expect(secureStorageStore.has('device_token')).toBe(false);
 
       (SecureStorage.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
@@ -4946,7 +5220,7 @@ describe('Client correctness & security residuals — siblings (B3–B7)', () =>
         secureStorageStore.set(key, value);
       });
 
-      await pollToPaired(pairedPayload, () => secureStorageStore.has('tenant_id'));
+      await pollToPaired(pairedPayload, () => secureStorageStore.has('tenant_id'), { expectSettled: false, budgetMs: 150 });
 
       expect(ioFactory.mock.calls.length).toBe(0);
       expect(mockCacheManager.setExpectedTenant).not.toHaveBeenCalledWith('tenant-A');
@@ -6022,11 +6296,20 @@ describe('deliveryAck — delivery-guaranteed emits (client capability)', () => 
 
     // Bounded: the operator's command runs even though the write never settled…
     expect(window.location.reload).toHaveBeenCalledTimes(1);
-    // …and the fact that it ran UNGUARDED is on the record.
+    // …and the fact that the BRIDGE write did not land is on the record.
     const calls = await reportedEventCalls();
     const timeout = calls.find(c => c[0] === 'command_dedupe_persist_timeout');
     expect(timeout).toBeDefined();
     expect((timeout![1] as { type?: string }).type).toBe('reload');
+
+    // …but the dispatch is NOT unguarded. This assertion is the point of the whole
+    // fix, and its absence is what made this test encode the loop rather than catch
+    // it: with only the bridge copy, "timed out, dispatched anyway" left the reload
+    // with NO on-disk terminator at all, so the requeue at 10s replayed it into a
+    // context that had no memory of having run it — reload → reconnect → replay →
+    // reload at a ~3–5s period with nothing to stop it. The synchronous localStorage
+    // write in rememberCommand lands before the bound can even start counting.
+    expect(JSON.parse(localStorageStore.get('vizora_seen_command_keys')!)).toContain('reload@a10');
   });
 
   it('A10 NEGATIVE CONTROL: a healthy bridge dispatches promptly and reports no timeout', async () => {
@@ -6157,5 +6440,954 @@ describe('deliveryAck — delivery-guaranteed emits (client capability)', () => 
 
     expect(seen).toEqual(['ack', 'reload']);
     expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ============================================================================
+// Release-review wave: loop terminator, frame origin, and the unguarded lines
+// ============================================================================
+//
+// Everything below is bound to a real production entry point — a socket event, a
+// heartbeat ack callback, or a fresh boot — never to a private method. Each fix
+// gets a negative control at the same layer, so a "did not happen" assertion
+// cannot pass by the path having gone dark.
+
+describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    resetCapacitorFakes();
+    resetDOM();
+    (window.location as { search: string }).search = '';
+    (window.location.reload as Mock).mockReset();
+    ioFactory.mockClear();
+    currentMockSocket = createMockSocket();
+    ioFactory.mockReturnValue(currentMockSocket);
+    mockCacheManager.getCachedUri.mockReset().mockResolvedValue(null);
+    mockCacheManager.downloadContent.mockReset().mockResolvedValue(null);
+    mockCacheManager.clearCache.mockReset().mockResolvedValue(undefined);
+    mockCacheManager.setExpectedTenant.mockClear();
+    qrToCanvasMock.mockReset().mockResolvedValue(undefined);
+    const { SecureStorage } = await import('./secure-storage');
+    (SecureStorage.get as Mock).mockImplementation(async ({ key }: { key: string }) => ({
+      value: secureStorageStore.get(key) ?? null,
+    }));
+    (SecureStorage.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+      secureStorageStore.set(key, value);
+    });
+    (SecureStorage.remove as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      secureStorageStore.delete(key);
+    });
+    const { reportEvent, isCrashReportingEnabled } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    (isCrashReportingEnabled as Mock).mockReturnValue(true);
+    secureStorageStore.set('device_token', 'tok-123');
+    secureStorageStore.set('device_id', 'dev-123');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  // -------- shared observables --------
+
+  const LOCAL_RING_KEY = 'vizora_seen_command_keys';
+
+  const visibleScreens = () =>
+    ['loading-screen', 'pairing-screen', 'content-screen', 'holding-screen', 'error-screen']
+      .filter(id => {
+        const el = domElements.get(id);
+        return el && !el._classListSet.has('hidden');
+      });
+
+  const reportedEventCalls = async () => {
+    const { reportEvent } = await import('./crash-reporting');
+    return (reportEvent as Mock).mock.calls as unknown[][];
+  };
+  const reportedEvents = async () => (await reportedEventCalls()).map(c => c[0]);
+
+  const localRing = (): string[] => {
+    const raw = localStorageStore.get(LOCAL_RING_KEY);
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  };
+
+  const playlistV = (version: string, contentId: string, url: string, playlistId?: string) => ({
+    version,
+    playlist: {
+      id: playlistId ?? `pl-${contentId}`, name: contentId, loopPlaylist: true,
+      items: [{ id: `it-${contentId}`, contentId, duration: 10, order: 0,
+        content: { id: contentId, name: contentId, type: 'image', url } }],
+    },
+  });
+
+  const connectAndCommit = async () => {
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    triggerSocketEvent('playlist:update', playlistV('v1', 'c1', '/c1.jpg'));
+    await vi.advanceTimersByTimeAsync(1600);
+    expect(visibleScreens()).toEqual(['content-screen']);
+  };
+
+  /** What this device TELLS THE SERVER it is rendering — read off a real heartbeat. */
+  const reportedContentVersion = async () => {
+    await vi.advanceTimersByTimeAsync(15_000);
+    const beats = currentMockSocket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'heartbeat');
+    return (beats[beats.length - 1][1] as { contentVersion: string }).contentVersion;
+  };
+
+  /** Make only the ring's Preferences slot fail; the rest of the store stays healthy. */
+  const breakRingPreferences = async (fail: () => Promise<never>) => {
+    const { Preferences } = await import('@capacitor/preferences');
+    (Preferences.set as Mock).mockImplementation(async (opts: { key: string; value: string }) => {
+      if (opts.key === 'seen_command_keys') return fail();
+      preferencesStore.set(opts.key, opts.value);
+    });
+    (Preferences.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      if (key === 'seen_command_keys') throw new Error('QuotaExceededError');
+      return { value: preferencesStore.get(key) ?? null };
+    });
+  };
+
+  const NEVER = () => new Promise<never>(() => {});
+
+  // ======================================================================
+  // B1. THE REPLAY-LOOP TERMINATOR IS DURABLE WITHOUT THE BRIDGE
+  // ======================================================================
+  //
+  // Advertising deliveryAck is what CREATED the requeue path — before it the gateway
+  // did a bare legacy emit and never requeued. The persisted (type, timestamp) ring
+  // is now the only thing that terminates a replay of a context-destroying command,
+  // and it had three ways to be silently absent at the moment of dispatch: the 2s
+  // persist bound elapsing, the write REJECTING (rememberCommand resolves either
+  // way, so the caller cannot tell), and a command with no timestamp. Any of them
+  // leaves reload → ack lost in engine.io's writeBuffer → reload() discards it →
+  // requeue at 10s → reconnect → replay → reload, at a ~3–5s period, forever;
+  // nothing bounds it, because the native crash ladder counts Java uncaught
+  // exceptions and location.reload() is not a crash.
+  //
+  // localStorage closes the first two: synchronous, no Capacitor bridge, survives
+  // window.location.reload().
+
+  it('B1: a REJECTING Preferences write still leaves a durable record', async () => {
+    await connectAndCommit();
+    await breakRingPreferences(() => Promise.reject(new Error('QuotaExceededError')));
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'b1-reject' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    // Direction: the bridge write really did fail…
+    expect(preferencesStore.has('seen_command_keys')).toBe(false);
+    expect(await reportedEvents()).toContain('command_dedupe_ring_persist_failed');
+    // …and the terminator is on disk anyway.
+    expect(localRing()).toContain('reload@b1-reject');
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('B1: a WEDGED bridge (persist never settles) still leaves a durable record', async () => {
+    await connectAndCommit();
+    await breakRingPreferences(NEVER);
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'b1-wedge' }, vi.fn());
+    // The synchronous write has landed before the bound has even started running out.
+    await vi.advanceTimersByTimeAsync(50);
+    expect(localRing()).toContain('reload@b1-wedge');
+    expect(window.location.reload).not.toHaveBeenCalled(); // still gated on the bound
+
+    await vi.advanceTimersByTimeAsync(2100);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(await reportedEvents()).toContain('command_dedupe_persist_timeout');
+    expect(localRing()).toContain('reload@b1-wedge');
+  });
+
+  it('B1: END TO END — the replay after the reload is suppressed with Preferences dead', async () => {
+    // The whole loop, through the real doors: command → dispatch → "reload" (a fresh
+    // module with the same storage) → the server requeues and replays the IDENTICAL
+    // (type, timestamp) → the second execution must not happen.
+    await connectAndCommit();
+    await breakRingPreferences(() => Promise.reject(new Error('QuotaExceededError')));
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'b1-e2e' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+
+    // The reload: same device, same disk, new JS context.
+    currentMockSocket = createMockSocket();
+    ioFactory.mockReturnValue(currentMockSocket);
+    await importFresh();
+    (window.location.reload as Mock).mockClear();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'b1-e2e' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).not.toHaveBeenCalled();
+    expect(await reportedEvents()).toContain('command_duplicate_suppressed');
+  });
+
+  it('B1 NEGATIVE CONTROL: with BOTH stores dead the replay executes — and says so', async () => {
+    // Proves the suppression above comes from the durable write and not from the
+    // replay never being delivered. Also pins the fail-OPEN direction: an unreadable
+    // ring must never refuse to boot or refuse the operator's command.
+    await connectAndCommit();
+    await breakRingPreferences(() => Promise.reject(new Error('QuotaExceededError')));
+    localStorageThrowOn.setItem = true;
+    localStorageThrowOn.getItem = true;
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'b1-none' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(await reportedEvents()).toContain('command_dedupe_local_persist_failed');
+
+    currentMockSocket = createMockSocket();
+    ioFactory.mockReturnValue(currentMockSocket);
+    await importFresh();
+    (window.location.reload as Mock).mockClear();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'b1-none' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).toHaveBeenCalledTimes(1); // the loop, unterminated
+    expect(await reportedEvents()).toContain('command_dedupe_ring_load_failed');
+  });
+
+  it('B1: the two ring homes are UNIONED, either one alone suppresses', async () => {
+    // They can legitimately disagree — localStorage lands when the bridge write does
+    // not, and Preferences survives a webview storage clear that takes localStorage
+    // with it. Whichever holds the key has to be enough.
+    for (const home of ['localStorage', 'preferences'] as const) {
+      resetCapacitorFakes();
+      secureStorageStore.set('device_token', 'tok-123');
+      secureStorageStore.set('device_id', 'dev-123');
+      const ring = JSON.stringify(['reload@union']);
+      if (home === 'localStorage') localStorageStore.set(LOCAL_RING_KEY, ring);
+      else preferencesStore.set('seen_command_keys', ring);
+
+      currentMockSocket = createMockSocket();
+      ioFactory.mockReturnValue(currentMockSocket);
+      await importFresh();
+      (window.location.reload as Mock).mockClear();
+      currentMockSocket.connected = true;
+      triggerSocketEvent('connect');
+
+      triggerSocketEvent('command', { type: 'reload', timestamp: 'union' }, vi.fn());
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(window.location.reload, `suppressed via ${home}`).not.toHaveBeenCalled();
+    }
+  });
+
+  it('B1: a purge clears BOTH ring homes', async () => {
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    await connectAndCommit();
+    triggerSocketEvent('command', { type: 'clear_override', timestamp: 'b1-purge' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(localRing()).toContain('clear_override@b1-purge'); // baseline: there is state to purge
+
+    triggerSocketEvent('device:revoked', { reason: 'operator' });
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(secureStorageStore.has('device_token')).toBe(false); // the purge really ran
+    expect(preferencesStore.has('seen_command_keys')).toBe(false);
+    expect(localRing()).toEqual([]);
+  });
+
+  // -------- test-instrument 5: the restore bound --------
+
+  it('T5: loadSeenCommands BOUNDS the restored ring — an evicted key is not suppressed', async () => {
+    // The ring is written back out at whatever size it comes back at, so an
+    // oversized store (an older build, a hand-edited file, two copies that diverged)
+    // would grow without limit. The bound has to be on the RESTORE, not only on the
+    // write. Observable through the real door: the 5th-from-oldest of 25 keys falls
+    // outside the last 20 and must therefore EXECUTE.
+    const keys = Array.from({ length: 25 }, (_, i) => `reload@k${i + 1}`);
+    localStorageStore.set(LOCAL_RING_KEY, JSON.stringify(keys));
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    (window.location.reload as Mock).mockClear();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'k1' }, vi.fn()); // evicted
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('T5 NEGATIVE CONTROL: a key INSIDE the bound is still suppressed', async () => {
+    // Same seam, same boot. Proves the restore is not simply dead — which would also
+    // produce "k1 executed", plus a device with no terminator at all.
+    const keys = Array.from({ length: 25 }, (_, i) => `reload@k${i + 1}`);
+    localStorageStore.set(LOCAL_RING_KEY, JSON.stringify(keys));
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    (window.location.reload as Mock).mockClear();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'k25' }, vi.fn()); // newest
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).not.toHaveBeenCalled();
+  });
+
+  // ======================================================================
+  // S1. THE DEDUPE KEY IS BOUNDED
+  // ======================================================================
+
+  it('S1: an oversized (type, timestamp) is refused as a key — reported, and still executed', async () => {
+    await connectAndCommit();
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'x'.repeat(200) }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    const calls = await reportedEventCalls();
+    const oversize = calls.find(c => c[0] === 'command_dedupe_key_oversize');
+    expect(oversize).toBeDefined();
+    expect((oversize![1] as { length?: number }).length).toBeGreaterThan(128);
+    // Fail OPEN, and nothing that huge reaches either store.
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(localRing()).toEqual([]);
+    expect(preferencesStore.has('seen_command_keys')).toBe(false);
+    // It is context-destroying and unkeyable, so the existing missing-key alarm fires too.
+    expect(await reportedEvents()).toContain('command_dedupe_key_missing');
+  });
+
+  it('S1 NEGATIVE CONTROL: a long-but-legal key is still recorded', async () => {
+    // Same seam. Proves the bound is a bound and not a blanket refusal — `reload@`
+    // plus a 100-char timestamp is 107 chars and must survive.
+    await connectAndCommit();
+    const ts = 'y'.repeat(100);
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: ts }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(await reportedEvents()).not.toContain('command_dedupe_key_oversize');
+    expect(localRing()).toContain(`reload@${ts}`);
+  });
+
+  // ======================================================================
+  // C3. THE BOOT-PATH BRIDGE READS ARE BOUNDED
+  // ======================================================================
+  //
+  // Both run inside init(), before credentials. A wedged bridge means init() never
+  // SETTLES, so it never REJECTS, so the startInit() retry loop never fires: the
+  // device sits on the splash indefinitely with no error and no telemetry. The diff
+  // that bounded the ring WRITE left these two READS unbounded.
+
+  it.each([
+    ['seen_command_keys', 'the dedupe ring read'],
+    ['crash_loop_capped', 'the crash-loop marker read'],
+  ])('C3: a wedged bridge on %s does not hang boot', async (hungKey) => {
+    secureStorageStore.clear(); // no credentials → the pairing screen is the settle proof
+    const { Preferences } = await import('@capacitor/preferences');
+    (Preferences.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      if (key === hungKey) return NEVER();
+      return { value: preferencesStore.get(key) ?? null };
+    });
+
+    await importFresh();
+    await vi.advanceTimersByTimeAsync(2500); // past the 2000ms bound
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(300);
+
+    // init() got all the way through to the pairing request.
+    expect(domElements.get('pairing-code')!.textContent).toBe('ABCD1234');
+    const calls = await reportedEventCalls();
+    const timeout = calls.find(c => c[0] === 'preferences_read_timeout');
+    expect(timeout).toBeDefined();
+    expect((timeout![1] as { key?: string }).key).toBe(hungKey);
+  });
+
+  it('C3 NEGATIVE CONTROL: a healthy bridge reports no read timeout', async () => {
+    // Same boot, same assertions, working storage — so the event above belongs to the
+    // wedge and not to the boot path.
+    secureStorageStore.clear();
+    await importFresh();
+    await vi.advanceTimersByTimeAsync(2500);
+
+    expect(domElements.get('pairing-code')!.textContent).toBe('ABCD1234');
+    expect(await reportedEvents()).not.toContain('preferences_read_timeout');
+  });
+
+  // ======================================================================
+  // C5. A TOKEN ROTATION MUST NOT SURVIVE A PURGE THAT LANDED MID-WRITE
+  // ======================================================================
+
+  it('C5: a purge during the keystore write discards the rotated token', async () => {
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    await connectAndCommit();
+
+    const { SecureStorage } = await import('./secure-storage');
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    (SecureStorage.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+      if (key === 'device_token') await gate;
+      secureStorageStore.set(key, value);
+    });
+
+    // The rotation parks inside the keystore write…
+    triggerSocketEvent('token:refresh', { token: 'rotated-tok' });
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    // …and the de-pair lands while it is parked.
+    triggerSocketEvent('device:revoked', { reason: 'operator' });
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(secureStorageStore.has('device_token')).toBe(false); // the purge completed
+
+    release();
+    for (let i = 0; i < 60; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(100);
+
+    // The write landed AFTER the purge's remove; it must be taken back out, and it
+    // must not be adopted in memory either — a resurrected credential on the pairing
+    // screen is what the network/appState listeners reconnect with.
+    expect(secureStorageStore.has('device_token')).toBe(false);
+    expect(await reportedEvents()).toContain('token_refresh_discarded_after_purge');
+    const authTokens = ioFactory.mock.calls.map(
+      (c: unknown[]) => (c[1] as { auth?: { token?: string } } | undefined)?.auth?.token,
+    );
+    expect(authTokens).not.toContain('rotated-tok');
+  });
+
+  it('C5 NEGATIVE CONTROL: with no purge, the same parked rotation is adopted', async () => {
+    // Same seam, same gate. Proves the discard belongs to the purge and not to the
+    // parking — otherwise the fix could have broken rotation outright, which strands
+    // devices whose token the server has already replaced.
+    await connectAndCommit();
+    const { SecureStorage } = await import('./secure-storage');
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    (SecureStorage.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+      if (key === 'device_token') await gate;
+      secureStorageStore.set(key, value);
+    });
+
+    triggerSocketEvent('token:refresh', { token: 'rotated-tok' });
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    release();
+    for (let i = 0; i < 60; i++) await Promise.resolve();
+
+    expect(secureStorageStore.get('device_token')).toBe('rotated-tok');
+    expect(currentMockSocket.auth).toEqual({ token: 'rotated-tok', capabilities: ['deliveryAck'] });
+    expect(await reportedEvents()).not.toContain('token_refresh_discarded_after_purge');
+  });
+
+  // ======================================================================
+  // C7. applyPulledContent IS SERIALIZED AND RE-VALIDATES
+  // ======================================================================
+  //
+  // Four entry points reach one critical section — pull-on-connect, the heartbeat
+  // reconcile pull, a versioned playlist:update, and pullContent itself — and
+  // overlap is guaranteed by construction, not merely possible: pullContent's bound
+  // is 20s while the heartbeat cadence is 15s. Interleaved, the read of `current`,
+  // the await inside updatePlaylist and the version commit are three steps on shared
+  // state and the LAST commit to land wins, which is not the newest version.
+
+  it('C7: two overlapping applies commit the NEWEST version, not the last to finish', async () => {
+    await connectAndCommit();
+    const { Preferences } = await import('@capacitor/preferences');
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let first = true;
+    (Preferences.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+      if (key === 'last_playlist' && first) { first = false; await gate; }
+      preferencesStore.set(key, value);
+    });
+
+    // v2 parks inside its own persist; v3 arrives on top of it.
+    triggerSocketEvent('playlist:update', playlistV('v2', 'c2', '/c2.jpg', 'pl-shared'));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(first).toBe(false); // the arrange really did park
+    triggerSocketEvent('playlist:update', playlistV('v3', 'c3', '/c3.jpg', 'pl-shared'));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    release();
+    for (let i = 0; i < 60; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1600);
+
+    // What is on glass and what the device TELLS THE SERVER must be the same thing.
+    // (The post-await re-validation alone is enough for this pair of assertions.)
+    expect(findCreatedElements('img').some(i => i.src.includes('c3.jpg'))).toBe(true);
+    expect(await reportedContentVersion()).toBe('v3');
+
+    // …and this is what SERIALIZATION alone buys, which no amount of re-validating
+    // the version can recover: unserialized, both updatePlaylist calls run their own
+    // `last_playlist` write concurrently and the OLDER one resolves last, so the
+    // device reboots into v2's content while reporting and rendering v3's. The
+    // offline-resilience copy has to be the one that is actually on glass.
+    const persisted = JSON.parse(preferencesStore.get('last_playlist')!);
+    expect(persisted.playlist.items[0].contentId).toBe('c3');
+  });
+
+  it('C7: a purge landing inside an apply does not commit the purged version', async () => {
+    // The one post-await hazard serialization cannot cover: purgeDeviceState is not in
+    // the queue, and it deliberately resets the content coordinates (C2) because a
+    // re-pair to the same playlist produces the identical version. Committing `v2` on
+    // top of that reset re-creates the hold-forever state the reset just cleared —
+    // and it is silent, because the heartbeat then reports a version matching the
+    // server's truth so the reconcile self-heal never fires.
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    await connectAndCommit();
+
+    const { Preferences } = await import('@capacitor/preferences');
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let parked = false;
+    (Preferences.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+      if (key === 'last_playlist' && value.includes('c2') && !parked) { parked = true; await gate; }
+      preferencesStore.set(key, value);
+    });
+
+    triggerSocketEvent('playlist:update', playlistV('v2', 'c2', '/c2.jpg', 'pl-shared'));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(parked).toBe(true); // the arrange really did park inside the apply
+
+    triggerSocketEvent('device:revoked', { reason: 'operator' });
+    await waitUntil('purge', () => !secureStorageStore.has('device_token'), { tickMs: 100 });
+
+    release();
+    for (let i = 0; i < 60; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(200);
+
+    // Pair again so there is a socket to observe the reported version on.
+    await waitUntil(
+      're-pairing code',
+      () => domElements.get('pairing-code')!.textContent === 'ABCD1234',
+      { tickMs: 200 },
+    );
+    httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
+      ? { status: 200, data: { data: { status: 'paired', deviceToken: 'tok-2', deviceId: 'dev-2', tenantId: 'tenant-B' } } }
+      : { status: 404, data: {} };
+    await waitUntil('re-pair', () => secureStorageStore.get('device_token') === 'tok-2', { tickMs: 2100 });
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+
+    // The coordinates the purge cleared are still cleared.
+    expect(await reportedContentVersion()).toBe('');
+  });
+
+  it('C7 NEGATIVE CONTROL: a genuinely stale re-delivery is still a no-op', async () => {
+    // Serializing must not turn version-wins into last-write-wins: an older version
+    // of the SAME playlist arriving after a newer one still has to be ignored.
+    await connectAndCommit();
+
+    triggerSocketEvent('playlist:update', playlistV('v3', 'c3', '/c3.jpg', 'pl-shared'));
+    await vi.advanceTimersByTimeAsync(1600);
+    triggerSocketEvent('playlist:update', playlistV('v2', 'c2', '/c2.jpg', 'pl-shared'));
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(findCreatedElements('img').some(i => i.src.includes('c2.jpg'))).toBe(false);
+    expect(await reportedContentVersion()).toBe('v3');
+  });
+
+  // ======================================================================
+  // C2 + test-instrument 3: a purge leaves NOTHING behind for the next pairing
+  // ======================================================================
+
+  /** De-pair via a CONFIRMED revocation, then pair again in the same process. */
+  const rePairInProcess = async (tenantId = 'tenant-B') => {
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    triggerSocketEvent('device:revoked', { reason: 'operator' });
+    await waitUntil('purge', () => !secureStorageStore.has('device_token'), { tickMs: 100 });
+    await waitUntil(
+      're-pairing code',
+      () => domElements.get('pairing-code')!.textContent === 'ABCD1234',
+      { tickMs: 200 },
+    );
+
+    httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
+      ? { status: 200, data: { data: { status: 'paired', deviceToken: 'tok-2', deviceId: 'dev-2', tenantId } } }
+      : { status: 404, data: {} };
+    await waitUntil('re-pair', () => secureStorageStore.get('device_token') === 'tok-2', { tickMs: 2100 });
+    await vi.advanceTimersByTimeAsync(50);
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+  };
+
+  it('T3: the IN-MEMORY dedupe ring dies with the pairing, not just the on-disk copy', async () => {
+    // Only the persisted half was tested. With the in-memory line gone, the first
+    // command after a re-pair writes the PREVIOUS tenant's keys straight back out —
+    // so the old tenant's command history is readable on the device again and a new
+    // command whose key collides is silently suppressed.
+    await connectAndCommit();
+    triggerSocketEvent('command', { type: 'clear_override', timestamp: 'old-pairing' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(localRing()).toContain('clear_override@old-pairing'); // baseline
+
+    await rePairInProcess();
+
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    triggerSocketEvent('command', { type: 'clear_override', timestamp: 'new-pairing' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(JSON.parse(preferencesStore.get('seen_command_keys')!)).toEqual(['clear_override@new-pairing']);
+    expect(localRing()).toEqual(['clear_override@new-pairing']);
+  });
+
+  it('C2: a purge resets the content coordinates — a re-pair to the same playlist still renders', async () => {
+    // The server derives `version` from content updatedAt stamps, so it is
+    // byte-identical across unpair → re-pair to the same playlist. Left set, the
+    // re-pair's pull hits shouldApplyContent({P,V},{P,V}) === false, no-ops, and
+    // leaves currentPlaylist null — the device holds FOREVER while its heartbeat
+    // reports a contentVersion that matches the server's truth, so the reconcile
+    // self-heal never fires either.
+    await connectAndCommit();
+    expect(await reportedContentVersion()).toBe('v1');
+
+    await rePairInProcess();
+
+    currentMockSocket.connected = true;
+    (document.createElement as Mock).mockClear();
+    triggerSocketEvent('connect');
+    triggerSocketEvent('playlist:update', playlistV('v1', 'c1', '/c1.jpg'));
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(visibleScreens()).toEqual(['content-screen']);
+    expect(findCreatedElements('img').some(i => i.src.includes('c1.jpg'))).toBe(true);
+  });
+
+  it('C2: a purge removes the crash-loop marker and the suspension latch', async () => {
+    // Device-lifecycle state that was surviving a purge which claims to be complete.
+    await connectAndCommit();
+    preferencesStore.set('crash_loop_capped', '1700000000000:4:uncaught_exception');
+    triggerSocketEvent('tenant:suspended');
+    await vi.advanceTimersByTimeAsync(100);
+    expect(preferencesStore.get('tenant_suspended')).toBe('1'); // baseline
+
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    triggerSocketEvent('device:revoked', { reason: 'operator' });
+    await waitUntil('purge', () => !secureStorageStore.has('device_token'), { tickMs: 100 });
+
+    expect(preferencesStore.has('crash_loop_capped')).toBe(false);
+    expect(preferencesStore.has('tenant_suspended')).toBe(false);
+  });
+
+  it('C2 NEGATIVE CONTROL: an UNCONFIRMED revocation removes neither', async () => {
+    // Same signal, same seam, an auth-check that does not confirm. Proves the removals
+    // above belong to a confirmed purge and are not something the signal alone does.
+    await connectAndCommit();
+    preferencesStore.set('crash_loop_capped', '1700000000000:4:uncaught_exception');
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 401, data: {} }
+      : { status: 200, data: { data: { status: 'pending' } } };
+
+    triggerSocketEvent('device:revoked', { reason: 'operator' });
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(secureStorageStore.has('device_token')).toBe(true); // no purge ran
+    expect(preferencesStore.has('crash_loop_capped')).toBe(true);
+    expect(await reportedEvents()).toContain('revocation_unconfirmed');
+  });
+
+  // ======================================================================
+  // Test-instrument 1: the heartbeat error-ack `return`
+  // ======================================================================
+
+  it('T1: a POISONED failure envelope is acted on by NOTHING — the return really returns', async () => {
+    // The existing test drives a failure envelope with no actionable fields, so the
+    // fall-through has nothing to do and passes with or without the `return`. Put
+    // revoked/commands/reconcileContent on the failure envelope's TOP LEVEL — where
+    // the pre-fix code read them — so only the `return` can keep these assertions true.
+    await connectAndCommit();
+    const { CapacitorHttp } = await import('@capacitor/core');
+    (CapacitorHttp.get as Mock).mockClear();
+    (window.location.reload as Mock).mockClear();
+
+    const hb = currentMockSocket.emit.mock.calls.find((c: unknown[]) => c[0] === 'heartbeat');
+    (hb![2] as (r: unknown) => void)({
+      success: false,
+      error: 'RATE_LIMITED',
+      timestamp: '2026-08-15T00:00:00.000Z',
+      revoked: true,
+      commands: [{ type: 'reload', timestamp: 't1-poison' }],
+      reconcileContent: true,
+    });
+    await vi.advanceTimersByTimeAsync(200);
+
+    const urls = (CapacitorHttp.get as Mock).mock.calls.map((c: unknown[]) => String((c[0] as { url: string }).url));
+    expect(urls.some(u => u.includes('/devices/auth/check'))).toBe(false); // revoked ignored
+    expect(urls.some(u => u.includes('/devices/me/content'))).toBe(false); // reconcile ignored
+    expect(window.location.reload).not.toHaveBeenCalled();                 // commands ignored
+    // …and the failure itself is still surfaced, which is the point of the branch.
+    expect(await reportedEvents()).toContain('heartbeat_ack_error');
+  });
+
+  it('T1 NEGATIVE CONTROL: the same three fields on a SUCCESS envelope are all acted on', async () => {
+    // Proves the observation window can see every one of the three side effects, so
+    // the negatives above are not vacuous.
+    await connectAndCommit();
+    const { CapacitorHttp } = await import('@capacitor/core');
+    (CapacitorHttp.get as Mock).mockClear();
+    (window.location.reload as Mock).mockClear();
+
+    const hb = currentMockSocket.emit.mock.calls.find((c: unknown[]) => c[0] === 'heartbeat');
+    (hb![2] as (r: unknown) => void)({
+      success: true,
+      data: {
+        revoked: true,
+        commands: [{ type: 'reload', timestamp: 't1-ok' }],
+        reconcileContent: true,
+      },
+      timestamp: '2026-08-15T00:00:00.000Z',
+    });
+    await vi.advanceTimersByTimeAsync(200);
+
+    const urls = (CapacitorHttp.get as Mock).mock.calls.map((c: unknown[]) => String((c[0] as { url: string }).url));
+    expect(urls.some(u => u.includes('/devices/auth/check'))).toBe(true);
+    expect(urls.some(u => u.includes('/devices/me/content'))).toBe(true);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  // ======================================================================
+  // Test-instrument 2: clear_cache containment + its report
+  // ======================================================================
+
+  it('T2: a REJECTING clearCache is contained — the reload still runs and it is reported', async () => {
+    // No test made clearCache reject on this command path. Bare, that rejection is an
+    // unhandled rejection AND it skips the restart the operator asked for, with the
+    // server already holding { ok: true } and the dashboard saying delivered.
+    await connectAndCommit();
+    mockCacheManager.clearCache.mockRejectedValue(new Error('rmdir EBUSY'));
+    const ack = vi.fn();
+
+    triggerSocketEvent('command', { type: 'clear_cache', timestamp: 't2' }, ack);
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(await reportedEvents()).toContain('clear_cache_incomplete');
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+    // Contained, not merely survived: the rejection never reached the handler's own
+    // catch, which is a different (and noisier) failure.
+    expect(await reportedEvents()).not.toContain('command_handler_failed');
+  });
+
+  it('T2 NEGATIVE CONTROL: a healthy clear_cache purges, reloads, and reports nothing', async () => {
+    await connectAndCommit();
+
+    triggerSocketEvent('command', { type: 'clear_cache', timestamp: 't2-ok' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(mockCacheManager.clearCache).toHaveBeenCalled();
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(await reportedEvents()).not.toContain('clear_cache_incomplete');
+  });
+
+  // ======================================================================
+  // Test-instrument 4: the `typeof ack !== 'function'` guard
+  // ======================================================================
+
+  it('T4: an ABSENT ack is not invoked — no "callback threw" anywhere', async () => {
+    // The connect-time sendInitialState playlist:update and the config /
+    // qr-overlay:update emits are not ack-wrapped. Without the typeof guard the
+    // helper calls `undefined({ok:true})`, which its own try/catch swallows into a
+    // warn — so the existing assertions (which only check the handler's work) pass
+    // either way. The warn is the observable that separates them.
+    await connectAndCommit();
+    const warnSpy = console.warn as unknown as Mock;
+    warnSpy.mockClear();
+
+    triggerSocketEvent('playlist:update', playlistV('v9', 'c9', '/c9.jpg')); // no ack argument
+    triggerSocketEvent('command', { type: 'clear_override', timestamp: 't4' }); // no ack argument
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('delivery ack callback threw'))).toBe(false);
+    // Direction: the payloads really were handled, so this is not passing on a dead path.
+    expect(findCreatedElements('img').some(i => i.src.includes('c9.jpg'))).toBe(true);
+  });
+
+  it('T4: a NON-FUNCTION ack is not invoked either', async () => {
+    // The wire is not typed. A gateway that ever sends a non-callable in the ack slot
+    // must not produce a throw inside the delivery handler.
+    await connectAndCommit();
+    const warnSpy = console.warn as unknown as Mock;
+    warnSpy.mockClear();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 't4b' }, 'not-a-function');
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('delivery ack callback threw'))).toBe(false);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('T4 NEGATIVE CONTROL: a genuinely THROWING ack does produce the warn', async () => {
+    // Proves the observation window can see the thing the two tests above assert is
+    // absent — and pins the containment: a throwing callback must not take the
+    // handler down with it.
+    await connectAndCommit();
+    const warnSpy = console.warn as unknown as Mock;
+    warnSpy.mockClear();
+    const ack = vi.fn(() => { throw new Error('socket gone'); });
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 't4c' }, ack);
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(warnSpy.mock.calls.some(c => String(c[0]).includes('delivery ack callback threw'))).toBe(true);
+    expect(window.location.reload).toHaveBeenCalledTimes(1); // contained
+  });
+
+  // ======================================================================
+  // S4. last_playlist is not stamped with an unverifiable tenant
+  // ======================================================================
+
+  it('S4: a boot whose tenant_id read FAILED does not rewrite last_playlist', async () => {
+    // `tenantId ?? undefined` writes the SAME envelope for "legacy device, never had
+    // a tenant" and "the read threw this boot", and the loader treats an absent
+    // tenantId as the legacy no-binding grace branch and renders it unconditionally.
+    // One transient decrypt failure therefore downgrades that record permanently.
+    secureStorageStore.set('tenant_id', 'tenant-A');
+    preferencesStore.set('last_playlist', JSON.stringify({
+      tenantId: 'tenant-A', deviceId: 'dev-123', savedAt: 1,
+      playlist: { id: 'pl-old', name: 'old', items: [], loopPlaylist: true },
+    }));
+    const { SecureStorage } = await import('./secure-storage');
+    (SecureStorage.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      if (key === 'tenant_id') throw { code: 'AEAD_DECRYPT_FAILED', message: 'tag mismatch' };
+      return { value: secureStorageStore.get(key) ?? null };
+    });
+
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    triggerSocketEvent('playlist:update', playlistV('v1', 'c1', '/c1.jpg'));
+    await vi.advanceTimersByTimeAsync(1600);
+
+    // The PREVIOUS, correctly stamped record survives — no unstamped envelope was written.
+    const stored = JSON.parse(preferencesStore.get('last_playlist')!);
+    expect(stored.tenantId).toBe('tenant-A');
+    expect(stored.playlist.id).toBe('pl-old');
+    expect(await reportedEvents()).toContain('playlist_persist_skipped_tenant_unverified');
+    // Live delivery is untouched — the device still renders what it was sent.
+    expect(findCreatedElements('img').some(i => i.src.includes('c1.jpg'))).toBe(true);
+  });
+
+  it('S4 NEGATIVE CONTROL: a boot with a READABLE tenant_id persists normally', async () => {
+    // Same seam, working keystore. Proves the skip belongs to the read failure and did
+    // not turn offline resilience off.
+    secureStorageStore.set('tenant_id', 'tenant-A');
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    triggerSocketEvent('playlist:update', playlistV('v1', 'c1', '/c1.jpg'));
+    await vi.advanceTimersByTimeAsync(1600);
+
+    const stored = JSON.parse(preferencesStore.get('last_playlist')!);
+    expect(stored.tenantId).toBe('tenant-A');
+    expect(stored.playlist.id).toBe('pl-c1');
+    expect(await reportedEvents()).not.toContain('playlist_persist_skipped_tenant_unverified');
+  });
+
+  // ======================================================================
+  // B2 + S3. THE CONTENT FRAME
+  // ======================================================================
+
+  const playItems = async (items: Array<{ type: string; url: string; id: string }>) => {
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    triggerSocketEvent('playlist:update', {
+      playlist: {
+        id: 'p-frame', name: 'F', loopPlaylist: true,
+        items: items.map((it, idx) => ({
+          id: `i${idx}`, contentId: it.id, duration: 10, order: idx,
+          content: { id: it.id, name: it.id, type: it.type, url: it.url },
+        })),
+      },
+    });
+    await vi.advanceTimersByTimeAsync(1600);
+  };
+
+  // The app document really is served from https://localhost under Capacitor:
+  // capacitor.config.ts sets androidScheme: 'https' with NO hostname. A `webpage`
+  // item naming that origin is same-origin with the app document, and Capacitor's
+  // WebViewLocalServer serves dist/index.html WITH the bridge injected for every
+  // frame — so with allow-same-origin the frame reaches
+  // parent.Capacitor.Plugins.SecureStorage and reads the device JWT. Reachable
+  // today: the backend's PATCH /content/:id does not run the validateUrl that POST
+  // does. The comment that used to justify the grant ("a local app scheme no remote
+  // URL can match") was false for this build.
+  it.each([
+    ['the app origin itself', 'https://localhost/?api_url=https://attacker.example'],
+    ['the app origin, bare', 'https://localhost/'],
+    // Parsed-origin comparison, not a string prefix: the default port normalises away.
+    ['the app origin with an explicit default port', 'https://localhost:443/index.html'],
+    ['javascript:', 'javascript:parent.postMessage(1,"*")'],
+    ['data:', 'data:text/html,<script>parent.x=1</script>'],
+    ['file:', 'file:///data/data/com.vizora.display/'],
+  ])('B2: a webpage item pointing at %s is refused', async (_label, url) => {
+    await playItems([{ type: 'webpage', url, id: 'bad' }]);
+
+    expect(findCreatedElements('iframe')).toHaveLength(0);
+    const calls = await reportedEventCalls();
+    const refused = calls.find(c => c[0] === 'frame_url_refused');
+    expect(refused).toBeDefined();
+    expect((refused![1] as { contentId?: string }).contentId).toBe('bad');
+  });
+
+  it('B2: a refused frame ADVANCES playback instead of dead-airing', async () => {
+    // Refusal is routed through the existing content-error path on purpose: the
+    // never-black contract still has to hold, so the engine skips to the next item.
+    await playItems([
+      { type: 'webpage', url: 'https://localhost/?api_url=https://attacker.example', id: 'bad' },
+      { type: 'image', url: '/good.jpg', id: 'good' },
+    ]);
+
+    expect(findCreatedElements('img').some(i => i.src.includes('good.jpg'))).toBe(true);
+    expect(visibleScreens()).toEqual(['content-screen']);
+  });
+
+  it('B2 NEGATIVE CONTROL: an ordinary third-party https page still frames', async () => {
+    // Same layer. Proves the guard is anchored to the app origin and not refusing
+    // everything — signage pages (dashboards, widgets) are the whole point of the type.
+    await playItems([{ type: 'webpage', url: 'https://example.com/dashboard', id: 'ok' }]);
+
+    const iframes = findCreatedElements('iframe');
+    expect(iframes).toHaveLength(1);
+    expect(iframes[0].src).toBe('https://example.com/dashboard');
+    expect(await reportedEvents()).not.toContain('frame_url_refused');
+  });
+
+  it('S3: a same-origin webpage frame is NOT handed the device JWT', async () => {
+    // transformContentUrl appends the token for any URL whose origin matches apiUrl,
+    // on the rationale that img/video tags cannot send headers. A FRAME NAVIGATION is
+    // not that case: the token lands in the frame's own document URL, readable off
+    // `location` by any script there and sent in the Referer of its sub-resources.
+    await playItems([{ type: 'webpage', url: 'https://api.vizora.io/kiosk', id: 'same' }]);
+
+    const iframes = findCreatedElements('iframe');
+    expect(iframes).toHaveLength(1);
+    expect(iframes[0].src).toBe('https://api.vizora.io/kiosk');
+    expect(iframes[0].src).not.toContain('token=');
+    expect(iframes[0].src).not.toContain('tok-123');
+  });
+
+  it('S3 NEGATIVE CONTROL: a same-origin IMAGE still gets the token', async () => {
+    // Same seam, same origin, the case the token rule was actually written for.
+    // Proves the withholding is scoped to frame navigations and did not break media
+    // authentication fleet-wide.
+    await playItems([{ type: 'image', url: 'https://api.vizora.io/asset.jpg', id: 'img' }]);
+
+    const imgs = findCreatedElements('img');
+    expect(imgs.length).toBeGreaterThan(0);
+    expect(imgs[imgs.length - 1].src).toContain('token=tok-123');
   });
 });

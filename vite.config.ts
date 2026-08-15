@@ -31,6 +31,51 @@ const RELEASE_ORIGINS = [
 type ResolvedOrigins = Record<'VITE_API_URL' | 'VITE_REALTIME_URL' | 'VITE_DASHBOARD_URL', string>;
 
 /**
+ * The app version compiled into the bundle, read from package.json.
+ *
+ * NOT `process.env.npm_package_version`: that variable exists only when the build
+ * was launched through an npm script. `npx vite build` (or any CI runner that calls
+ * vite directly) silently fell back to '1.0.0', producing an artifact that is signed,
+ * passes the origin verifier, and makes every device report `appVersion: "1.0.0"`
+ * forever — while the release gate "heartbeat records a non-zero appVersion" passes
+ * on the wrong value. Reading the file removes the dependency on how the build was
+ * invoked; the same file is already the source of truth for release-origins.json.
+ *
+ * Release modes THROW rather than fall back. A customer artifact that cannot say
+ * which version it is has no way to be recalled, and a wrong version is worse than a
+ * failed build.
+ */
+function resolveAppVersion(mode: string): string {
+  const pkgPath = resolve(process.cwd(), 'package.json');
+  let version: unknown;
+  try {
+    version = (JSON.parse(readFileSync(pkgPath, 'utf8')) as { version?: unknown }).version;
+  } catch (err) {
+    if (RELEASE_MODES.has(mode)) {
+      throw new Error(
+        `[app-version] cannot build mode "${mode}": ${pkgPath} is missing or not valid JSON ` +
+          `(${(err as Error).message}). The compiled-in __APP_VERSION__ is what every device ` +
+          `reports on its heartbeat; a release cannot ship without it.`,
+      );
+    }
+    return '0.0.0-dev';
+  }
+
+  if (typeof version !== 'string' || version.length === 0) {
+    if (RELEASE_MODES.has(mode)) {
+      throw new Error(
+        `[app-version] cannot build mode "${mode}": "version" is missing or empty in ${pkgPath}. ` +
+          `Shipping a build that reports a placeholder version would pass the release gate on the ` +
+          `wrong value.`,
+      );
+    }
+    return '0.0.0-dev';
+  }
+
+  return version;
+}
+
+/**
  * Resolve the backend origins for a release build, or throw.
  *
  * Fails closed on every path that could otherwise ship an artifact pointing
@@ -125,6 +170,29 @@ export default defineConfig(({ mode }) => {
   // module scripts are unreliable anyway. Newer TVs pick the modern build.
   const isTvBuild = mode === 'tv';
 
+  const appVersion = resolveAppVersion(mode);
+
+  // Crash reporting is DSN-gated at runtime (src/crash-reporting.ts returns early
+  // without one), so an absent DSN silently turns reportEvent into a total no-op —
+  // and every safety argument that rests on telemetry (command_dedupe_*,
+  // device_purge_incomplete, crash_loop_capped, …) becomes void with no signal.
+  //
+  // Deliberately NOT fail-closed: a DSN is a credential, and blocking a release on
+  // one we may not have would be worse than shipping without telemetry knowingly.
+  // Instead the artifact SELF-DESCRIBES (see __VIZORA_SENTRY_CONFIGURED__ in
+  // src/main.ts) and the build says so out loud.
+  const sentryConfigured = Boolean(env.VITE_SENTRY_DSN);
+  if (RELEASE_MODES.has(mode) && !sentryConfigured) {
+    console.warn(
+      `\n[sentry] WARNING: building release mode "${mode}" with NO VITE_SENTRY_DSN.\n` +
+        `  Crash reporting will be a no-op in this artifact: reportEvent() returns without\n` +
+        `  sending, so command_dedupe_*, device_purge_incomplete, crash_loop_capped and every\n` +
+        `  other safety signal this release depends on will be silently unobservable.\n` +
+        `  The bundle records this as __VIZORA_SENTRY_CONFIGURED__ = false — the publish-side\n` +
+        `  verifier reads it back out of the artifact.\n`,
+    );
+  }
+
   return {
     root: '.',
     // Packaged TV apps load index.html from file:// — asset URLs must be
@@ -175,8 +243,9 @@ export default defineConfig(({ mode }) => {
       host: true,
     },
     define: {
-      // App version from package.json (avoids hardcoding)
-      '__APP_VERSION__': JSON.stringify(process.env.npm_package_version || '1.0.0'),
+      // App version read from package.json — see resolveAppVersion() for why this is
+      // no longer process.env.npm_package_version.
+      '__APP_VERSION__': JSON.stringify(appVersion),
       // Backend origins. In release modes these come from release-origins.json and
       // the build has already failed if anything disagreed; in dev/test they are
       // env-driven. Deliberately NOT `env.X || fallback` here any more: that
@@ -199,6 +268,12 @@ export default defineConfig(({ mode }) => {
         }),
       ),
       'import.meta.env.VITE_SENTRY_DSN': JSON.stringify(env.VITE_SENTRY_DSN || ''),
+      // Whether this artifact was built with a crash-reporting DSN. Stamped as a
+      // literal so the publish-side verifier can read it back out of the built
+      // bundle (see the __VIZORA_SENTRY_CONFIGURED__ comment in src/main.ts). The
+      // DSN itself is a credential and is NOT what gets checked — only whether one
+      // was present at build time.
+      '__RELEASE_SENTRY_CONFIGURED__': JSON.stringify(sentryConfigured),
     },
   };
 });
