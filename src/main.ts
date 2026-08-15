@@ -338,6 +338,44 @@ class VizoraAndroidTV {
    * the ring's chance to be read back.
    */
   private static readonly CONTEXT_DESTROYING_COMMANDS = new Set(['reload', 'restart', 'clear_cache']);
+  /**
+   * Marker separating a SYNTHETIC dedupe record from a real `type@timestamp` one.
+   *
+   * A synthetic record is keyed on the command TYPE alone plus the local time it was
+   * dispatched, because the wire gave us nothing else to key on. `~` cannot appear at
+   * the start of a server timestamp we would ever produce (they are ISO strings or
+   * epoch numbers), so the two families cannot be confused in a ring that holds both.
+   */
+  private static readonly COMMAND_UNKEYED_MARK = '@~unkeyed:';
+  /**
+   * How long a synthetic record suppresses an IDENTICAL unkeyable context-destroying
+   * command. 60s, and the two bounds it sits between are both hard:
+   *
+   *  - LOWER bound — it must outlast one replay round, or it terminates nothing. The
+   *    server's ack timeout is 10s and the requeue is delivered on the next connect;
+   *    a reload plus reconnect is the ~3-5s the observed loop period is made of. 60s
+   *    covers that with an order of magnitude to spare, including a slow TV boot.
+   *  - UPPER bound — it must not eat a DELIBERATE re-issue. An operator who watches a
+   *    reload not take and presses the button again does so in tens of seconds, but
+   *    they are the kind of user who will try twice; a window measured in minutes
+   *    would silently swallow the second press with `{ ok: true }` on the dashboard.
+   *
+   * The record only ever exists for a command that arrived with NO usable dedupe key.
+   * A keyed command is matched EXACTLY and is unaffected by this window, and a
+   * non-context-destroying command is never recorded at all — a replayed
+   * `clear_override` costs one wasted execution, a replayed `reload` costs the device.
+   *
+   * CLOCK. The only time source that survives window.location.reload() is Date.now(),
+   * so that is what is used, read once per delivery and used for both the scan and the
+   * record. It can jump: TVs boot with a bogus RTC and correct it from NTP seconds
+   * later. Both directions therefore fail towards EXECUTING, never towards
+   * suppressing — a record stamped in the future (clock moved backwards) and a record
+   * that appears ancient (clock moved forwards) are both simply not "recent", so the
+   * command runs. A suppressed reload the operator wanted is recoverable by pressing
+   * it again; a permanently suppressed one is a device that has stopped taking
+   * commands, which is not.
+   */
+  private static readonly COMMAND_UNKEYED_WINDOW_MS = 60_000;
   private seenCommandKeys: string[] = [];
 
   /**
@@ -1481,6 +1519,10 @@ class VizoraAndroidTV {
 
   private async pullContent(): Promise<void> {
     if (!this.deviceToken || !this.isOnline) return;
+    // The pairing this content is being fetched FOR. A de-pair cannot reach into an
+    // in-flight request (the bound is 20s), so without this the response of the OLD
+    // pairing lands on a purged device and is applied as if it were current.
+    const gen = this.purgeGeneration;
     try {
       const response: HttpResponse = await VizoraAndroidTV.httpWithTimeout(
         CapacitorHttp.get({
@@ -1498,7 +1540,7 @@ class VizoraAndroidTV {
       }
       const body = response.data;
       const payload = body?.data ?? body; // unwrap { success, data } envelope
-      await this.applyPulledContent(payload);
+      await this.applyPulledContent(payload, gen);
     } catch (error) {
       // Fail safe: a reconcile/pull failure NEVER blanks the screen — keep last-known-good.
       console.warn('[Vizora] pullContent failed — keeping last-known-good:', error);
@@ -1514,6 +1556,7 @@ class VizoraAndroidTV {
    */
   private applyPulledContent(
     payload: { version?: string; playlist?: Playlist | null } | null | undefined,
+    gen: number,
   ): Promise<void> {
     // SERIALIZED. There are four entry points into this one critical section —
     // pull-on-connect, the heartbeat reconcile pull, a versioned playlist:update and
@@ -1524,7 +1567,17 @@ class VizoraAndroidTV {
     // three separate steps on shared state, and the LAST commit to land wins — which
     // is not the newest version. The device then reports a version it is not
     // rendering, the server sees agreement and the reconcile self-heal never fires.
-    const next = this.applyContentQueue.then(() => this.applyContentExclusive(payload));
+    //
+    // `gen` is the purge generation of the pairing this payload BELONGS TO, and every
+    // caller captures it where the payload was asked for or delivered — NOT here and
+    // not inside the critical section, both of which run arbitrarily late. A de-pair
+    // cannot reach into an in-flight pull (a 20s bound) or empty a queue that already
+    // holds a push, so a payload of the OLD pairing can enter this section entirely
+    // after the purge; a generation read at that point agrees with itself and commits
+    // the purged tenant's content onto a device sitting on the pairing screen — which
+    // pairing -> playing does NOT refuse, because canPlay() only asks whether a
+    // playlist has items.
+    const next = this.applyContentQueue.then(() => this.applyContentExclusive(payload, gen));
     // The queue must never hold a rejection, or every later apply short-circuits.
     this.applyContentQueue = next.catch(() => {});
     return next;
@@ -1532,13 +1585,19 @@ class VizoraAndroidTV {
 
   private async applyContentExclusive(
     payload: { version?: string; playlist?: Playlist | null } | null | undefined,
+    gen: number,
   ): Promise<void> {
     if (!payload) return;
+    if (gen !== this.purgeGeneration) {
+      // De-paired between this payload arriving and the queue reaching it.
+      console.warn('[Vizora] Content arrived for a pairing that has been purged — discarding it');
+      reportEvent('content_discarded_after_purge', { playlistId: payload.playlist?.id ?? null });
+      return;
+    }
     const incoming = { playlistId: payload.playlist?.id ?? null, version: payload.version ?? '' };
     const current = { playlistId: this.currentContentPlaylistId, version: this.currentContentVersion };
     if (!shouldApplyContent(incoming, current)) return; // stale/duplicate → no-op, no re-flash
     if (payload.playlist) {
-      const gen = this.purgeGeneration;
       try {
         await this.updatePlaylist(payload.playlist);
       } catch (error) {
@@ -1803,7 +1862,9 @@ class VizoraAndroidTV {
       // re-apply (no re-flash). A legacy push without a version falls back to
       // updatePlaylist, whose signature no-op still absorbs an identical re-send (PD-1).
       if (typeof data?.version === 'string' && data.version) {
-        void this.applyPulledContent({ version: data.version, playlist });
+        // The generation at DELIVERY: this handler runs synchronously on the socket
+        // event, but the queue can hold the payload across a de-pair before it applies.
+        void this.applyPulledContent({ version: data.version, playlist }, this.purgeGeneration);
       } else {
         // Same failure handling as the versioned path above (which gets it via
         // applyPulledContent's try). validatePlaylist only checks that `items` is an
@@ -2232,6 +2293,12 @@ class VizoraAndroidTV {
   }
 
   private async updatePlaylist(playlist: Playlist) {
+    // Snapshot BEFORE the persist await below — see the re-check after it. Same
+    // supersede primitive handleTokenRefresh uses for a credential; this one is for
+    // the CONTENT commit, which was the half applyContentExclusive's guard did not
+    // cover (it guards the version only).
+    const gen = this.purgeGeneration;
+
     // PD-1 idempotency: a redundant delivery of the playlist ALREADY playing must
     // be a no-op — no rotation restart, no re-render flash, no duplicate
     // content:impression. The Finding-2 backend fix deliberately re-sends the
@@ -2267,6 +2334,7 @@ class VizoraAndroidTV {
     // transient decrypt failure permanently downgrades that record's tenant binding,
     // for every boot after. Keeping the PREVIOUS (correctly stamped) record is
     // strictly better: it is still tenant-bound, and live delivery is unaffected.
+    let persisted = false;
     if (this.tenantReadFailed) {
       console.warn('[Vizora] Not persisting last_playlist — tenant identity is unverifiable this boot (F4/F42)');
       reportEvent('playlist_persist_skipped_tenant_unverified', { playlistId: playlist.id ?? null });
@@ -2281,9 +2349,47 @@ class VizoraAndroidTV {
             playlist,
           }),
         });
+        persisted = true;
       } catch (err) {
         console.warn('[Vizora] Failed to persist playlist:', err);
       }
+    }
+
+    // A purge that landed inside that write is the whole reason the snapshot exists.
+    // purgeDeviceState removes last_playlist as part of its own purge, so a write
+    // parked in the bridge lands AFTER that removal and OURS is the copy left on disk:
+    // the de-paired device reboots straight back into the purged tenant's playlist.
+    // And everything below this point runs off the `playlist` ARGUMENT rather than
+    // this.currentPlaylist (which the purge nulled), so the preloader re-populates the
+    // cache the purge had just cleared with that tenant's assets. Both are the exact
+    // leak purgeDeviceState exists to prevent, so decline the whole commit.
+    //
+    // The sibling hazard — a payload that reaches updatePlaylist entirely AFTER a
+    // purge, which this entry snapshot cannot see because it is taken too late — is
+    // closed one level up, by the generation applyPulledContent's callers capture at
+    // the point the payload was asked for. See the comment there.
+    if (gen !== this.purgeGeneration) {
+      console.warn('[Vizora] Device was purged while applying a playlist — discarding it');
+      reportEvent('playlist_discarded_after_purge', { playlistId: playlist.id ?? null });
+      // Only what WE put there, and only if it is still ours: a purge implies a
+      // pairing screen, but a re-pair inside the same window is not impossible and
+      // its content must not be collateral.
+      if (this.currentPlaylist === playlist) {
+        this.currentPlaylist = null;
+        this.currentIndex = 0;
+      }
+      if (this.savedPlaylistState?.playlist === playlist) this.savedPlaylistState = null;
+      if (persisted) {
+        void Preferences.remove({ key: 'last_playlist' }).catch((err) => {
+          console.error('[Vizora] Could not remove a playlist persisted across a purge:', err);
+          reportEvent('playlist_purge_cleanup_failed', {});
+        });
+      }
+      // No advance(), no preload, and no screen transition: the revocation path owns
+      // the screen and is already heading for pairing. An enterHolding() from here is
+      // refused while pairing owns it, but it would still fire before that transition
+      // lands, and there is nothing to hold FOR on a de-paired device.
+      return;
     }
 
     if (this.playbackTimer) {
@@ -2674,6 +2780,40 @@ class VizoraAndroidTV {
   }
 
   /**
+   * The key for a SYNTHETIC dedupe record: the command type plus the local time it is
+   * being dispatched at. Null when it would not fit the same length bound a real key
+   * has — `type` is unvalidated wire data, and this key goes into the same two stores.
+   */
+  private static syntheticUnkeyedKey(type: string, at: number): string | null {
+    const key = `${type}${VizoraAndroidTV.COMMAND_UNKEYED_MARK}${at}`;
+    if (key.length > VizoraAndroidTV.COMMAND_DEDUPE_KEY_MAX_LEN) {
+      console.warn(`[Vizora] Synthetic dedupe key too long (${key.length} chars) — not recorded`);
+      reportEvent('command_dedupe_key_oversize', { type: type.slice(0, 64), length: key.length });
+      return null;
+    }
+    return key;
+  }
+
+  /**
+   * When, if ever, an identical unkeyable command was dispatched inside the window —
+   * see COMMAND_UNKEYED_WINDOW_MS for why the window exists and what the clock can do
+   * to it. Newest match first; `elapsed >= 0` is the clock-went-backwards guard, and
+   * dropping such a record means the command EXECUTES.
+   */
+  private recentUnkeyedDispatch(type: string, now: number): number | null {
+    const mark = `${type}${VizoraAndroidTV.COMMAND_UNKEYED_MARK}`;
+    for (let i = this.seenCommandKeys.length - 1; i >= 0; i--) {
+      const key = this.seenCommandKeys[i];
+      if (key.slice(0, mark.length) !== mark) continue;
+      const at = Number(key.slice(mark.length));
+      if (!Number.isFinite(at)) continue;
+      const elapsed = now - at;
+      if (elapsed >= 0 && elapsed < VizoraAndroidTV.COMMAND_UNKEYED_WINDOW_MS) return at;
+    }
+    return null;
+  }
+
+  /**
    * Restore the persisted dedupe ring.
    *
    * This is the infinite-reload guard, and it only works because it is on DISK.
@@ -2822,17 +2962,57 @@ class VizoraAndroidTV {
         reportEvent('command_dedupe_persist_timeout', { type: command.type });
       }
     } else if (VizoraAndroidTV.CONTEXT_DESTROYING_COMMANDS.has(command.type)) {
-      // An unkeyable context-destroying command is the one shape this whole guard
-      // cannot cover: it executes (never suppressed on a guess) and records NOTHING,
-      // so a requeue after a lost ack replays it with no terminator at all. The
-      // scheme's safety rests on the gateway always stamping `timestamp` — one line
-      // in another repo, with no compiler between us. Failing open there is right;
-      // failing open SILENTLY is how it would first be discovered as a field loop.
-      console.warn(`[Vizora] ${command.type} arrived with no dedupe key — replay cannot be suppressed`);
+      // An unkeyable context-destroying command was the one shape this guard could not
+      // cover: it executes (never suppressed on a guess) and, with no key to record,
+      // recorded NOTHING — so a requeue after a lost ack replayed it with no
+      // terminator at all, at the ~3-5s period of reload → reconnect → replay →
+      // reload, forever. The scheme's safety otherwise rests on the gateway always
+      // stamping `timestamp`: one line in another repo, with no compiler between us.
+      //
+      // So key it on what we DO have — the type, and our own clock. A TIME-WINDOWED
+      // SYNTHETIC RECORD (COMMAND_UNKEYED_WINDOW_MS) terminates the loop after ONE
+      // execution while leaving a deliberate re-issue a minute later working. It is
+      // deliberately not a permanent record: the replay is a machine retrying inside
+      // seconds, a second press is a human, and only the window tells them apart.
+      //
+      // It goes through rememberCommand — the SAME durable mechanism as a real key
+      // (synchronous localStorage first, then Preferences) — because it has to survive
+      // the very reload it exists to survive. An in-memory-only record is read back
+      // empty by the reloaded context and terminates nothing.
+      const now = Date.now();
+      const recordedAt = this.recentUnkeyedDispatch(command.type, now);
+      if (recordedAt !== null) {
+        // Still acked by the caller, exactly like a keyed duplicate (rule 1): a nack
+        // would just requeue the delivery we are deliberately declining to repeat.
+        console.warn(`[Vizora] Unkeyable ${command.type} repeated after ${now - recordedAt}ms — suppressed as a replay`);
+        reportEvent('command_unkeyed_replay_suppressed', { type: command.type, ageMs: now - recordedAt });
+        return;
+      }
+      // Failing open is right; failing open SILENTLY is how a missing stamp would
+      // first be discovered as a field loop. This fires on the FIRST delivery only.
+      console.warn(`[Vizora] ${command.type} arrived with no dedupe key — guarding the replay on a synthetic record`);
       reportEvent('command_dedupe_key_missing', { type: command.type });
+
+      const synthetic = VizoraAndroidTV.syntheticUnkeyedKey(command.type, now);
+      if (synthetic !== null) {
+        // Bounded exactly like the keyed path, and dispatching anyway on timeout for
+        // the same reason: losing the record risks one duplicate execution, losing the
+        // command loses the operator's action outright.
+        const persist = await Promise.race([
+          this.rememberCommand(synthetic).then(() => 'persisted' as const),
+          this.timeoutAfter(VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS),
+        ]);
+        if (persist === 'timeout') {
+          console.warn(
+            `[Vizora] Synthetic dedupe record did not settle in ${VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS}ms — dispatching ${command.type} unguarded`,
+          );
+          reportEvent('command_dedupe_persist_timeout', { type: command.type });
+        }
+      }
       // Give the ack frame the same task boundary the keyed path gets from its
       // persist, so the tightest flush window does not land on exactly the case that
-      // also has no dedupe protection.
+      // also has the weakest dedupe protection. Kept unconditional: the record above
+      // is skipped entirely when the synthetic key does not fit.
       await this.timeoutAfter(0);
     }
 

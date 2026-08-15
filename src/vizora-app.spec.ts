@@ -254,7 +254,9 @@ let preferencesStore: Map<string, string>;
 let secureStorageStore: Map<string, string>;
 /** When true, the next Preferences.get throws — used to exercise init retry. */
 let preferencesFailNext = false;
-let httpGetHandler: (opts: { url: string }) => { status: number; data: unknown };
+// A handler may return the response ASYNCHRONOUSLY — CapacitorHttp.get is async and a
+// request parked in flight (across a de-pair, say) is a real state this suite drives.
+let httpGetHandler: (opts: { url: string }) => { status: number; data: unknown } | Promise<{ status: number; data: unknown }>;
 let httpPostHandler: (opts: { url: string; data?: unknown; connectTimeout?: number; readTimeout?: number }) => { status: number; data: unknown };
 let networkListeners: Map<string, Function[]>;
 let appListeners: Map<string, Function[]>;
@@ -5649,16 +5651,27 @@ describe('deliveryAck — delivery-guaranteed emits (client capability)', () => 
   });
 
   it('5b: a command with NO timestamp is executed (never suppressed on a guess) and still acked', async () => {
+    // The FIRST delivery is unchanged and deliberately so: with no key there is
+    // nothing to match on, and dropping the operator's command is worse than
+    // duplicating it. What this test used to assert about the SECOND one — that it
+    // also executed — was the unterminated loop itself, 50ms apart being exactly the
+    // replay cadence and nothing else in the system bounding it. The time-windowed
+    // synthetic record (G1 below, both directions) is what now separates a machine
+    // replaying inside seconds from a human re-issuing a minute later.
     await connectAndCommit();
     const ackA = vi.fn();
     const ackB = vi.fn();
 
     triggerSocketEvent('command', { type: 'reload' }, ackA);
     await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+
     triggerSocketEvent('command', { type: 'reload' }, ackB);
     await vi.advanceTimersByTimeAsync(50);
 
-    expect(window.location.reload).toHaveBeenCalledTimes(2);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    // BOTH are acked, the suppressed one included — a nack just requeues the delivery
+    // we deliberately declined to repeat.
     expect(ackA).toHaveBeenCalledWith({ ok: true });
     expect(ackB).toHaveBeenCalledWith({ ok: true });
   });
@@ -6380,10 +6393,17 @@ describe('deliveryAck — delivery-guaranteed emits (client capability)', () => 
       const missing = calls.find(c => c[0] === 'command_dedupe_key_missing');
       expect(missing, `no report for ${type}`).toBeDefined();
       expect((missing![1] as { type?: string }).type).toBe(type);
-      // Fail-open behaviour is UNCHANGED: it ran, it was acked, nothing was recorded.
+      // Fail-open behaviour is UNCHANGED on the first delivery: it ran, it was acked.
       expect(window.location.reload).toHaveBeenCalledTimes(1);
       expect(ack).toHaveBeenCalledWith({ ok: true });
-      expect(preferencesStore.has('seen_command_keys')).toBe(false);
+      // What it no longer does is record NOTHING. A synthetic record lands in BOTH
+      // durable homes — the synchronous one is the copy that survives the reload this
+      // command just fired, which is the only reason it can terminate the replay.
+      const mark = `${type}@~unkeyed:`;
+      expect(localStorageStore.get('vizora_seen_command_keys'), `no local record for ${type}`)
+        .toContain(mark);
+      expect(preferencesStore.get('seen_command_keys'), `no persisted record for ${type}`)
+        .toContain(mark);
     }
   });
 
@@ -6754,12 +6774,17 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     const oversize = calls.find(c => c[0] === 'command_dedupe_key_oversize');
     expect(oversize).toBeDefined();
     expect((oversize![1] as { length?: number }).length).toBeGreaterThan(128);
-    // Fail OPEN, and nothing that huge reaches either store.
+    // Fail OPEN, and nothing that huge reaches either store — which is the point of
+    // the bound: an oversized key is a way to blow the quota from the wire.
     expect(window.location.reload).toHaveBeenCalledTimes(1);
-    expect(localRing()).toEqual([]);
-    expect(preferencesStore.has('seen_command_keys')).toBe(false);
-    // It is context-destroying and unkeyable, so the existing missing-key alarm fires too.
+    expect(localRing().some(k => k.length > 128)).toBe(false);
+    expect(localStorageStore.get('vizora_seen_command_keys') ?? '').not.toContain('x'.repeat(200));
+    expect(preferencesStore.get('seen_command_keys') ?? '').not.toContain('x'.repeat(200));
+    // It is context-destroying and unkeyable, so the existing missing-key alarm fires
+    // too — and the short synthetic guard IS recorded, because an oversized key leaves
+    // a replay just as unterminable as a missing one.
     expect(await reportedEvents()).toContain('command_dedupe_key_missing');
+    expect(localRing().some(k => k.startsWith('reload@~unkeyed:'))).toBe(true);
   });
 
   it('S1 NEGATIVE CONTROL: a long-but-legal key is still recorded', async () => {
@@ -7389,5 +7414,323 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     const imgs = findCreatedElements('img');
     expect(imgs.length).toBeGreaterThan(0);
     expect(imgs[imgs.length - 1].src).toContain('token=tok-123');
+  });
+
+  // ======================================================================
+  // G1. THE UNKEYABLE CONTEXT-DESTROYING COMMAND LOOP HAS A TERMINATOR
+  // ======================================================================
+  //
+  // B1 made the ring durable, which closed the two keyed ways a dispatch could go
+  // unrecorded (a rejecting write, a wedged bridge). It could not close the third:
+  // with no `timestamp` on the wire there is no key, so rememberCommand was never
+  // called at all and NOTHING was recorded. A requeue after a lost ack then replays
+  // the identical unkeyable reload with no terminator — reload → ack stranded in
+  // engine.io's writeBuffer → reload() discards it → requeue at 10s → reconnect →
+  // replay → reload, forever, the moment any future server emitter forgets the stamp.
+  //
+  // The record is therefore keyed on the command TYPE plus our own clock, and it
+  // expires. That is the whole design: a replay is a machine retrying inside seconds,
+  // a re-issue is a human pressing the button again; only a window tells them apart.
+  // Both directions are asserted below, and the clock is assumed hostile — a TV boots
+  // with a bogus RTC and corrects it from NTP — so every ambiguous stamp must fail
+  // towards EXECUTING.
+
+  /** Synthetic records for `type`, read off the SYNCHRONOUS durable home. */
+  const unkeyedRecords = (type: string) => localRing().filter(k => k.startsWith(`${type}@~unkeyed:`));
+
+  it('G1: an unkeyable reload replayed inside the window is suppressed — and still acked', async () => {
+    await connectAndCommit();
+
+    triggerSocketEvent('command', { type: 'reload' }, vi.fn()); // no timestamp
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(unkeyedRecords('reload')).toHaveLength(1);
+
+    // The requeue lands one server ack-timeout later — well inside the window.
+    await vi.advanceTimersByTimeAsync(10_000);
+    const ack = vi.fn();
+    triggerSocketEvent('command', { type: 'reload' }, ack);
+    await vi.advanceTimersByTimeAsync(50);
+
+    // ONE execution total: the loop is terminated.
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    // And the suppressed replay is STILL acked — a nack requeues the exact delivery we
+    // deliberately declined to repeat, which is the loop again by another door.
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+    expect(await reportedEvents()).toContain('command_unkeyed_replay_suppressed');
+  });
+
+  it('G1: the record survives the RELOAD it exists to survive', async () => {
+    // The suppression above would be worthless in the field if it lived in memory: the
+    // replay arrives in a context that has just been torn down and rebuilt. This is
+    // the real shape — dispatch, whole new JS context, requeue — and only the durable
+    // half of the record can terminate it from there.
+    await connectAndCommit();
+    triggerSocketEvent('command', { type: 'reload' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(4000); // reload + reconnect
+    await importFresh();                     // ← the reload: nothing survives but storage
+    (window.location.reload as Mock).mockClear();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+
+    const ack = vi.fn();
+    triggerSocketEvent('command', { type: 'reload' }, ack); // the server's requeue
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).not.toHaveBeenCalled();
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+    expect(await reportedEvents()).toContain('command_unkeyed_replay_suppressed');
+  });
+
+  it('G1: the SYNCHRONOUS home alone terminates it — a rejecting Preferences write is not enough to lose it', async () => {
+    // Same reasoning as B1, applied to the synthetic record: on Tizen/webOS the
+    // Preferences plugin IS localStorage, and a QuotaExceededError fails every write
+    // identically. If the synthetic record only had the async home it would be absent
+    // in exactly the state the loop runs in.
+    await connectAndCommit();
+    await breakRingPreferences(async () => { throw new Error('QuotaExceededError'); });
+
+    triggerSocketEvent('command', { type: 'reload' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(preferencesStore.has('seen_command_keys')).toBe(false); // the async home is gone
+    expect(unkeyedRecords('reload')).toHaveLength(1);              // the sync one is not
+
+    await vi.advanceTimersByTimeAsync(4000);
+    await importFresh();
+    (window.location.reload as Mock).mockClear();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    triggerSocketEvent('command', { type: 'reload' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).not.toHaveBeenCalled();
+  });
+
+  it('G1 THE OTHER DIRECTION: a deliberate re-issue AFTER the window still executes', async () => {
+    // The window is what keeps this a replay guard rather than a one-shot latch. An
+    // operator who watches a reload not take and presses it again a minute later must
+    // get a reload — silently swallowing that press, with `{ ok: true }` on the
+    // dashboard, is its own field failure.
+    await connectAndCommit();
+
+    triggerSocketEvent('command', { type: 'reload' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(61_000); // past the 60s window
+    triggerSocketEvent('command', { type: 'reload' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).toHaveBeenCalledTimes(2);
+    expect(unkeyedRecords('reload')).toHaveLength(2); // and the new one is guarded too
+  });
+
+  it('G1 NEGATIVE CONTROL: the window reaches neither keyed commands nor harmless ones', async () => {
+    // Two ways a type-keyed window could be wrong: swallowing distinct KEYED commands
+    // (which already have exact dedupe, so type-only suppression would be a
+    // regression), and recording commands whose replay is merely wasteful.
+    await connectAndCommit();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'g1-a' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'g1-b' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(2); // both ran, 100ms apart
+    expect(unkeyedRecords('reload')).toHaveLength(0);        // nothing synthetic recorded
+
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    triggerSocketEvent('command', { type: 'reboot' }, vi.fn()); // unkeyed, NOT context-destroying
+    await vi.advanceTimersByTimeAsync(50);
+    triggerSocketEvent('command', { type: 'reboot' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect((await reportedEventCalls()).filter(c => c[0] === 'command_unsupported')).toHaveLength(2);
+    expect(unkeyedRecords('reboot')).toHaveLength(0);
+    expect(await reportedEvents()).not.toContain('command_unkeyed_replay_suppressed');
+  });
+
+  it('G1 CLOCK: a record stamped in the FUTURE does not suppress', async () => {
+    // A device whose clock jumps BACKWARDS at boot (bogus RTC, then NTP) reads its own
+    // record as being in the future. Treating that as "recent" would suppress every
+    // unkeyable reload until the clock caught up — a device that has silently stopped
+    // taking commands. Fail towards executing: a suppressed reload the operator wanted
+    // is recoverable by pressing it again; a permanently suppressed one is not.
+    localStorageStore.set(LOCAL_RING_KEY, JSON.stringify([`reload@~unkeyed:${Date.now() + 3_600_000}`]));
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    (window.location.reload as Mock).mockClear();
+
+    triggerSocketEvent('command', { type: 'reload' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('G1 CLOCK NEGATIVE CONTROL: the same seeded record, stamped NOW, does suppress', async () => {
+    // Same boot, same seam, same restore path — only the sign of the offset differs.
+    // Proves the future-stamp case above is the clock guard doing its job and not the
+    // restore having gone dark (which would also produce "it executed", plus a device
+    // with no terminator at all).
+    localStorageStore.set(LOCAL_RING_KEY, JSON.stringify([`reload@~unkeyed:${Date.now()}`]));
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    (window.location.reload as Mock).mockClear();
+
+    triggerSocketEvent('command', { type: 'reload' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).not.toHaveBeenCalled();
+  });
+
+  // ======================================================================
+  // G2. A PURGE DURING A CONTENT COMMIT LEAVES NOTHING OF THAT TENANT
+  // ======================================================================
+  //
+  // C7 guards the VERSION commit. The CONTENT commit was unguarded: updatePlaylist
+  // awaits a Preferences write, and purgeDeviceState — which runs its own
+  // `last_playlist` removal — can land inside that window, so our write is the one
+  // left on disk. Everything after the await then renders and PRELOADS the purged
+  // tenant's assets, and pairing -> playing is NOT refused, because canPlay() only
+  // asks whether a playlist has items. Same class one level out: a pull is not
+  // cancelled by a de-pair (a 20s bound), so the old pairing's content can arrive on a
+  // device that is already showing a pairing code.
+
+  /** Park the `last_playlist` write for one specific playlist; the rest stays healthy. */
+  const parkPlaylistPersist = async (marker: string) => {
+    const { Preferences } = await import('@capacitor/preferences');
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let parked = false;
+    (Preferences.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+      if (key === 'last_playlist' && value.includes(marker) && !parked) { parked = true; await gate; }
+      preferencesStore.set(key, value);
+    });
+    return { release: () => release(), parked: () => parked };
+  };
+
+  it('G2: a purge inside the playlist persist discards it — disk, memory and screen', async () => {
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    await connectAndCommit();
+    const persist = await parkPlaylistPersist('c2');
+
+    triggerSocketEvent('playlist:update', playlistV('v2', 'c2', '/c2.jpg', 'pl-shared'));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(persist.parked()).toBe(true); // the arrange really did park inside the commit
+
+    triggerSocketEvent('device:revoked', { reason: 'operator' });
+    await waitUntil('purge', () => !secureStorageStore.has('device_token'), { tickMs: 100 });
+    await waitUntil(
+      'pairing code',
+      () => domElements.get('pairing-code')!.textContent === 'ABCD1234',
+      { tickMs: 200 },
+    );
+
+    persist.release();
+    for (let i = 0; i < 60; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1600);
+
+    // The write landed AFTER purgeDeviceState's removal, so it is the copy left on
+    // disk — a de-paired device that reboots straight back into the purged tenant's
+    // playlist. It must be taken back out.
+    expect(preferencesStore.has('last_playlist')).toBe(false);
+    // Independently of the disk record: everything after the await runs off the
+    // playlist ARGUMENT, not off this.currentPlaylist, so the preloader re-populated
+    // the cache purgeDeviceState had just cleared with the purged tenant's assets.
+    expect(mockCacheManager.downloadContent.mock.calls.some((c: unknown[]) => c[0] === 'c2')).toBe(false);
+    // Nothing of that tenant reaches the glass, and the screen the revocation path
+    // owns is the one the device is left on.
+    expect(findCreatedElements('img').some(i => i.src.includes('c2.jpg'))).toBe(false);
+    expect(visibleScreens()).toEqual(['pairing-screen']);
+    expect(await reportedEvents()).toContain('playlist_discarded_after_purge');
+  });
+
+  it('G2 NEGATIVE CONTROL: the same parked persist with NO purge still commits', async () => {
+    // Same seam, same parking, no revocation. Proves the discard belongs to the purge
+    // and not to the parking — a guard that dropped every slow persist would drop
+    // content on every device with a busy bridge.
+    await connectAndCommit();
+    const persist = await parkPlaylistPersist('c2');
+
+    triggerSocketEvent('playlist:update', playlistV('v2', 'c2', '/c2.jpg', 'pl-shared'));
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(persist.parked()).toBe(true);
+
+    persist.release();
+    for (let i = 0; i < 60; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(JSON.parse(preferencesStore.get('last_playlist')!).playlist.items[0].contentId).toBe('c2');
+    expect(mockCacheManager.downloadContent.mock.calls.some((c: unknown[]) => c[0] === 'c2')).toBe(true);
+    expect(findCreatedElements('img').some(i => i.src.includes('c2.jpg'))).toBe(true);
+    expect(visibleScreens()).toEqual(['content-screen']);
+    expect(await reportedEvents()).not.toContain('playlist_discarded_after_purge');
+  });
+
+  it('G2: a pull that resolves AFTER the de-pair does not put the purged tenant back on screen', async () => {
+    await connectAndCommit();
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    httpGetHandler = (opts) => {
+      if (opts.url.includes('/devices/me/content')) {
+        return gate.then(() => ({ status: 200, data: { data: playlistV('v9', 'c9', '/c9.jpg', 'pl-purged') } }));
+      }
+      if (opts.url.includes('/devices/auth/check')) return { status: 410, data: { code: 'DEVICE_REVOKED' } };
+      return { status: 200, data: { data: { status: 'pending' } } };
+    };
+
+    // A reconnect issues the pull-on-connect; it parks in flight.
+    triggerSocketEvent('connect');
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+
+    triggerSocketEvent('device:revoked', { reason: 'operator' });
+    await waitUntil('purge', () => !secureStorageStore.has('device_token'), { tickMs: 100 });
+    await waitUntil(
+      'pairing code',
+      () => domElements.get('pairing-code')!.textContent === 'ABCD1234',
+      { tickMs: 200 },
+    );
+
+    release();
+    for (let i = 0; i < 60; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(findCreatedElements('img').some(i => i.src.includes('c9.jpg'))).toBe(false);
+    expect(visibleScreens()).toEqual(['pairing-screen']);
+    expect(preferencesStore.has('last_playlist')).toBe(false);
+    expect(await reportedEvents()).toContain('content_discarded_after_purge');
+  });
+
+  it('G2 NEGATIVE CONTROL: the same parked pull with NO purge applies normally', async () => {
+    // Same seam, same parking. Proves the discard is bound to the de-pair and that
+    // pull-on-connect — the T2 delivery path for every reconnecting device — still
+    // works when the pairing is intact.
+    await connectAndCommit();
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    httpGetHandler = (opts) => {
+      if (opts.url.includes('/devices/me/content')) {
+        return gate.then(() => ({ status: 200, data: { data: playlistV('v9', 'c9', '/c9.jpg', 'pl-purged') } }));
+      }
+      return { status: 200, data: { data: { status: 'pending' } } };
+    };
+
+    triggerSocketEvent('connect');
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    release();
+    for (let i = 0; i < 60; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(findCreatedElements('img').some(i => i.src.includes('c9.jpg'))).toBe(true);
+    expect(visibleScreens()).toEqual(['content-screen']);
+    expect(await reportedEvents()).not.toContain('content_discarded_after_purge');
   });
 });
