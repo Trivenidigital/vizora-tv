@@ -352,6 +352,9 @@ interface MockSocket {
   disconnect: Mock;
   removeAllListeners: Mock;
   connected: boolean;
+  /** Real Socket.IO seeds this from the handshake options and re-reads it on every
+   *  reconnection attempt; the client mutates it on token rotation. */
+  auth?: unknown;
   _handlers: Map<string, Function[]>;
 }
 
@@ -1478,6 +1481,10 @@ describe('VizoraAndroidTV', () => {
     it('command event calls handleCommand', async () => {
       await importFresh();
       triggerSocketEvent('command', { type: 'reload' });
+      // The dispatch is one task boundary out — an unkeyable context-destroying
+      // command yields before reloading so the ack frame gets a chance to flush
+      // (see A11b). Same reason the keyed path awaits its ring persist.
+      await vi.advanceTimersByTimeAsync(10);
       expect(window.location.reload).toHaveBeenCalled();
     });
 
@@ -1592,6 +1599,7 @@ describe('VizoraAndroidTV', () => {
       const ack = hb[hb.length - 1] as Function;
       expect(typeof ack).toBe('function');
       ack({ commands: [{ type: 'reload' }] });
+      await vi.advanceTimersByTimeAsync(10); // task boundary before the dispatch — see A11b
       expect(window.location.reload).toHaveBeenCalled();
     });
 
@@ -1602,6 +1610,7 @@ describe('VizoraAndroidTV', () => {
       const hb = currentMockSocket.emit.mock.calls.find((c: unknown[]) => c[0] === 'heartbeat')!;
       const ack = hb[hb.length - 1] as Function;
       ack({ data: { commands: [{ type: 'reload' }] } });
+      await vi.advanceTimersByTimeAsync(10); // task boundary before the dispatch — see A11b
       expect(window.location.reload).toHaveBeenCalled();
     });
   });
@@ -2085,6 +2094,7 @@ describe('VizoraAndroidTV', () => {
     it('reload: calls window.location.reload()', async () => {
       await importFresh();
       triggerSocketEvent('command', { type: 'reload' });
+      await vi.advanceTimersByTimeAsync(10); // task boundary before the dispatch — see A11b
       expect(window.location.reload).toHaveBeenCalled();
     });
 
@@ -4013,7 +4023,12 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
       await vi.advanceTimersByTimeAsync(10);
 
       expect(secureStorageStore.get('device_token')).toBe('new-tok');
-      expect(currentMockSocket.auth).toEqual({ token: 'new-tok' });
+      // The handshake auth after a rotation carries the new token AND the
+      // capability advertisement. This assertion is exact on purpose: it was
+      // `toEqual({ token })` while the client sent only a token, and the moment
+      // `capabilities` was added a wholesale `auth = { token }` would have silently
+      // dropped it here. See the dedicated deliveryAck block for the direction test.
+      expect(currentMockSocket.auth).toEqual({ token: 'new-tok', capabilities: ['deliveryAck'] });
     });
 
     it('NEGATIVE: a malformed payload never clears a working credential', async () => {
@@ -5062,5 +5077,1085 @@ describe('Client correctness & security residuals — siblings (B3–B7)', () =>
       expect(tokens).toContain('allow-same-origin');
       expect(tokens).toContain('allow-scripts');
     });
+  });
+});
+
+// ============================================================================
+// deliveryAck — the client capability that arms the server's delivery guarantee
+// ============================================================================
+//
+// The backend's whole delivery-guarantee layer is live in production and inert,
+// because it is gated on `auth.capabilities` in the Socket.IO handshake and no TV
+// client advertised anything. With no capability the gateway does a bare
+// socket.emit() and returns { delivered: true, legacy: true } — so a `command`
+// written into a half-open socket (TCP dead, server has not noticed, up to ~45s)
+// is lost permanently and silently while the dashboard reports it delivered and
+// writes an audit row, and a `playlist:update` into the same socket is marked
+// delivered while the server DELETES its pending-replay entry.
+//
+// Every test below drives the REAL production socket handlers registered by
+// connectToRealtime(), through the same triggerSocketEvent seam the rest of this
+// file uses. Each assertion is on DIRECTION (what value, in what order, how many
+// times), never on mere presence, and each one uses an INDEPENDENT observable —
+// the ack callback, window.location.reload, the persisted Preferences ring, the
+// heartbeat's reported contentVersion, the rendered <img> src, the telemetry
+// stream — so no single convenient field can carry the suite.
+describe('deliveryAck — delivery-guaranteed emits (client capability)', () => {
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    resetCapacitorFakes();
+    resetDOM();
+    (window.location as { search: string }).search = '';
+    (window.location.reload as Mock).mockReset();
+    ioFactory.mockClear();
+    currentMockSocket = createMockSocket();
+    ioFactory.mockReturnValue(currentMockSocket);
+    mockCacheManager.getCachedUri.mockReset().mockResolvedValue(null);
+    mockCacheManager.downloadContent.mockReset().mockResolvedValue(null);
+    mockCacheManager.clearCache.mockReset().mockResolvedValue(undefined);
+    qrToCanvasMock.mockReset().mockResolvedValue(undefined);
+    const { SecureStorage } = await import('./secure-storage');
+    (SecureStorage.get as Mock).mockImplementation(async ({ key }: { key: string }) => ({
+      value: secureStorageStore.get(key) ?? null,
+    }));
+    (SecureStorage.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+      secureStorageStore.set(key, value);
+    });
+    (SecureStorage.remove as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      secureStorageStore.delete(key);
+    });
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    secureStorageStore.set('device_token', 'tok-123');
+    secureStorageStore.set('device_id', 'dev-123');
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  // -------- shared observables --------
+
+  const visibleScreens = () =>
+    ['loading-screen', 'pairing-screen', 'content-screen', 'holding-screen', 'error-screen']
+      .filter(id => {
+        const el = domElements.get(id);
+        return el && !el._classListSet.has('hidden');
+      });
+
+  const reportedEventCalls = async () => {
+    const { reportEvent } = await import('./crash-reporting');
+    return (reportEvent as Mock).mock.calls as unknown[][];
+  };
+
+  const reportedEvents = async () => (await reportedEventCalls()).map(c => c[0]);
+
+  /** What this device TELLS THE SERVER it is rendering — read off a real heartbeat. */
+  const reportedContentVersion = async () => {
+    await vi.advanceTimersByTimeAsync(15_000);
+    const beats = currentMockSocket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'heartbeat');
+    return (beats[beats.length - 1][1] as { contentVersion: string }).contentVersion;
+  };
+
+  const imgCount = (needle: string) =>
+    findCreatedElements('img').filter((i: ElementStub) => i.src.includes(needle)).length;
+
+  // playlistId matters: shouldApplyContent() treats a CHANGED playlistId as a
+  // reassignment and applies it regardless of version. Staleness only bites within
+  // one playlist, so the stale-version test below pins the id deliberately.
+  const playlistV = (version: string, contentId: string, url: string, playlistId?: string) => ({
+    version,
+    playlist: {
+      id: playlistId ?? `pl-${contentId}`, name: contentId, loopPlaylist: true,
+      items: [{ id: `it-${contentId}`, contentId, duration: 10, order: 0,
+        content: { id: contentId, name: contentId, type: 'image', url } }],
+    },
+  });
+
+  /** Boot a paired device onto a connected socket with content on the glass. */
+  const connectAndCommit = async () => {
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    triggerSocketEvent('playlist:update', playlistV('v1', 'c1', '/c1.jpg'));
+    await vi.advanceTimersByTimeAsync(1600);
+    expect(visibleScreens()).toEqual(['content-screen']);
+  };
+
+  /** Every value the client passed to an ack callback, flattened. */
+  const ackArgs = (ack: Mock) => ack.mock.calls.map((c: unknown[]) => c[0] as { ok?: unknown });
+
+  // ======================================================================
+  // 1. POSITIVE ACK — both delivery-guaranteed events
+  // ======================================================================
+
+  it('1a: playlist:update invokes the callback exactly once with { ok: true }', async () => {
+    await connectAndCommit();
+    const ack = vi.fn();
+
+    triggerSocketEvent('playlist:update', playlistV('v2', 'c2', '/c2.jpg'), ack);
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(ack).toHaveBeenCalledTimes(1);
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+    // Direction, not presence: the payload was also actually applied, so the ack is
+    // not a receipt for a handler that quietly did nothing.
+    expect(await reportedContentVersion()).toBe('v2');
+  });
+
+  it('1b: command invokes the callback exactly once with { ok: true }', async () => {
+    await connectAndCommit();
+    const ack = vi.fn();
+
+    triggerSocketEvent('command', { type: 'reload' }, ack);
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(ack).toHaveBeenCalledTimes(1);
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  // ======================================================================
+  // 2. THE CLIENT NEVER NACKS — the single most dangerous thing it could do
+  // ======================================================================
+  //
+  // The server has NO attempt counter, NO dead-letter and NO give-up for a nacked
+  // payload. Its only circuit breaker is per-device/per-process, is reset by any
+  // clean replay round, and is bypassed entirely by the connect-time replay path
+  // (which also refreshes the Redis TTL). A nack on a failure class that also
+  // restarts the client is therefore a loop the server cannot terminate. Playlist
+  // and command replay additionally share ONE backoff counter, so nacking playlists
+  // would throttle and eventually suppress this device's own command delivery.
+
+  it('2: NEVER nacks — malformed payload, unknown command, and a throwing handler all ack ok:true', async () => {
+    await connectAndCommit();
+    const acks: Mock[] = [];
+    const fire = (event: string, payload: unknown) => {
+      const ack = vi.fn();
+      acks.push(ack);
+      return () => triggerSocketEvent(event, payload, ack);
+    };
+
+    fire('playlist:update', { playlist: 'not-an-object' })();
+    fire('playlist:update', null)();
+    fire('playlist:update', { playlist: { id: 'p', name: 'p', items: [null] }, version: 'v9' })();
+    fire('command', { type: 'no_such_command_type' })();
+    fire('command', {})();
+    // A handler that genuinely throws: reload() blowing up mid-dispatch.
+    (window.location.reload as Mock).mockImplementationOnce(() => { throw new Error('boom'); });
+    fire('command', { type: 'reload' })();
+    // And a payload whose own property access throws, before validation can run.
+    const hostile = fire('playlist:update', { get playlist() { throw new Error('hostile getter'); } });
+    expect(hostile).toThrow('hostile getter');
+
+    await vi.advanceTimersByTimeAsync(1600);
+
+    // POSITIVE CONTROL FIRST — a "never ok:false" assertion goes vacuous the moment
+    // the acks stop being invoked at all.
+    expect(acks).toHaveLength(7);
+    for (const ack of acks) {
+      expect(ack).toHaveBeenCalledTimes(1);
+    }
+    const everyValue = acks.flatMap(ackArgs);
+    expect(everyValue).toHaveLength(7);
+    expect(everyValue.every(v => v?.ok === true)).toBe(true);
+    expect(everyValue.some(v => v?.ok === false)).toBe(false);
+  });
+
+  it('2 NEGATIVE CONTROL: the ok-value assertion can distinguish true from false', async () => {
+    // Same shape, same matchers, so the check above is known to be capable of
+    // failing rather than passing on anything at all.
+    const nacked = [{ ok: true }, { ok: false }];
+    expect(nacked.every(v => v.ok === true)).toBe(false);
+    expect(nacked.some(v => v.ok === false)).toBe(true);
+  });
+
+  // ======================================================================
+  // 3. MALFORMED PAYLOAD — acked, inert, playback continues
+  // ======================================================================
+
+  it('3: a malformed playlist:update is acked, changes nothing, and never darkens the screen', async () => {
+    await connectAndCommit();
+    const before = imgCount('c1.jpg');
+    const ack = vi.fn();
+
+    triggerSocketEvent('playlist:update', { playlist: { nope: true } }, ack);
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+    // Inert: no re-render, no version move, no screen change.
+    expect(imgCount('c1.jpg')).toBe(before);
+    expect(await reportedContentVersion()).toBe('v1');
+    expect(visibleScreens()).toEqual(['content-screen']);
+  });
+
+  it('3 NEGATIVE CONTROL: a WELL-FORMED update at the same entry point does re-render', async () => {
+    // Without this, "nothing changed" could just mean the handler is dead.
+    await connectAndCommit();
+    const ack = vi.fn();
+
+    triggerSocketEvent('playlist:update', playlistV('v2', 'c2', '/c2.jpg'), ack);
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(imgCount('c2.jpg')).toBeGreaterThan(0);
+    expect(await reportedContentVersion()).toBe('v2');
+  });
+
+  // ======================================================================
+  // 4. STALE VERSION — acked, and correctly NOT applied
+  // ======================================================================
+
+  it('4: a stale-version push is acked ok:true but does NOT replace what is on glass', async () => {
+    const SAME = 'pl-shared';
+    await connectAndCommit();
+    triggerSocketEvent('playlist:update', playlistV('v5', 'c5', '/c5.jpg', SAME));
+    await vi.advanceTimersByTimeAsync(1600);
+    expect(await reportedContentVersion()).toBe('v5');
+    const staleRendersBefore = imgCount('c3.jpg');
+    const ack = vi.fn();
+
+    triggerSocketEvent('playlist:update', playlistV('v3', 'c3', '/c3.jpg', SAME), ack);
+    await vi.advanceTimersByTimeAsync(1600);
+
+    // Acked — a nack would only make the server replay the same stale payload,
+    // against a shared backoff counter this device's commands depend on.
+    expect(ack).toHaveBeenCalledTimes(1);
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+    // …and version-wins still held: the older payload never reached the glass.
+    expect(imgCount('c3.jpg')).toBe(staleRendersBefore);
+    expect(await reportedContentVersion()).toBe('v5');
+
+    // POSITIVE CONTROL, same playlist, same seam: a NEWER version still applies, so
+    // "did not apply" above is about the version and not about a dead handler.
+    triggerSocketEvent('playlist:update', playlistV('v7', 'c7', '/c7.jpg', SAME), vi.fn());
+    await vi.advanceTimersByTimeAsync(1600);
+    expect(imgCount('c7.jpg')).toBeGreaterThan(0);
+    expect(await reportedContentVersion()).toBe('v7');
+  });
+
+  // ======================================================================
+  // 5. DUPLICATE DELIVERY — executes once, BOTH deliveries acked
+  // ======================================================================
+
+  it('5: the same (type, timestamp) executes ONCE and both deliveries are acked', async () => {
+    await connectAndCommit();
+    const dup = { type: 'reload', timestamp: 1755000000000 };
+    const ackA = vi.fn();
+    const ackB = vi.fn();
+
+    triggerSocketEvent('command', { ...dup }, ackA);
+    await vi.advanceTimersByTimeAsync(50);
+    triggerSocketEvent('command', { ...dup }, ackB);
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(ackA).toHaveBeenCalledWith({ ok: true });
+    // The suppressed one is acked too — otherwise the server requeues the exact
+    // payload we deliberately ignored, forever.
+    expect(ackB).toHaveBeenCalledTimes(1);
+    expect(ackB).toHaveBeenCalledWith({ ok: true });
+    expect(await reportedEvents()).toContain('command_duplicate_suppressed');
+  });
+
+  it('5 NEGATIVE CONTROL: a DIFFERENT timestamp is not suppressed', async () => {
+    // The dedupe must key on (type, timestamp), not on type alone — otherwise an
+    // operator could never send the same command twice.
+    await connectAndCommit();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 1 }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    triggerSocketEvent('command', { type: 'reload', timestamp: 2 }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).toHaveBeenCalledTimes(2);
+  });
+
+  it('5b: a command with NO timestamp is executed (never suppressed on a guess) and still acked', async () => {
+    await connectAndCommit();
+    const ackA = vi.fn();
+    const ackB = vi.fn();
+
+    triggerSocketEvent('command', { type: 'reload' }, ackA);
+    await vi.advanceTimersByTimeAsync(50);
+    triggerSocketEvent('command', { type: 'reload' }, ackB);
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).toHaveBeenCalledTimes(2);
+    expect(ackA).toHaveBeenCalledWith({ ok: true });
+    expect(ackB).toHaveBeenCalledWith({ ok: true });
+  });
+
+  it('5c: the dedupe ring is bounded and pruned to the newest 20 keys', async () => {
+    await connectAndCommit();
+    for (let i = 1; i <= 25; i++) {
+      // `reboot` is a no-op-with-telemetry, so this exercises the ring without
+      // reloading the context 25 times.
+      triggerSocketEvent('command', { type: 'reboot', timestamp: i }, vi.fn());
+      await vi.advanceTimersByTimeAsync(5);
+    }
+
+    const ring = JSON.parse(preferencesStore.get('seen_command_keys')!) as string[];
+    expect(ring).toHaveLength(20);
+    expect(ring[0]).toBe('reboot@6');
+    expect(ring[19]).toBe('reboot@25');
+    expect(ring).not.toContain('reboot@5');
+  });
+
+  // ======================================================================
+  // 6. DUPLICATE ACROSS A RESTART — the infinite-reload guard
+  // ======================================================================
+
+  it('6: suppression SURVIVES re-initialisation — the reload→replay→reload loop cannot start', async () => {
+    // The sequence this defends against, end to end: we ack a `reload`; the device
+    // reloads; the ack is lost in flight because the socket died mid-reload; the
+    // server times out at 10s and requeues; on reconnect the IDENTICAL
+    // (reload, timestamp) arrives again. In memory only, the ring is empty at that
+    // moment and the device reloads forever. On disk, it is absorbed.
+    await connectAndCommit();
+    const dup = { type: 'reload', timestamp: 1755000000001 };
+
+    triggerSocketEvent('command', { ...dup }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    // The key is on DISK before the dispatch that tears the context down.
+    expect(preferencesStore.get('seen_command_keys')).toContain('reload@1755000000001');
+
+    // --- the restart: brand-new socket, brand-new app instance, same storage ---
+    currentMockSocket = createMockSocket();
+    ioFactory.mockReturnValue(currentMockSocket);
+    await importFresh();
+    (window.location.reload as Mock).mockClear();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    await vi.advanceTimersByTimeAsync(50);
+
+    const ackAfterRestart = vi.fn();
+    triggerSocketEvent('command', { ...dup }, ackAfterRestart);
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).not.toHaveBeenCalled();
+    expect(ackAfterRestart).toHaveBeenCalledTimes(1);
+    expect(ackAfterRestart).toHaveBeenCalledWith({ ok: true });
+
+    // POSITIVE CONTROL, same instance, same seam: a genuinely new command still
+    // runs. Without this, "not called" would also pass if the restarted instance
+    // had simply stopped handling commands at all.
+    triggerSocketEvent('command', { type: 'reload', timestamp: 1755000000002 }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('6 NEGATIVE CONTROL: an unreadable ring fails OPEN rather than blocking commands', async () => {
+    // A corrupt ring must cost at most one duplicate execution — never a device
+    // that refuses the operator's commands.
+    await connectAndCommit();
+    preferencesStore.set('seen_command_keys', '{not json');
+
+    currentMockSocket = createMockSocket();
+    ioFactory.mockReturnValue(currentMockSocket);
+    await importFresh();
+    (window.location.reload as Mock).mockClear();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 42 }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  // ======================================================================
+  // 7. HANDLER EXCEPTION — the ack still fires, exactly once
+  // ======================================================================
+
+  it('7: a throwing command handler still acks exactly once, and the throw does not escape', async () => {
+    await connectAndCommit();
+    (window.location.reload as Mock).mockImplementation(() => { throw new Error('context died'); });
+    const ack = vi.fn();
+
+    expect(() => triggerSocketEvent('command', { type: 'reload' }, ack)).not.toThrow();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(ack).toHaveBeenCalledTimes(1);
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+    // The failure is surfaced through telemetry, NOT through the ack.
+    expect(await reportedEvents()).toContain('command_handler_failed');
+  });
+
+  it('7b: a throwing playlist:update handler has already acked before it throws', async () => {
+    await connectAndCommit();
+    const ack = vi.fn();
+
+    expect(() =>
+      triggerSocketEvent('playlist:update', { get playlist() { throw new Error('kaboom'); } }, ack),
+    ).toThrow('kaboom');
+
+    expect(ack).toHaveBeenCalledTimes(1);
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+  });
+
+  it('7c: an ack callback that itself throws does not take the handler down', async () => {
+    await connectAndCommit();
+    const hostileAck = vi.fn(() => { throw new Error('ack exploded'); });
+
+    expect(() => triggerSocketEvent('command', { type: 'reload' }, hostileAck)).not.toThrow();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(hostileAck).toHaveBeenCalledTimes(1);
+    // The command still ran — a broken receipt must not cost the operator the action.
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  // ======================================================================
+  // 8. ACK BEFORE DISPATCH — proven by ORDER, not by presence
+  // ======================================================================
+  //
+  // If the ack were sent after window.location.reload(), it would never leave the
+  // device: the server times out at 10s, requeues, and the device reloads →
+  // reconnects → replays → reloads forever. Presence of an ack proves nothing here;
+  // only the ordering does.
+
+  it.each([['reload'], ['restart']])(
+    '8: %s — the ack is invoked BEFORE window.location.reload',
+    async (type) => {
+      await connectAndCommit();
+      const order: string[] = [];
+      (window.location.reload as Mock).mockImplementation(() => { order.push('reload'); });
+      const ack = vi.fn(() => { order.push('ack'); });
+
+      triggerSocketEvent('command', { type }, ack);
+      await vi.advanceTimersByTimeAsync(50);
+
+      // Both events observed (guards against a vacuous single-element sequence)…
+      expect(order).toContain('ack');
+      expect(order).toContain('reload');
+      // …and in this order.
+      expect(order).toEqual(['ack', 'reload']);
+    },
+  );
+
+  it('8b: clear_cache — the ack precedes BOTH the cache purge and the reload', async () => {
+    await connectAndCommit();
+    const order: string[] = [];
+    (window.location.reload as Mock).mockImplementation(() => { order.push('reload'); });
+    mockCacheManager.clearCache.mockImplementation(async () => { order.push('clearCache'); });
+    const ack = vi.fn(() => { order.push('ack'); });
+
+    triggerSocketEvent('command', { type: 'clear_cache' }, ack);
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(order).toEqual(['ack', 'clearCache', 'reload']);
+    expect(order.indexOf('ack')).toBeLessThan(order.indexOf('reload'));
+  });
+
+  it('8c: the persisted dedupe key is written BEFORE the dispatch that destroys the context', async () => {
+    // Ordering again, on the other half of the loop guard: if the ring were written
+    // without being awaited, the write would race window.location.reload() and the
+    // replay after the teardown would find an empty ring.
+    //
+    // The default Preferences.set fake resolves its promise but mutates the store
+    // SYNCHRONOUSLY, which makes `await store.set()` and a bare fire-and-forget
+    // indistinguishable — a mutation that dropped the await passed against it. Real
+    // Capacitor Preferences is a bridge round-trip to the native layer, so model
+    // that here: one microtask before the value lands.
+    await connectAndCommit();
+    const { Preferences } = await import('@capacitor/preferences');
+    (Preferences.set as Mock).mockImplementationOnce(
+      async ({ key, value }: { key: string; value: string }) => {
+        await Promise.resolve(); // the native bridge round-trip
+        preferencesStore.set(key, value);
+      },
+    );
+    const observed: string[] = [];
+    (window.location.reload as Mock).mockImplementation(() => {
+      observed.push(`reload:${preferencesStore.get('seen_command_keys') ?? 'EMPTY'}`);
+    });
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 7 }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    // The dispatch happened at all (guards against a vacuous pass)…
+    expect(observed).toHaveLength(1);
+    // …and the key was already on disk when it did.
+    expect(observed[0]).toContain('reload@7');
+  });
+
+  // ======================================================================
+  // 9. MISSING CALLBACK — the legacy / unacked emit path
+  // ======================================================================
+
+  it('9: no crash when the ack is absent (sendInitialState, config, qr-overlay:update)', async () => {
+    // The connect-time playlist:update and the config / qr-overlay emits are never
+    // ack-wrapped. A handler that assumed a callback would break every reconnect.
+    await connectAndCommit();
+
+    expect(() => triggerSocketEvent('playlist:update', playlistV('v2', 'c2', '/c2.jpg'))).not.toThrow();
+    expect(() => triggerSocketEvent('command', { type: 'reload' })).not.toThrow();
+    await vi.advanceTimersByTimeAsync(1600);
+
+    // Not merely "did not throw" — the work still happened.
+    expect(imgCount('c2.jpg')).toBeGreaterThan(0);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('9b: a non-function in the callback slot is ignored, not called', async () => {
+    await connectAndCommit();
+
+    expect(() => triggerSocketEvent('command', { type: 'reload' }, 'not-a-function')).not.toThrow();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  // ======================================================================
+  // 10. THE CAPABILITY ITSELF — advertised, and surviving a token rotation
+  // ======================================================================
+
+  it('10: the handshake advertises capabilities: ["deliveryAck"]', async () => {
+    secureStorageStore.set('device_token', 'tok-handshake-probe');
+    await importFresh();
+
+    const opts = ioFactory.mock.calls[0][1] as { auth: { token: string; capabilities: string[] } };
+    // Observation channel is live: this reads a value the test controls.
+    expect(opts.auth.token).toBe('tok-handshake-probe');
+    expect(Array.isArray(opts.auth.capabilities)).toBe(true);
+    expect(opts.auth.capabilities).toContain('deliveryAck');
+  });
+
+  it('10b: capabilities SURVIVE a token refresh — the device must not silently revert to legacy', async () => {
+    // handleTokenRefresh used to do a wholesale `auth = { token }`. That drops the
+    // capability, so the device goes back to the server's legacy delivery path on
+    // its next reconnect with NO signal anywhere — and a command lost on a half-open
+    // socket is then gone permanently while the dashboard says delivered.
+    await importFresh();
+    // Stand in for what real Socket.IO holds: the handshake auth, plus a field
+    // neither we nor the test owns, so this binds the MERGE and not just the re-add.
+    currentMockSocket.auth = { token: 'tok-123', capabilities: ['deliveryAck'], sessionNonce: 'n1' };
+
+    triggerSocketEvent('token:refresh', { token: 'rotated-tok' });
+    await vi.advanceTimersByTimeAsync(20);
+
+    const auth = currentMockSocket.auth as Record<string, unknown>;
+    expect(auth.token).toBe('rotated-tok');             // the rotation happened…
+    expect(auth.capabilities).toContain('deliveryAck'); // …and did not cost the capability
+    expect(auth.sessionNonce).toBe('n1');               // merged, not replaced
+  });
+
+  it('10c: capabilities are re-advertised on a full RECONNECT', async () => {
+    // Socket.IO re-reads socket.auth on every reconnection attempt, and a fresh
+    // connectToRealtime() rebuilds it from the same single source. Both routes must
+    // carry the capability — "advertise always or never".
+    await importFresh();
+    triggerSocketEvent('token:refresh', { token: 'rotated-tok' });
+    await vi.advanceTimersByTimeAsync(20);
+
+    // Route A: the live socket's auth, which the next reconnection attempt reads.
+    expect((currentMockSocket.auth as { capabilities: string[] }).capabilities).toContain('deliveryAck');
+
+    // Route B: a network drop → restore re-enters connectToRealtime().
+    currentMockSocket.connected = false;
+    triggerNetworkChange(false);
+    triggerNetworkChange(true);
+    await vi.advanceTimersByTimeAsync(50);
+
+    const calls = ioFactory.mock.calls as unknown[][];
+    expect(calls.length).toBeGreaterThan(1);
+    for (const call of calls) {
+      const auth = (call[1] as { auth: { capabilities?: string[] } }).auth;
+      expect(auth.capabilities).toContain('deliveryAck');
+    }
+  });
+
+  // ======================================================================
+  // 11. clear_override — the command with real customer impact
+  // ======================================================================
+
+  it('11: clear_override cancels the emergency push and restores the playlist', async () => {
+    // Before this existed, clear_override fell to `default:` and warned. An operator
+    // cancelling an emergency push could not clear the screen — the pushed content
+    // stayed on the glass for the rest of its timer, up to 240 minutes — while the
+    // dashboard reported the cancel delivered and wrote an audit row saying so.
+    await connectAndCommit();
+    const playlistRendersBefore = imgCount('c1.jpg');
+
+    triggerSocketEvent('command', {
+      type: 'push_content',
+      payload: { content: { id: 'pp', name: 'P', type: 'image', url: '/emergency.jpg' }, duration: 240 },
+    }, vi.fn());
+    await vi.advanceTimersByTimeAsync(1600);
+    expect(imgCount('emergency.jpg')).toBeGreaterThan(0);
+    expect(imgCount('c1.jpg')).toBe(playlistRendersBefore); // the push owns the glass
+
+    const ack = vi.fn();
+    triggerSocketEvent('command', { type: 'clear_override' }, ack);
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+    // The playlist is back on the glass — a fresh render, not a leftover.
+    expect(imgCount('c1.jpg')).toBeGreaterThan(playlistRendersBefore);
+    expect(visibleScreens()).toEqual(['content-screen']);
+  });
+
+  it('11b: clear_override with NO push active is a no-op — it must not blank a playing playlist', async () => {
+    // resumePlaylist() with nothing saved falls through to enterHolding(), so a
+    // late or duplicate clear_override routed there unconditionally would take a
+    // perfectly good playlist off the screen.
+    await connectAndCommit();
+    const before = imgCount('c1.jpg');
+    const ack = vi.fn();
+
+    triggerSocketEvent('command', { type: 'clear_override' }, ack);
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+    expect(visibleScreens()).toEqual(['content-screen']);
+    expect(imgCount('c1.jpg')).toBe(before);
+  });
+
+  // ======================================================================
+  // 12. UNSUPPORTED COMMANDS — acked and reported, never silently dropped
+  // ======================================================================
+
+  it.each([['reboot'], ['update'], ['screenshot']])(
+    '12: %s is acked ok:true AND reported as unsupported',
+    async (type) => {
+      // Nacking a permanent failure would make the server replay it forever, so
+      // these ack. The gap has to be visible to US instead — via telemetry, not via
+      // a fake implementation and not via silence.
+      await connectAndCommit();
+      const ack = vi.fn();
+
+      triggerSocketEvent('command', { type }, ack);
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(ack).toHaveBeenCalledTimes(1);
+      expect(ack).toHaveBeenCalledWith({ ok: true });
+      const calls = await reportedEventCalls();
+      expect(calls.some(c => c[0] === 'command_unsupported' && (c[1] as { type?: string })?.type === type)).toBe(true);
+      // NOT stubbed with fake behaviour: nothing pretended to happen.
+      expect(window.location.reload).not.toHaveBeenCalled();
+    },
+  );
+
+  it('12 NEGATIVE CONTROL: a SUPPORTED command does not report command_unsupported', async () => {
+    await connectAndCommit();
+
+    triggerSocketEvent('command', { type: 'reload' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(await reportedEvents()).not.toContain('command_unsupported');
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  // ======================================================================
+  // A6. HEARTBEAT ERROR ACKS ARE NO LONGER DISCARDED
+  // ======================================================================
+  //
+  // `response.data ?? response` fell back to the top level on an error ack
+  // ({ success:false, error, timestamp } — no `data`), where every field the client
+  // reads is undefined. A rate-limited or rejected heartbeat was therefore
+  // indistinguishable from a clean one: no signal at all, on either side.
+
+  const heartbeatAck = async (payload: unknown) => {
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    await vi.advanceTimersByTimeAsync(200);
+    const { CapacitorHttp } = await import('@capacitor/core');
+    (CapacitorHttp.get as Mock).mockClear(); // ignore the pull-on-connect
+    const hb = currentMockSocket.emit.mock.calls.find((c: unknown[]) => c[0] === 'heartbeat');
+    const cb = hb?.[2] as ((r: unknown) => void) | undefined;
+    expect(typeof cb).toBe('function');
+    cb!(payload);
+    await vi.advanceTimersByTimeAsync(50);
+    return (CapacitorHttp.get as Mock).mock.calls.map(
+      (c: unknown[]) => String((c[0] as { url?: string })?.url ?? ''),
+    );
+  };
+
+  it('A6: a server error ack is surfaced instead of read as an empty success', async () => {
+    await heartbeatAck({ success: false, error: 'RATE_LIMITED', timestamp: '2026-08-15T00:00:00.000Z' });
+
+    const calls = await reportedEventCalls();
+    const err = calls.find(c => c[0] === 'heartbeat_ack_error');
+    expect(err).toBeDefined();
+    expect((err![1] as { error?: string }).error).toContain('RATE_LIMITED');
+  });
+
+  it('A6 NEGATIVE CONTROL: a real success ack is not flagged, and still reconciles', async () => {
+    // Same helper, same seam. Proves the detector is not just firing on everything,
+    // and that the early return did not swallow the success path it sits in front of.
+    const urls = await heartbeatAck({
+      success: true,
+      data: { reconcileContent: true, nextHeartbeatIn: 15000, commands: [] },
+      timestamp: '2026-08-15T00:00:00.000Z',
+    });
+
+    expect(await reportedEvents()).not.toContain('heartbeat_ack_error');
+    expect(urls.some(u => u.includes('/devices/me/content'))).toBe(true);
+  });
+
+  it('A6: an error ack does NOT act on fields read off the failure envelope', async () => {
+    // A failure envelope carries no data payload; treating its top level as an ack
+    // is what produced the silence in the first place. It must trigger nothing.
+    const urls = await heartbeatAck({ success: false, error: 'HEARTBEAT_FAILED', timestamp: 'x' });
+
+    expect(urls.some(u => u.includes('/devices/me/content'))).toBe(false);
+    expect(urls.some(u => u.includes('/devices/auth/check'))).toBe(false);
+    expect(window.location.reload).not.toHaveBeenCalled();
+  });
+
+  // ======================================================================
+  // A7. The heartbeat ack's commands array is not a second-class delivery door
+  // ======================================================================
+  //
+  // There are TWO doors into handleCommand — the `command` socket event and the
+  // heartbeat ack's commands array — and they must not differ on what happens when
+  // the handler rejects. The socket door wraps it in .catch and reports it; this one
+  // was a bare `forEach(cmd => this.handleCommand(cmd))`, so the identical failure
+  // became an unhandled rejection with no telemetry, depending only on which door
+  // the command happened to arrive through.
+
+  it('A7: a throwing handler delivered through the HEARTBEAT ack is reported, not left floating', async () => {
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    await vi.advanceTimersByTimeAsync(200);
+
+    const { Preferences } = await import('@capacitor/preferences');
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    // update_config persists each accepted URL; a rejecting store makes handleCommand
+    // reject for real rather than simulating the rejection.
+    (Preferences.set as Mock).mockRejectedValue(new Error('simulated Preferences.set failure'));
+
+    const hb = currentMockSocket.emit.mock.calls.find((c: unknown[]) => c[0] === 'heartbeat');
+    (hb![2] as (r: unknown) => void)({
+      success: true,
+      data: {
+        commands: [{ type: 'update_config', apiUrl: 'https://cdn.vizora.io', timestamp: 'ts-a7' }],
+        nextHeartbeatIn: 15000,
+      },
+      timestamp: '2026-08-15T00:00:00.000Z',
+    });
+    await vi.advanceTimersByTimeAsync(50);
+
+    const events = await reportedEvents();
+    expect(events).toContain('command_handler_failed');
+    // Not the allowlist refusing the URL before the throwing line was reached.
+    expect(events).not.toContain('config_rejected');
+  });
+
+  // ======================================================================
+  // A8. The dedupe ring is pairing-bound state and dies with the pairing
+  // ======================================================================
+
+  it('A8: a confirmed revocation purges the PERSISTED command-dedupe ring', async () => {
+    await connectAndCommit(); // default handler: auth-check 404 → legacy carve-out
+    triggerSocketEvent('command', { type: 'clear_override', timestamp: 'ts-a8' });
+    await vi.advanceTimersByTimeAsync(50);
+    // Baseline: there is ring state on disk to purge.
+    expect(preferencesStore.get('seen_command_keys')).toContain('ts-a8');
+
+    triggerSocketEvent('command', { type: 'unpair', timestamp: 'ts-a8-unpair' });
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(200);
+
+    // Baseline for the purge itself, so this cannot pass because no purge ran.
+    expect(secureStorageStore.has('device_token')).toBe(false);
+    // The ring is delivery state for the pairing that just ended. Left behind, it can
+    // suppress a genuinely new command for whatever tenant is paired next, and it
+    // leaves the revoked tenant's command history readable on the device.
+    expect(preferencesStore.has('seen_command_keys')).toBe(false);
+  });
+
+  // ======================================================================
+  // A9. THE LOOP TERMINATOR MUST NOT FAIL SILENTLY
+  // ======================================================================
+  //
+  // Advertising deliveryAck is what INTRODUCED the requeue path: before it, the
+  // gateway did a bare legacy emit and never requeued, so a command-replay loop
+  // could not exist. Now an ack lost with the socket makes the server time out at
+  // 10s, requeue (refreshing the Redis TTL each time) and replay on reconnect,
+  // through a path that is not rate-limited. The persisted ring is the ONLY thing
+  // that terminates that replay for a context-destroying command — so every way the
+  // ring can fail has to be visible to us, not just to a console nobody reads.
+  //
+  // The concrete field case: on Tizen/webOS the Capacitor Preferences plugin falls
+  // through to its localStorage web implementation, where a QuotaExceededError takes
+  // out every read and every write at once.
+
+  /** Break only the dedupe ring's storage, leaving the rest of Preferences healthy. */
+  const breakRingWrites = async (fail: () => Promise<never>) => {
+    const { Preferences } = await import('@capacitor/preferences');
+    (Preferences.set as Mock).mockImplementation(async (opts: { key: string; value: string }) => {
+      if (opts.key === 'seen_command_keys') return fail();
+      preferencesStore.set(opts.key, opts.value);
+    });
+  };
+
+  it('A9: a FAILED ring persist is reported, not just logged — and the command still runs', async () => {
+    await connectAndCommit();
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    await breakRingWrites(() => Promise.reject(new Error('QuotaExceededError')));
+    const ack = vi.fn();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'a9' }, ack);
+    await vi.advanceTimersByTimeAsync(50);
+
+    const calls = await reportedEventCalls();
+    expect(calls.some(c => c[0] === 'command_dedupe_ring_persist_failed')).toBe(true);
+    // Direction, not presence: the write really did fail (nothing on disk) while the
+    // operator's command really did run and really was acked.
+    expect(preferencesStore.has('seen_command_keys')).toBe(false);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+  });
+
+  it('A9 NEGATIVE CONTROL: a HEALTHY ring persist reports nothing', async () => {
+    // Same seam, same command, working storage — so the event above is a report of a
+    // failure and not something this path emits unconditionally.
+    await connectAndCommit();
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'a9-ok' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(await reportedEvents()).not.toContain('command_dedupe_ring_persist_failed');
+    expect(preferencesStore.get('seen_command_keys')).toContain('reload@a9-ok');
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('A9b: an unreadable ring at BOOT is reported under its own event name', async () => {
+    // Distinguishable from the persist failure on purpose: this one says the ring did
+    // not survive the restart, which is exactly the window a requeued command replays
+    // into. One event name for both would make the two indistinguishable in Sentry.
+    await connectAndCommit();
+    const { Preferences } = await import('@capacitor/preferences');
+    (Preferences.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      if (key === 'seen_command_keys') throw new Error('QuotaExceededError');
+      return { value: preferencesStore.get(key) ?? null };
+    });
+
+    currentMockSocket = createMockSocket();
+    ioFactory.mockReturnValue(currentMockSocket);
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    await importFresh();
+
+    const events = await reportedEvents();
+    expect(events).toContain('command_dedupe_ring_load_failed');
+    // …and only that one: a load failure is not a persist failure.
+    expect(events).not.toContain('command_dedupe_ring_persist_failed');
+  });
+
+  it('A9b NEGATIVE CONTROL: a READABLE ring boots silently and still suppresses', async () => {
+    // Guards two ways of passing vacuously: the event firing on every boot, and the
+    // load path being dead (which would also produce "no load_failed" — plus a device
+    // that has lost its terminator entirely).
+    await connectAndCommit();
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'a9b' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(preferencesStore.get('seen_command_keys')).toContain('reload@a9b');
+
+    currentMockSocket = createMockSocket();
+    ioFactory.mockReturnValue(currentMockSocket);
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    await importFresh();
+    (window.location.reload as Mock).mockClear();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+
+    expect(await reportedEvents()).not.toContain('command_dedupe_ring_load_failed');
+    // The ring was genuinely restored — the replay is absorbed.
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'a9b' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).not.toHaveBeenCalled();
+  });
+
+  // ======================================================================
+  // A10. THE PERSIST THAT GATES THE DISPATCH IS BOUNDED
+  // ======================================================================
+  //
+  // The ring write is awaited BEFORE window.location.reload() on purpose (8c). That
+  // makes a wedged Capacitor bridge — a promise that never settles — into a total
+  // loss of the operator's command: reload/restart/clear_cache silently never run,
+  // the server already holds { ok: true }, the dashboard says delivered, and there is
+  // no rejection to report because the promise does not settle at all.
+  //
+  // Modelling note, learned the hard way: the default Preferences.set fake resolves
+  // its own promise, so it cannot tell a bounded await from an unbounded one. The
+  // hang below is a promise that NEVER settles, and the assertions straddle the
+  // timeout — before it the dispatch must NOT have happened (or the await is not
+  // gating anything), after it the dispatch MUST have happened (or the await is not
+  // bounded).
+
+  const NEVER = () => new Promise<never>(() => {});
+
+  it('A10: a wedged bridge does not swallow the command — it dispatches after the bound', async () => {
+    await connectAndCommit();
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    await breakRingWrites(NEVER);
+    const ack = vi.fn();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'a10' }, ack);
+    await vi.advanceTimersByTimeAsync(1500);
+
+    // The ack went out immediately — it is a delivery receipt, not an apply receipt,
+    // and it must not wait on storage.
+    expect(ack).toHaveBeenCalledTimes(1);
+    expect(ack).toHaveBeenCalledWith({ ok: true });
+    // …and at 1500ms the write is still pending, so the dispatch is genuinely GATED
+    // on it. Without this half, a fire-and-forget persist would pass the next half.
+    expect(window.location.reload).not.toHaveBeenCalled();
+    expect(await reportedEvents()).not.toContain('command_dedupe_persist_timeout');
+
+    await vi.advanceTimersByTimeAsync(600); // past the 2000ms bound
+
+    // Bounded: the operator's command runs even though the write never settled…
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    // …and the fact that it ran UNGUARDED is on the record.
+    const calls = await reportedEventCalls();
+    const timeout = calls.find(c => c[0] === 'command_dedupe_persist_timeout');
+    expect(timeout).toBeDefined();
+    expect((timeout![1] as { type?: string }).type).toBe('reload');
+  });
+
+  it('A10 NEGATIVE CONTROL: a healthy bridge dispatches promptly and reports no timeout', async () => {
+    // Same command, same seam, a persist that settles one bridge microtask later.
+    // Proves the 2000ms wait above belongs to the wedge and not to the code path.
+    await connectAndCommit();
+    const { Preferences } = await import('@capacitor/preferences');
+    (Preferences.set as Mock).mockImplementation(async ({ key, value }: { key: string; value: string }) => {
+      await Promise.resolve(); // the native bridge round-trip
+      preferencesStore.set(key, value);
+    });
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'a10-ok' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50); // nowhere near the bound
+
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(await reportedEvents()).not.toContain('command_dedupe_persist_timeout');
+    expect(preferencesStore.get('seen_command_keys')).toContain('reload@a10-ok');
+  });
+
+  it('A10b: the bound applies to clear_cache too, and the purge still runs', async () => {
+    // clear_cache is context-destroying by the same route, and it has real work
+    // between the ack and the reload — a wedge must not strand that either.
+    await connectAndCommit();
+    const order: string[] = [];
+    mockCacheManager.clearCache.mockImplementation(async () => { order.push('clearCache'); });
+    (window.location.reload as Mock).mockImplementation(() => { order.push('reload'); });
+    await breakRingWrites(NEVER);
+
+    triggerSocketEvent('command', { type: 'clear_cache', timestamp: 'a10b' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(order).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(600);
+    expect(order).toEqual(['clearCache', 'reload']);
+    expect(await reportedEvents()).toContain('command_dedupe_persist_timeout');
+  });
+
+  // ======================================================================
+  // A11. A CONTEXT-DESTROYING COMMAND WITH NO DEDUPE KEY IS VISIBLE
+  // ======================================================================
+  //
+  // The whole scheme rests on the gateway stamping `timestamp` on every command
+  // (device.gateway.ts:2299 today, and the identical object is requeued verbatim).
+  // That is one line in another repo with no compiler between the two. The client
+  // fails OPEN when it is missing — commandDedupeKey returns null, the command
+  // EXECUTES and nothing is recorded — which for reload/restart/clear_cache is an
+  // unterminable loop the moment any future emitter forgets the stamp.
+  //
+  // Executing anyway is the right call (dropping the operator's command would be
+  // worse). Executing anyway SILENTLY is not: it would first be discovered as a
+  // field loop.
+
+  it('A11: an unkeyable reload/restart/clear_cache is reported, and still executes', async () => {
+    await connectAndCommit();
+    for (const type of ['reload', 'restart', 'clear_cache']) {
+      const { reportEvent } = await import('./crash-reporting');
+      (reportEvent as Mock).mockClear();
+      (window.location.reload as Mock).mockClear();
+      const ack = vi.fn();
+
+      triggerSocketEvent('command', { type }, ack); // NO timestamp — unkeyable
+      await vi.advanceTimersByTimeAsync(50);
+
+      const calls = await reportedEventCalls();
+      const missing = calls.find(c => c[0] === 'command_dedupe_key_missing');
+      expect(missing, `no report for ${type}`).toBeDefined();
+      expect((missing![1] as { type?: string }).type).toBe(type);
+      // Fail-open behaviour is UNCHANGED: it ran, it was acked, nothing was recorded.
+      expect(window.location.reload).toHaveBeenCalledTimes(1);
+      expect(ack).toHaveBeenCalledWith({ ok: true });
+      expect(preferencesStore.has('seen_command_keys')).toBe(false);
+    }
+  });
+
+  it('A11 NEGATIVE CONTROL: a KEYED reload, and an unkeyed harmless command, report nothing', async () => {
+    // Two ways this detector could be wrong: firing when the key is present, and
+    // firing for commands whose replay is merely wasteful rather than unterminable.
+    await connectAndCommit();
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'a11' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await reportedEvents()).not.toContain('command_dedupe_key_missing');
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+
+    (reportEvent as Mock).mockClear();
+    triggerSocketEvent('command', { type: 'clear_override' }, vi.fn()); // unkeyed, harmless
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await reportedEvents()).not.toContain('command_dedupe_key_missing');
+  });
+
+  it('A11b: the unkeyed path gets the same task boundary the keyed path gets', async () => {
+    // Compounding failure the report called out: with no key there is also no await,
+    // so window.location.reload() fired in the SAME synchronous turn as the ack —
+    // the tightest possible flush window landing on exactly the case that also has no
+    // dedupe protection. Acking first only buys a chance to flush; it buys nothing if
+    // the context is torn down before the turn ends.
+    await connectAndCommit();
+    const ack = vi.fn();
+
+    triggerSocketEvent('command', { type: 'reload' }, ack);
+
+    // Synchronously after the handler returns: acked, NOT yet reloaded.
+    expect(ack).toHaveBeenCalledTimes(1);
+    expect(window.location.reload).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  it('A11b NEGATIVE CONTROL: the observation window can see a same-turn dispatch', async () => {
+    // The assertion above is "not yet called", which passes trivially if nothing ever
+    // calls it. This runs the same probe against a handler that DOES dispatch in the
+    // same turn, so the window is known to be capable of catching one.
+    await connectAndCommit();
+    const seen: string[] = [];
+    currentMockSocket._handlers.set('sync-probe', [() => {
+      seen.push('ack');
+      (window.location.reload as Mock)();
+      seen.push('reload');
+    }]);
+
+    triggerSocketEvent('sync-probe');
+
+    expect(seen).toEqual(['ack', 'reload']);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
   });
 });
