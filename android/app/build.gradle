@@ -1,5 +1,82 @@
 apply plugin: 'com.android.application'
 
+// ─── Release signing material ────────────────────────────────────────────────────────────────
+//
+// Sources, in order of precedence: android/keystore.properties, then the environment.
+//
+//     keystore.properties      environment
+//     ---------------------    ------------------------------
+//     storeFile                VIZORA_KEYSTORE_FILE
+//     storePassword            VIZORA_KEYSTORE_PASSWORD
+//     keyAlias                 VIZORA_KEY_ALIAS
+//     keyPassword              VIZORA_KEY_PASSWORD
+//
+// The environment path exists because rootProject.file("keystore.properties") resolves PER
+// WORKTREE. A release build from any clean checkout therefore finds no file, which used to mean
+// "build it unsigned" — see the fail-closed note below.
+//
+// storeFile may be absolute, or relative to android/app (the historical meaning of the
+// "../vizora-release.jks" form) or to android/. It is NOT copied anywhere: point at it where it
+// already lives.
+//
+// This block never fails the build. Missing material has to stay non-fatal at configuration
+// time or it would break debug builds, unit tests and IDE sync — CI runs testDebugUnitTest with
+// no keystore at all. The refusal is scoped to release packaging tasks; see FAIL CLOSED below.
+
+def vizoraSigningProps = new Properties()
+def vizoraKeystorePropertiesFile = rootProject.file("keystore.properties")
+if (vizoraKeystorePropertiesFile.exists()) {
+    vizoraKeystorePropertiesFile.withInputStream { vizoraSigningProps.load(it) }
+}
+
+def vizoraSigningValue = { String fileKey, String envKey ->
+    def fromFile = vizoraSigningProps.getProperty(fileKey)?.trim()
+    if (fromFile) {
+        return fromFile
+    }
+    def fromEnv = System.getenv(envKey)?.trim()
+    return fromEnv ?: null
+}
+
+def vizoraResolveKeystore = { String path ->
+    if (!path) {
+        return null
+    }
+    def asGiven = new File(path)
+    if (asGiven.isAbsolute()) {
+        return asGiven
+    }
+    // Relative paths: android/app first (what "../vizora-release.jks" has always meant), then
+    // android/. Return the app-relative candidate when neither exists so the error names one
+    // concrete place that was looked at rather than a list.
+    def candidates = [new File(project.projectDir, path), new File(rootProject.projectDir, path)]
+    return candidates.find { it.isFile() } ?: candidates.first()
+}
+
+def vizoraStoreFilePath = vizoraSigningValue('storeFile', 'VIZORA_KEYSTORE_FILE')
+def vizoraStorePassword = vizoraSigningValue('storePassword', 'VIZORA_KEYSTORE_PASSWORD')
+def vizoraKeyAlias = vizoraSigningValue('keyAlias', 'VIZORA_KEY_ALIAS')
+def vizoraKeyPassword = vizoraSigningValue('keyPassword', 'VIZORA_KEY_PASSWORD')
+def vizoraKeystoreFile = vizoraResolveKeystore(vizoraStoreFilePath)
+
+def vizoraSigningMissing = []
+if (!vizoraStoreFilePath) {
+    vizoraSigningMissing << "storeFile (or \$VIZORA_KEYSTORE_FILE)"
+} else if (!vizoraKeystoreFile.isFile()) {
+    vizoraSigningMissing << "the keystore itself - storeFile is '${vizoraStoreFilePath}', which " +
+        "does not resolve to a readable file (looked at ${vizoraKeystoreFile.absolutePath})"
+}
+if (!vizoraStorePassword) {
+    vizoraSigningMissing << "storePassword (or \$VIZORA_KEYSTORE_PASSWORD)"
+}
+if (!vizoraKeyAlias) {
+    vizoraSigningMissing << "keyAlias (or \$VIZORA_KEY_ALIAS)"
+}
+if (!vizoraKeyPassword) {
+    vizoraSigningMissing << "keyPassword (or \$VIZORA_KEY_PASSWORD)"
+}
+def vizoraSigningReady = vizoraSigningMissing.isEmpty()
+
 android {
     namespace "com.vizora.display"
     compileSdk rootProject.ext.compileSdkVersion
@@ -27,20 +104,14 @@ android {
 
     signingConfigs {
         release {
-            // Load signing config from local properties or environment variables
-            // Create keystore.properties file with:
-            // storeFile=path/to/vizora-release.keystore
-            // storePassword=your-store-password
-            // keyAlias=vizora-display
-            // keyPassword=your-key-password
-            def keystorePropertiesFile = rootProject.file("keystore.properties")
-            if (keystorePropertiesFile.exists()) {
-                def keystoreProperties = new Properties()
-                keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
-                storeFile file(keystoreProperties['storeFile'])
-                storePassword keystoreProperties['storePassword']
-                keyAlias keystoreProperties['keyAlias']
-                keyPassword keystoreProperties['keyPassword']
+            // Populated only when every piece resolved — see the resolver above. A partially
+            // populated config is worse than none: it fails deep inside the packaging task with
+            // a message about the keystore rather than about what the operator forgot to supply.
+            if (vizoraSigningReady) {
+                storeFile vizoraKeystoreFile
+                storePassword vizoraStorePassword
+                keyAlias vizoraKeyAlias
+                keyPassword vizoraKeyPassword
             }
         }
     }
@@ -54,15 +125,22 @@ android {
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            // Use release signing config if available
-            def keystorePropertiesFile = rootProject.file("keystore.properties")
-            if (keystorePropertiesFile.exists()) {
+            // Attached only when the material resolved. When it did not, this variant stays
+            // unsigned AND the build refuses to package it — the refusal is what makes leaving
+            // it unattached safe. See FAIL CLOSED at the end of this file.
+            if (vizoraSigningReady) {
                 signingConfig signingConfigs.release
             }
         }
     }
 
-    // Generate APK and AAB with descriptive names
+    // Generate APK and AAB with descriptive names.
+    //
+    // NOTE this rename also erases the "-unsigned" suffix AGP puts on an unsigned release APK,
+    // which was the last filename-level tell that a build had silently gone out unsigned. That
+    // is only acceptable because a release build can no longer BE unsigned: the FAIL CLOSED
+    // check below stops packaging before this rename can run. Do not weaken that check without
+    // reinstating a signedness tell here.
     applicationVariants.all { variant ->
         variant.outputs.all { output ->
             def versionName = variant.versionName
@@ -146,4 +224,54 @@ try {
     }
 } catch(Exception e) {
     logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
+}
+
+// ─── FAIL CLOSED: a release artifact is signed, or it does not exist ─────────────────────────
+//
+// What this replaces: both the signingConfigs block and the release buildType used to be
+// wrapped in `if (keystorePropertiesFile.exists())`. With no file — the normal state of any
+// clean worktree, since that path resolves per worktree — the release variant silently got no
+// signing config at all, AGP emitted app-release-unsigned.apk, and the unconditional rename
+// above renamed it to vizora-display-<version>-release.apk. Unsigned bytes under the name we
+// ship, with nothing in the build output saying so.
+//
+// Why the check lives HERE and not at configuration time. A configuration-time throw would be
+// simpler and wrong: it would break `./gradlew testDebugUnitTest` (which CI runs with no
+// keystore), every debug build, and IDE sync. Signing material is only genuinely required to
+// PACKAGE a release, so that is exactly the scope of the refusal — the task graph is inspected
+// once it is known, and the build stops before any packaging task runs.
+gradle.taskGraph.whenReady { graph ->
+    def releasePackagingTasks = graph.allTasks.findAll { task ->
+        task.project.path == project.path &&
+            task.name ==~ /^(assemble|bundle|package)([A-Z]\w*)?Release$/
+    }
+    if (releasePackagingTasks.isEmpty()) {
+        return
+    }
+
+    if (!vizoraSigningReady) {
+        throw new GradleException(
+            "Refusing to package a release artifact: the signing material is incomplete.\n\n" +
+            "  Missing:\n" +
+            vizoraSigningMissing.collect { "    - ${it}" }.join("\n") + "\n\n" +
+            "  Requested: ${releasePackagingTasks.collect { it.path }.join(', ')}\n\n" +
+            "  Supply it either in ${vizoraKeystorePropertiesFile.absolutePath}\n" +
+            "  or via VIZORA_KEYSTORE_FILE / VIZORA_KEYSTORE_PASSWORD / VIZORA_KEY_ALIAS /\n" +
+            "  VIZORA_KEY_PASSWORD. The keystore does not need to be inside this worktree -\n" +
+            "  VIZORA_KEYSTORE_FILE may be an absolute path to wherever it already lives.\n\n" +
+            "  This build used to succeed and produce an UNSIGNED apk under the shipping\n" +
+            "  filename. An unsigned or wrongly-signed artifact cannot update a paired device:\n" +
+            "  it fails with INSTALL_FAILED_UPDATE_INCOMPATIBLE and is only recoverable by\n" +
+            "  uninstalling, which un-pairs the fleet.")
+    }
+
+    // Belt and braces: material resolving is not the same fact as the config being ATTACHED to
+    // the release variant. If a future edit drops the `signingConfig signingConfigs.release`
+    // line, everything above still reports "ready" while AGP happily emits unsigned bytes.
+    if (android.buildTypes.release.signingConfig == null) {
+        throw new GradleException(
+            "Refusing to package a release artifact: signing material resolved, but no signing " +
+            "config is attached to the release build type. This is a build-script defect, not a " +
+            "missing credential - see buildTypes.release in ${buildFile}.")
+    }
 }
