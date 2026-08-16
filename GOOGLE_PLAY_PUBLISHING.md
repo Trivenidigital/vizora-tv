@@ -49,6 +49,62 @@ keyPassword=YOUR_KEY_PASSWORD
 - Back up your keystore file and passwords in a secure location
 - You cannot update your app without this key!
 
+### Or supply the credentials from the environment
+
+`keystore.properties` is resolved **per worktree** (`rootProject.file(...)`), so a clean
+checkout or a CI runner will not see the one on your machine. Either source works, and
+`keystore.properties` wins when both are present:
+
+| `keystore.properties` | environment variable |
+|---|---|
+| `storeFile` | `VIZORA_KEYSTORE_FILE` |
+| `storePassword` | `VIZORA_KEYSTORE_PASSWORD` |
+| `keyAlias` | `VIZORA_KEY_ALIAS` |
+| `keyPassword` | `VIZORA_KEY_PASSWORD` |
+
+`VIZORA_KEYSTORE_FILE` may be an **absolute path**, so the keystore does not need to be copied
+into the worktree — point at wherever it already lives. Relative paths resolve against
+`android/app` first (the historical meaning of `../vizora-release.jks`), then `android/`.
+
+### The build fails closed
+
+A release build **refuses to run** when any piece is missing, naming exactly what is absent.
+This replaced a fail-open guard: with no `keystore.properties`, the release variant used to get
+no signing config at all, AGP produced `app-release-unsigned.apk`, and the output-renaming step
+renamed it to `vizora-display-<version>-release.apk` — unsigned bytes under the shipping
+filename, with nothing in the build log saying so.
+
+The refusal is scoped to release **packaging** tasks — `assembleRelease`, `bundleRelease`,
+`packageRelease`, and the bundle-side `packageReleaseBundle`, `signReleaseBundle`,
+`packageReleaseUniversalApk`. Debug builds, `testDebugUnitTest`, `testReleaseUnitTest` and IDE
+sync all still work with no keystore present, which is what CI runs.
+
+`packageReleaseUniversalApk` is included deliberately: it is what produces an installable APK
+out of an AAB, and it depends on none of the other three, so it needs to be named or that route
+is unguarded.
+
+**`./gradlew build` and `./gradlew assemble` now fail without a keystore.** This is not the
+guard misfiring — both of those depend on `assembleRelease`, so they really are asking to
+package a release. Use `./gradlew assembleDebug`, `./gradlew testDebugUnitTest`, or supply the
+signing material.
+
+**Verify the certificate after every release build** — signing with the wrong key is as bad as
+not signing, and is not visible until an update fails on a fielded device:
+
+```bash
+apksigner verify --print-certs app/build/outputs/apk/release/vizora-display-<version>-release.apk
+```
+
+The SHA-256 digest must be:
+
+```
+be2320a5728cfcf1cf9436c04c377be9bf347807b23183f8c88be3583a9187a5
+```
+
+A different digest means the artifact cannot update any paired device: installs fail with
+`INSTALL_FAILED_UPDATE_INCOMPATIBLE`, recoverable only by uninstalling, which un-pairs the
+device.
+
 ---
 
 ## Step 2: Build the Release App
