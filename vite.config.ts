@@ -1,4 +1,4 @@
-import { defineConfig, loadEnv } from 'vite';
+import { defineConfig, loadEnv, type Plugin } from 'vite';
 import legacy from '@vitejs/plugin-legacy';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -148,6 +148,83 @@ function resolveReleaseOrigins(mode: string, env: Record<string, string>): Resol
   return resolved;
 }
 
+/**
+ * Post-build artifact assertions. These run on the EMITTED bundle, because the defect
+ * they exist for was invisible to every other instrument: it type-checked, it passed
+ * 595 unit tests, and it shipped green.
+ *
+ * What happened: `initCrashReporting` read the DSN as
+ * `import.meta.env.VITE_SENTRY_DSN?.trim()`. Vite statically REPLACES
+ * `import.meta.env.VITE_SENTRY_DSN` with a literal, so with no DSN the guard below it
+ * reads `if (!undefined) return;` and the whole Sentry path is dead code that gets
+ * tree-shaken away. Put ANY transform on that expression — an optional chain, a
+ * `.trim()`, a destructure, storing it via a helper — and the substitution no longer
+ * feeds a statically-decidable branch, the minifier can no longer prove the branch is
+ * dead, and the ENTIRE @sentry/browser SDK lands in the artifact. It cost +90.4 kB
+ * uncompressed in a build that cannot send a single event, on TV devices whose engines
+ * are frozen and whose storage and parse budgets are not generous.
+ *
+ * So: read `import.meta.env.X` raw, on its own line, and transform the RESULT.
+ *
+ * Both assertions THROW. A silent warning is what we already had — the build printed
+ * nothing and CI was green.
+ */
+function artifactAssertions(opts: { isTvBuild: boolean; sentryConfigured: boolean }): Plugin {
+  // Headroom over today's output (~148 kB modern, ~282 kB TV incl. polyfills), sized so
+  // ordinary growth does not trip it but a whole vendored SDK does. Raise deliberately
+  // and say why — a budget quietly raised to make a build pass is not a budget.
+  const budgetBytes = opts.isTvBuild ? 340_000 : 200_000;
+  return {
+    name: 'vizora-artifact-assertions',
+    writeBundle(_options, bundle) {
+      let totalJs = 0;
+      const sentryChunks: string[] = [];
+      for (const [fileName, output] of Object.entries(bundle)) {
+        if (!fileName.endsWith('.js')) continue;
+        const code = (output as { code?: string }).code ?? '';
+        totalJs += Buffer.byteLength(code, 'utf8');
+        // Matched on SDK-internal tokens, not on /sentry/i: our own log strings mention
+        // VITE_SENTRY_DSN, so a naive match flags every healthy build. `sentry_key` and
+        // `sentry_client` are DSN/envelope internals that appear ONLY when the transport
+        // code is bundled — verified against both a lean and a regressed artifact.
+        if (!opts.sentryConfigured && /sentry_key|sentry_client/.test(code)) sentryChunks.push(fileName);
+      }
+
+      if (sentryChunks.length > 0) {
+        throw new Error(
+          `[artifact] @sentry is present in a build with NO VITE_SENTRY_DSN ` +
+            `(${sentryChunks.join(', ')}).
+` +
+            `  The SDK cannot send anything without a DSN, so this is pure weight on a
+` +
+            `  frozen-engine TV device. The usual cause is a transform applied directly to
+` +
+            `  import.meta.env.VITE_SENTRY_DSN, which defeats Vite's static replacement and
+` +
+            `  stops the no-DSN branch being eliminated. Read the env var raw on its own
+` +
+            `  line, then transform the result.`,
+        );
+      }
+
+      if (totalJs > budgetBytes) {
+        throw new Error(
+          `[artifact] JS bundle is ${totalJs} bytes, over the ${budgetBytes} byte budget ` +
+            `for mode "${opts.isTvBuild ? 'tv' : 'default'}".
+` +
+            `  This budget exists because a +90 kB regression once shipped CI-green: the
+` +
+            `  entire Sentry SDK was pulled into an artifact that could not use it.
+` +
+            `  Find what grew before raising this number.`,
+        );
+      }
+
+      console.log(`[artifact] JS ${totalJs} bytes (budget ${budgetBytes}), sentry ${opts.sentryConfigured ? 'configured' : 'absent as expected'}`);
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
   // Load env file based on `mode` in the current directory
   const env = loadEnv(mode, process.cwd(), '');
@@ -200,6 +277,7 @@ export default defineConfig(({ mode }) => {
     base: isTvBuild ? './' : '/',
     plugins: isTvBuild
       ? [
+          artifactAssertions({ isTvBuild, sentryConfigured }),
           legacy({
             targets: ['chrome >= 53'],
             // Legacy-only output: <script type="module"> is blocked from a
@@ -209,7 +287,7 @@ export default defineConfig(({ mode }) => {
             renderModernChunks: false,
           }),
         ]
-      : [],
+      : [artifactAssertions({ isTvBuild, sentryConfigured })],
     test: {
       environment: 'node',
       include: ['src/**/*.spec.ts'],

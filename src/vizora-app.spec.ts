@@ -7584,25 +7584,66 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
   // always safe. Proving the DEGRADED path, not the happy one: these guards exist for
   // exactly the states below.
 
-  it('G1x: a WEDGED config read does not hang the boot — the device still reaches pairing', async () => {
+  it('G1x: a WEDGED BRIDGE does not brick the boot — the retry fires and recovers', async () => {
+    // Reshaped: this used to wedge only the `config_` keys, which is the shape of the
+    // three lines that were changed rather than the shape of the failure. A wedged
+    // Capacitor bridge is a BRIDGE-level condition — it takes out Network.getStatus,
+    // the five migration reads, the credential reads, last_playlist, the marker
+    // removal and SplashScreen.hide() alike — so bounding per key just moved the hang
+    // two calls later. The boot is bounded as a whole instead, and this wedges
+    // everything to prove it.
+    //
+    // This asserts the RECOVERY, not the guard: the retry has to fire AND the device
+    // has to reach a working state afterwards. A test that only checked "not stuck on
+    // splash" would pass on a device that retried forever.
     secureStorageStore.clear();
     const { Preferences } = await import('@capacitor/preferences');
-    (Preferences.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
-      if (key.startsWith('config_')) return NEVER();
-      return { value: preferencesStore.get(key) ?? null };
-    });
+    const { SecureStorage } = await import('./secure-storage');
+    const { Network } = await import('@capacitor/network');
+    const { SplashScreen } = await import('@capacitor/splash-screen');
+    let wedged = true;
+    const hangWhileWedged = <T,>(real: () => Promise<T>): Promise<T> =>
+      (wedged ? (NEVER() as Promise<T>) : real());
+
+    (Preferences.get as Mock).mockImplementation(({ key }: { key: string }) =>
+      hangWhileWedged(async () => ({ value: preferencesStore.get(key) ?? null })));
+    (SecureStorage.get as Mock).mockImplementation(({ key }: { key: string }) =>
+      hangWhileWedged(async () => ({ value: secureStorageStore.get(key) ?? null })));
+    (Network.getStatus as Mock).mockImplementation(() =>
+      hangWhileWedged(async () => ({ connected: true, connectionType: 'wifi' })));
+    (SplashScreen.hide as Mock).mockImplementation(() => hangWhileWedged(async () => undefined));
 
     await importFresh();
-    await vi.advanceTimersByTimeAsync(2500); // past the 2000ms bound
+    await vi.advanceTimersByTimeAsync(1000);
+    // Still wedged: nothing has settled, and crucially the device is NOT stuck silently.
+    await vi.advanceTimersByTimeAsync(20_500); // past the boot bound
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+
+    expect(await reportedEvents()).toContain('boot_timeout');
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    expect(domElements.get('holding-message')!.textContent).toContain('retrying');
+
+    // THE RECOVERY: the bridge comes back, and the scheduled retry boots the device.
+    wedged = false;
     await waitUntil(
-      'the pairing code',
+      'the boot retry to reach pairing',
       () => domElements.get('pairing-code')!.textContent === 'ABCD1234',
-      { tickMs: 300 },
+      { tickMs: 5000 },
     );
 
     expect(visibleScreens()).toEqual(['pairing-screen']);
-    const timeouts = (await reportedEventCalls()).filter(c => c[0] === 'preferences_read_timeout');
-    expect(timeouts.length).toBeGreaterThan(0);
+  });
+
+  it('G1x NEGATIVE CONTROL: a healthy bridge boots without ever arming the boot timeout', async () => {
+    // Proves the bound is a bound and not a delay every device now pays, and that the
+    // recovery above belongs to the retry rather than to something that would have
+    // happened anyway.
+    secureStorageStore.clear();
+
+    await importFresh(() => domElements.get('pairing-code')!.textContent === 'ABCD1234');
+
+    expect(visibleScreens()).toEqual(['pairing-screen']);
+    expect(await reportedEvents()).not.toContain('boot_timeout');
   });
 
   it('G1x: a THROWING config store does not strand the device in recovering', async () => {
@@ -7673,6 +7714,120 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     expect(await reportedEvents()).toContain('tenant_suspended_provisional');
   });
 
+  /** Boot with credentials + a cached playlist and an unreadable suspension latch. */
+  const bootWithUnreadableLatch = async () => {
+    secureStorageStore.set('device_token', 'tok-123');
+    secureStorageStore.set('device_id', 'dev-123');
+    preferencesStore.set('last_playlist', JSON.stringify({
+      tenantId: undefined, deviceId: 'dev-123', savedAt: Date.now(),
+      playlist: { id: 'pl-cached', name: 'cached', loopPlaylist: true,
+        items: [{ id: 'i1', contentId: 'cached1', duration: 10, order: 0,
+          content: { id: 'cached1', name: 'cached1', type: 'image', url: '/cached1.jpg' } }] },
+    }));
+    const { Preferences } = await import('@capacitor/preferences');
+    (Preferences.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      if (key === 'tenant_suspended') return NEVER();
+      return { value: preferencesStore.get(key) ?? null };
+    });
+    await importFresh();
+    await vi.advanceTimersByTimeAsync(2500);
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+  };
+
+  it('G3x RECOVERY: an EXPIRED TOKEN device released from a provisional hold resumes cached content', async () => {
+    // THE failure the fail-closed change created. Every non-purge exit needs a 200 from
+    // auth-check, and an expired token never gets one: the gateway rejects the
+    // handshake so `connect` never fires and the probe only ever sees 401. Most of the
+    // fleet is already past the 90-day expiry, so "hold until a 200" meant those
+    // devices go dark permanently, on a 2-second storage timeout, with an
+    // operator-directed message. They played cached content before this change.
+    //
+    // This asserts the RECOVERY, which is the whole point: held first, then PLAYING.
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 401, data: {} }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    await bootWithUnreadableLatch();
+
+    // Held, and not rendering the cached playlist.
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    expect(findCreatedElements('img').some(i => i.src.includes('cached1.jpg'))).toBe(false);
+
+    // …then the bounded probe releases it and the cached content comes back.
+    // Wait for the SCREEN, not for an <img>. The element is created during the
+    // off-screen prepare(); the transition to PLAYING only happens later at
+    // commitItem(). Waiting on the element and then asserting the screen is a race that
+    // passes on an idle machine and fails under load — it did, 2 runs in 4. Wait for
+    // the property being claimed, not a proxy that precedes it.
+    await waitUntil(
+      'the provisional hold to be released and playback to resume',
+      () => visibleScreens().includes('content-screen'),
+      { tickMs: 20_000, budgetMs: 30_000 },
+    );
+
+    expect(visibleScreens()).toEqual(['content-screen']);
+    expect(findCreatedElements('img').some(i => i.src.includes('cached1.jpg'))).toBe(true);
+    const released = (await reportedEventCalls()).find(c => c[0] === 'tenant_provisional_released');
+    expect(released).toBeDefined();
+    expect((released![1] as { lastStatus?: number }).lastStatus).toBe(401);
+  });
+
+  it('G3x RECOVERY: a LEGACY BACKEND releases the provisional hold immediately', async () => {
+    // 404 stops the probe loop, so a hold left standing here would never be revisited —
+    // and a backend with no auth-check endpoint can never produce the 403 that would
+    // justify it. Released on the first answer rather than after the retry budget.
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 404, data: {} }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    await bootWithUnreadableLatch();
+    expect(visibleScreens()).toEqual(['holding-screen']);
+
+    await waitUntil(
+      'the legacy release',
+      () => findCreatedElements('img').some(i => i.src.includes('cached1.jpg')),
+      { tickMs: 20_000, budgetMs: 30_000 },
+    );
+
+    const released = (await reportedEventCalls()).find(c => c[0] === 'tenant_provisional_released');
+    expect((released![1] as { reason?: string }).reason).toBe('legacy_backend');
+  });
+
+  it('G3x: a PROVISIONAL hold is never persisted — a transient read cannot become durable state', async () => {
+    // N2. Persisting the guess is what made it permanent: every later boot read back
+    // '1' and treated a 2-second timeout as a legitimate suspension, clearable only by
+    // a 200 that the sequences above show may never come.
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 401, data: {} }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    await bootWithUnreadableLatch();
+
+    expect(visibleScreens()).toEqual(['holding-screen']); // it really is held
+    expect(preferencesStore.has('tenant_suspended')).toBe(false);
+    expect(domElements.get('holding-message')!.textContent).toContain('Verifying');
+    expect(domElements.get('holding-message')!.textContent).not.toContain('contact your administrator');
+  });
+
+  it('G3x NEGATIVE CONTROL: a real 403 PROMOTES the hold — confirmed, persisted, and it stays', async () => {
+    // The entitlement fix must survive the false-positive bound. A genuinely suspended
+    // tenant answers 403: the hold is promoted to confirmed, persisted so a power cycle
+    // cannot resume it, and the release budget no longer applies.
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 403, data: {} }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    await bootWithUnreadableLatch();
+
+    await waitUntil(
+      'the promotion to a confirmed suspension',
+      () => preferencesStore.get('tenant_suspended') === '1',
+      { tickMs: 20_000, budgetMs: 30_000 },
+    );
+
+    // Well past the provisional release budget: a confirmed hold does not time out.
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    expect(findCreatedElements('img').some(i => i.src.includes('cached1.jpg'))).toBe(false);
+    expect(await reportedEvents()).not.toContain('tenant_provisional_released');
+  });
+
   it('G3x NEGATIVE CONTROL: a readable, absent latch resumes cached content normally', async () => {
     // Same boot, same cached playlist, working store. Proves the hold above belongs to
     // the unreadable latch and not to the cached-playlist path having gone dark — a
@@ -7710,10 +7865,24 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     // NEITHER source carries an id. The pairing REQUEST response normally does, and
     // the commit legitimately falls back to it — that fallback is kept, so it has to
     // be removed here too or this would be testing the fallback working, not the hole.
-    httpPostHandler = () => ({ status: 200, data: { data: { code: 'ABCD1234', expiresInSeconds: 300 } } });
-    httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
-      ? { status: 200, data: { data: { status: 'paired', deviceToken: 'tok-half' } } } // no deviceId
-      : { status: 200, data: { data: { status: 'pending' } } };
+    //
+    // ONE-SHOT, because the deployed backend is: checkPairingStatus deletes the pairing
+    // request BEFORE returning `paired` (d323434e), so the paired response is produced
+    // exactly once and every later poll 404s. A handler that keeps answering `paired`
+    // tests a server that does not exist, and would hide the real recovery — which is
+    // the 404 branch minting a fresh code, not a retry of the same one.
+    let codeIssued = 0;
+    httpPostHandler = () => {
+      codeIssued++;
+      return { status: 200, data: { data: { code: codeIssued === 1 ? 'ABCD1234' : 'WXYZ9999', expiresInSeconds: 300 } } };
+    };
+    let pairedServed = false;
+    httpGetHandler = (opts) => {
+      if (!opts.url.includes('/pairing/status/')) return { status: 200, data: { data: { status: 'pending' } } };
+      if (pairedServed) return { status: 404, data: {} }; // the request is gone server-side
+      pairedServed = true;
+      return { status: 200, data: { data: { status: 'paired', deviceToken: 'tok-half' } } }; // no deviceId
+    };
 
     await importFresh(() => domElements.get('pairing-code')!.textContent === 'ABCD1234');
     await vi.advanceTimersByTimeAsync(6000); // several poll rounds
@@ -7722,9 +7891,12 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     expect(secureStorageStore.has('device_token')).toBe(false);
     expect(secureStorageStore.has('device_id')).toBe(false);
     expect(await reportedEvents()).toContain('pairing_persist_failed');
-    // …and the device is still pairable, showing a LIVE code rather than stranded.
+    // …and the device RECOVERS: the one-shot response is gone, so the next poll 404s
+    // and a FRESH code is minted. That is the real recovery path, and it is better
+    // than retrying a code whose commit just failed.
     expect(visibleScreens()).toEqual(['pairing-screen']);
-    expect(domElements.get('pairing-code')!.textContent).toBe('ABCD1234');
+    expect(domElements.get('pairing-code')!.textContent).toBe('WXYZ9999');
+    expect(codeIssued).toBeGreaterThan(1);
   });
 
   it('G9x: the retry does not spin hot — it stays on the 2s poll cadence', async () => {
@@ -7746,11 +7918,14 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     expect(polls.length).toBeLessThanOrEqual(6);
   });
 
-  it('G9x: a missing tenantId is REPORTED but still pairs — the legacy backend must stay pairable', async () => {
-    // Deliberately NOT fatal, unlike deviceId: the legacy backend never sends tenantId
-    // (init() has a documented grace path for it), so refusing here would make this
-    // client unpairable against it forever. What was wrong was the SILENCE — the device
-    // is now permanently on the no-binding grace path, which weakens cache isolation.
+  it('G9x: a missing tenantId is REPORTED as a backend anomaly but still pairs', async () => {
+    // NOT fatal, and not for the reason this test first gave. Production ALWAYS sends
+    // tenantId (d323434e pairing.service.ts:511) — the earlier "legacy backends omit
+    // it" premise was wrong. It is tolerated because the field is emitted as
+    // `display?.organizationId`, so a null `display` yields undefined while still
+    // saying `paired`: making that fatal turns a backend defect into a fleet-wide
+    // pairing outage. Absence is tolerated, MISMATCH is still refused at load time,
+    // and the event is named so telemetry reads it as a server-side anomaly.
     secureStorageStore.clear();
     httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
       ? { status: 200, data: { data: { status: 'paired', deviceToken: 'tok-legacy', deviceId: 'dev-legacy' } } }
@@ -7761,7 +7936,7 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
 
     expect(secureStorageStore.get('device_id')).toBe('dev-legacy');
     expect(secureStorageStore.has('tenant_id')).toBe(false);
-    expect(await reportedEvents()).toContain('pairing_without_tenant');
+    expect(await reportedEvents()).toContain('pairing_backend_omitted_tenant');
   });
 
   it('G9x NEGATIVE CONTROL: a COMPLETE paired response still commits everything', async () => {
@@ -7776,7 +7951,7 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     expect(secureStorageStore.get('device_id')).toBe('dev-full');
     expect(secureStorageStore.get('tenant_id')).toBe('tenant-full');
     expect(await reportedEvents()).not.toContain('pairing_persist_failed');
-    expect(await reportedEvents()).not.toContain('pairing_without_tenant');
+    expect(await reportedEvents()).not.toContain('pairing_backend_omitted_tenant');
   });
 
   // ======================================================================

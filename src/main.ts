@@ -269,6 +269,22 @@ class VizoraAndroidTV {
   private authProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private authProbeRetry = 0;
   private lastConfirmProbeAt = 0;
+  /**
+   * True while the suspension is OUR GUESS rather than the server's word — see
+   * enterTenantSuspended. Never persisted, and released by any answer that is not a
+   * 403.
+   */
+  private suspensionProvisional = false;
+  /** Probe answers seen while provisional, for the liveness bound below. */
+  private provisionalProbes = 0;
+  /**
+   * How many non-403 probe answers a PROVISIONAL hold survives before it is released.
+   * A 404 releases immediately (a legacy backend can never produce a 403, so waiting
+   * only keeps a healthy device dark). Anything else — 401, a null/transport failure —
+   * gets this many chances to turn into a 403 first, so a genuinely suspended tenant
+   * whose first probe merely blipped still latches durably.
+   */
+  private static readonly PROVISIONAL_MAX_PROBES = 2;
   private authDegradedSince = 0;
 
   // Temporary content push state
@@ -375,6 +391,22 @@ class VizoraAndroidTV {
    * boundedPrefsGet().
    */
   private static readonly BRIDGE_READ_TIMEOUT_MS = 2000;
+  /**
+   * Ceiling on a whole boot. Generous on purpose: init() does not await the network
+   * (startPairing is fire-and-forget), so a healthy boot is bridge calls only and
+   * settles in well under a second even on a cold TV. This is not a latency budget,
+   * it is the difference between a device that retries and a device that is bricked
+   * on the splash screen — so it is set far above any plausible healthy boot, and a
+   * device that trips it is genuinely wedged.
+   */
+  private static readonly BOOT_TIMEOUT_MS = 20_000;
+  /**
+   * Which boot attempt is current. A timed-out init() is ABANDONED, not cancelled —
+   * a wedged bridge call can still resolve later — so its tail must not run
+   * startPairing()/connectToRealtime() on top of the attempt that replaced it, which
+   * would double-pair or open a second socket.
+   */
+  private initGeneration = 0;
   /** Durable half of the tenant-suspension latch — see enterTenantSuspended(). */
   private static readonly TENANT_SUSPENDED_PREF_KEY = 'tenant_suspended';
   /**
@@ -475,18 +507,49 @@ class VizoraAndroidTV {
    * error screen (F19). Backoff 5s -> 5min cap.
    */
   private startInit() {
-    this.init().catch(err => {
-      console.error('[Vizora] Initialization error, will retry:', err);
-      this.machine.transition('recovering', 'init_failure');
-      this.setHoldingMessage('Starting up — retrying…');
-      const delay = Math.min(5000 * Math.pow(2, this.initRetryCount), 300000);
-      this.initRetryCount = Math.min(this.initRetryCount + 1, 6);
-      setTimeout(() => this.startInit(), delay);
-    });
+    // BOUNDED AT THE BOOT, not per call site. Bounding individual reads was the wrong
+    // layer: a wedged Capacitor bridge is a BRIDGE-level condition, so bounding the
+    // three config reads just moved the hang two calls later — to Network.getStatus,
+    // the five migration reads, the credential reads, the last_playlist read, the
+    // marker removal, or SplashScreen.hide(), which is literally the call that takes
+    // the splash down. None of those settle either, and a hang (unlike a throw) never
+    // reaches this catch, so the retry never fires and the device sits on the splash
+    // forever with no error and no telemetry.
+    //
+    // One race here covers every unbounded bridge call in the boot path, including
+    // ones nobody has written yet, and turns "brick" into "retry".
+    const attempt = this.initGeneration + 1;
+    this.initGeneration = attempt;
+
+    void Promise.race([
+      this.init().then(() => 'settled' as const),
+      this.timeoutAfter(VizoraAndroidTV.BOOT_TIMEOUT_MS),
+    ])
+      .then((outcome) => {
+        if (outcome !== 'timeout') return;
+        // Deliberately routed through the SAME catch a thrown init takes: one recovery
+        // path, one retry ladder, one screen state. A hang and a throw are the same
+        // thing to an operator.
+        console.error(`[Vizora] init() did not settle in ${VizoraAndroidTV.BOOT_TIMEOUT_MS}ms — treating as a failed boot`);
+        reportEvent('boot_timeout', { attempt });
+        throw new Error('init_timeout');
+      })
+      .catch(err => {
+        console.error('[Vizora] Initialization error, will retry:', err);
+        this.machine.transition('recovering', 'init_failure');
+        this.setHoldingMessage('Starting up — retrying…');
+        const delay = Math.min(5000 * Math.pow(2, this.initRetryCount), 300000);
+        this.initRetryCount = Math.min(this.initRetryCount + 1, 6);
+        setTimeout(() => this.startInit(), delay);
+      });
   }
 
   private async init() {
     console.log('[Vizora] Initializing Android TV display client...');
+    // The attempt this body belongs to — see initGeneration. Checked before the
+    // terminal side effects, so a boot that timed out and later unwedged cannot
+    // pair or connect on top of the attempt that superseded it.
+    const bootGen = this.initGeneration;
 
     // Load configuration
     await this.loadConfig();
@@ -556,6 +619,14 @@ class VizoraAndroidTV {
       await SplashScreen.hide();
       this.initRetryCount = 0;
       this.startPairing();
+      return;
+    }
+
+    // A boot that the timeout already abandoned must stop here rather than pair or
+    // connect on top of its replacement. Everything above this line is reads.
+    if (bootGen !== this.initGeneration) {
+      console.warn('[Vizora] Abandoned boot attempt resumed after its timeout — discarding it');
+      reportEvent('boot_attempt_superseded', { attempt: bootGen });
       return;
     }
 
@@ -664,7 +735,9 @@ class VizoraAndroidTV {
       if (suspendedLatch === 'timeout') {
         console.warn('[Vizora] Suspension latch unreadable — entering suspension PROVISIONALLY (fail closed)');
         reportEvent('tenant_suspended_provisional', {});
-        this.enterTenantSuspended('latch_unreadable');
+        // PROVISIONAL, not confirmed: not persisted, neutral copy, and released by any
+        // probe answer that is not a 403. See enterTenantSuspended.
+        this.enterTenantSuspended('latch_unreadable', { provisional: true });
       } else if (suspendedLatch.value === '1') {
         this.enterTenantSuspended('restored_latch');
       }
@@ -1416,22 +1489,42 @@ class VizoraAndroidTV {
             if (tenantId) {
               await SecureStorage.set({ key: 'tenant_id', value: tenantId });
             } else {
-              // NOT fatal, deliberately — and this is a considered disagreement with
-              // the review, which suggested treating it like a missing deviceId. The
-              // legacy backend genuinely never sends tenantId (see the grace path in
-              // init()), so refusing here would make this client unpairable against it
-              // forever — the exact "so strict it strands a legitimate device" failure
-              // the same review warned about. What was wrong was that the degradation
-              // was SILENT: this device is now permanently on the legacy no-binding
-              // grace path, which weakens cross-tenant cache isolation, so it is
-              // reported rather than refused.
-              console.warn('[Vizora] Paired without a tenantId — cache/playlist binding degrades to legacy grace');
-              reportEvent('pairing_without_tenant', { hasDeviceId: true });
+              // NOT fatal, deliberately — but NOT for the reason first written here.
+              //
+              // RETRACTION. The original justification was "the legacy backend genuinely
+              // never sends tenantId, so refusing would make this client unpairable
+              // against it forever." That is FALSE for the deployed backend and I should
+              // not have asserted it: I lifted "absent on the legacy backend" from the
+              // comment a few lines up and treated it as a fact about production.
+              // Verified at d323434e — pairing.service.ts:511 returns
+              // `tenantId: display?.organizationId` on every paired response, and the
+              // comment above it states the Device Revocation Contract v1.1 requires the
+              // device to bind cache and playlist to it. There is one production backend
+              // and it always sends this field.
+              //
+              // The real reason to tolerate absence is blast radius, not compatibility:
+              // the field is emitted as `display?.organizationId`, so a degenerate
+              // response where `display` is null yields `tenantId: undefined` while still
+              // reporting `status: 'paired'`. Making that fatal would convert a
+              // BACKEND-side defect into a fleet-wide pairing outage — no client-side
+              // strictness should own that. Absence is tolerated; MISMATCH is still
+              // refused at load time, so the isolation property is untouched.
+              //
+              // Which makes this signal an ANOMALY, not a benign legacy path: production
+              // always sends it, so seeing this means something is wrong server-side.
+              console.error('[Vizora] Paired WITHOUT a tenantId — the backend omitted it; this is a server-side defect, not a legacy path');
+              reportEvent('pairing_backend_omitted_tenant', { hasDeviceId: true });
             }
           } catch (error) {
             // Fail RECOVERABLE: nothing is committed and the poller is untouched, so
-            // the very next poll retries this same still-valid code, and if it does
-            // expire the 404 branch requests a fresh one. The device stays pairable.
+            // the device stays pairable.
+            //
+            // NOT by retrying the same code, which an earlier version of this comment
+            // claimed. Against deployed d323434e the paired response is ONE-SHOT:
+            // checkPairingStatus deletes the pairing request before returning `paired`,
+            // so the next poll 404s and startPairing() mints a fresh code. That is the
+            // better recovery of the two — a code whose commit just failed is not one
+            // to keep trying — but it is not what was written here.
             console.error('[Vizora] Failed to persist pairing credentials — will retry on the next poll:', error);
             reportEvent('pairing_persist_failed', {});
             return;
@@ -2188,6 +2281,17 @@ class VizoraAndroidTV {
       if (status === 404) {
         // Legacy backend — the endpoint teaches us nothing; stop probing and
         // let the socket reconnection loop carry recovery.
+        //
+        // A PROVISIONAL hold must be released here rather than left standing: this
+        // backend cannot produce a 403, so the probe loop is about to stop and the
+        // hold would never be revisited. Holding a healthy device dark forever on a
+        // guess is strictly worse than resuming cached content on a backend that has
+        // no opinion about entitlement at all.
+        if (this.suspensionProvisional) {
+          console.warn('[Vizora] Provisional hold released — legacy backend cannot confirm a suspension');
+          reportEvent('tenant_provisional_released', { reason: 'legacy_backend' });
+          this.resumeFromSuspension('provisional_unconfirmed');
+        }
         console.log('[Vizora] Auth-check endpoint absent (legacy backend) — probe loop stopped');
         return;
       }
@@ -2205,6 +2309,19 @@ class VizoraAndroidTV {
             ? Math.round((Date.now() - this.authDegradedSince) / 1000)
             : 0,
         });
+      }
+
+      // A PROVISIONAL hold gets a bounded number of chances to become a 403 before it
+      // is released. This is the path an EXPIRED TOKEN takes — the gateway rejects the
+      // handshake so `connect` never fires and only 401s ever arrive — and without the
+      // bound that device stays dark permanently despite being perfectly healthy.
+      if (this.suspensionProvisional && status !== 403) {
+        this.provisionalProbes++;
+        if (this.provisionalProbes >= VizoraAndroidTV.PROVISIONAL_MAX_PROBES) {
+          console.warn(`[Vizora] Provisional hold released after ${this.provisionalProbes} unconfirmed probes (last=${status})`);
+          reportEvent('tenant_provisional_released', { reason: 'unconfirmed', lastStatus: status });
+          this.resumeFromSuspension('provisional_unconfirmed');
+        }
       }
 
       // 24h continuously degraded: unobtrusive badge, cached loop continues (§5)
@@ -2257,6 +2374,18 @@ class VizoraAndroidTV {
       return;
     }
 
+    // A PROVISIONAL hold is not evidence of anything, so only a 403 keeps it. Any
+    // other answer — 401, 404, a transport failure — means we still have no statement
+    // from the server, and the device should be playing its cached content while we
+    // keep asking rather than dark on our own guess.
+    if (this.suspensionProvisional && status !== 403) {
+      console.warn(`[Vizora] Provisional hold released on ${source} (auth-check=${status})`);
+      reportEvent('tenant_provisional_released', { reason: source, lastStatus: status });
+      this.resumeFromSuspension('provisional_unconfirmed');
+      this.scheduleAuthProbe();
+      return;
+    }
+
     console.warn(`[Vizora] Tenant still suspended after ${source} (auth-check=${status}) — staying held`);
     reportEvent('tenant_suspension_confirmed', { source, authCheckStatus: status });
     // Keep the disambiguation loop alive so a later resume is noticed even if no
@@ -2264,11 +2393,57 @@ class VizoraAndroidTV {
     this.scheduleAuthProbe();
   }
 
-  /** Tenant suspension: fail closed for rendering, keep credentials (§3.1). */
-  private enterTenantSuspended(source: string) {
-    console.warn('[Vizora] Tenant suspended:', source);
-    reportEvent('tenant_suspended', { source });
+  /**
+   * Tenant suspension: fail closed for rendering, keep credentials (§3.1).
+   *
+   * PROVISIONAL vs CONFIRMED. A confirmed suspension is one the server stated — a 403
+   * from auth-check, or the `tenant:suspended` push. A PROVISIONAL one is our own
+   * guess, entered when the durable latch could not be read at boot, and it is a guess
+   * that accuses a customer's display of being suspended on the strength of a 2-second
+   * storage timeout.
+   *
+   * The two must not be treated alike, because the exits are not alike. Every non-purge
+   * exit needs HTTP 200 from auth-check, and there are three ordinary states with no
+   * 200 available at all: an EXPIRED TOKEN (the gateway rejects the handshake, so
+   * `connect` never fires and the probe only ever sees 401 — and most of the fleet is
+   * already past the 90-day expiry), a LEGACY BACKEND (404, and the probe loop stops),
+   * and a SITE OUTAGE. A provisional hold in any of those is permanent, on a device
+   * with nothing wrong with it, showing an operator-directed message. That trade is
+   * worse than the fail-open it replaced: the old failure needed the tenant to be
+   * genuinely suspended AND the latch unreadable; this one needs the latch unreadable
+   * AND any of three everyday conditions.
+   *
+   * So provisional is deliberately weak: it is NOT persisted (a transient read must
+   * never become durable cross-reboot state — that is what made it permanent), it says
+   * something neutral on the glass, and it is bounded — only a 403 promotes it, and
+   * anything else releases it and resumes cached playback.
+   */
+  private enterTenantSuspended(source: string, options?: { provisional?: boolean }) {
+    // A CONFIRMED suspension always wins, including as a promotion of a provisional
+    // hold that a 403 has now justified. A provisional one never downgrades a
+    // confirmed one — the server's word outranks our guess in both directions.
+    const alreadyConfirmed = this.tenantSuspended && !this.suspensionProvisional;
+    const provisional = options?.provisional === true && !alreadyConfirmed;
+    console.warn(`[Vizora] Tenant suspended${provisional ? ' (PROVISIONAL)' : ''}:`, source);
+    reportEvent('tenant_suspended', { source, provisional });
     this.tenantSuspended = true;
+    this.suspensionProvisional = provisional;
+
+    if (provisional) {
+      // NOT persisted, on purpose. Persisting a guess is what turned a 2s read timeout
+      // into a durable latch that every later boot read back as a legitimate
+      // suspension, clearable only by a 200 that may never come.
+      this.provisionalProbes = 0;
+      this.playbackGeneration++;
+      this.enterHolding('tenant_suspended_provisional');
+      this.setHoldingMessage('Verifying display entitlement…');
+      // LIVENESS. Nothing else will start the probe on this path: the connect-time
+      // revalidation needs a handshake the expired-token case never gets. Without this
+      // the hold has no exit at all, which is the defect.
+      this.scheduleAuthProbe();
+      return;
+    }
+
     // DURABLE. In memory only, the latch died with the process: a power cycle booted
     // straight back into the cached playlist (last_playlist is still written while
     // suspended) and the suspended tenant's content was on customer glass again with
@@ -2290,6 +2465,25 @@ class VizoraAndroidTV {
   }
 
   /**
+   * Release a suspension and put content back on the glass.
+   *
+   * The exit is only half the job: advance() gates on the suspend flag, so clearing it
+   * without nudging the engine leaves a device holding with valid cached content and
+   * nothing scheduled to re-render it. Every caller that clears a suspension outside a
+   * purge goes through here, so the resume cannot be forgotten on one path and not
+   * another — which is how the original latch stranded devices.
+   */
+  private resumeFromSuspension(source: string) {
+    this.exitTenantSuspended(source);
+    if (this.temporaryContent) return; // an active push owns the screen (F47)
+    if (this.currentPlaylist?.items?.length) {
+      this.ensurePlaying();
+    } else {
+      this.enterHolding('paired_no_playlist');
+    }
+  }
+
+  /**
    * Clear the tenant-suspension latch (F41). Idempotent: only fires telemetry on
    * a real suspended→active transition. Callers own the actual playback resume,
    * so this never double-renders. Without this, a device suspended via the
@@ -2299,6 +2493,8 @@ class VizoraAndroidTV {
   private exitTenantSuspended(source: string) {
     if (!this.tenantSuspended) return;
     this.tenantSuspended = false;
+    this.suspensionProvisional = false;
+    this.provisionalProbes = 0;
     // Clear the durable copy too, or the next boot re-enters holding on a tenant that
     // is demonstrably active. Unconditional and fire-and-forget: a stranded latch
     // costs one extra auth-check on the next boot, which clears it.
