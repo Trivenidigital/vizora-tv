@@ -243,6 +243,80 @@ dedupe ring (17/19), ack behaviour (16/16), cache managers (28/31), pairing
 
 ---
 
+## Corrections to this wave's own durable records
+
+Claims this wave asserted and later disproved. Recorded with the retraction
+quoted, because a claim that reads as a green check while describing the
+mechanism of a bug is worse than no claim — the next reader stops there. Commit
+messages on pushed branches are immutable, so the correction lives here and is
+the authority over anything earlier that contradicts it.
+
+**1. "The `CrashLoopGuard` prune rule is sound, and `WINDOW_MS (90m) >
+CAPPED_RETRY_MS (60m)` genuinely holds."**
+Asserted by the guard-predicate audit as a reassurance. **Wrong — that inequality
+was the *cause* of the defect, not evidence against it.** A chain window must
+outlast the 60-minute capped rung, and therefore necessarily also compounds
+crashes 45 minutes apart: a box OOMing ~25 minutes after each start climbed to
+the hourly rung and pinned there, ~29% uptime where the previous rule gave ~100%.
+Both constants have since been removed. The property to check now is the general
+form — *the reset threshold always exceeds the delay it just imposed* — pinned
+for every rung rather than asserted for one.
+
+**2. "It is reported, not merely logged."**
+Asserted in this wave's commit messages and code comments as the justification
+for several safety mechanisms. **Void as written at the time it was made.**
+`initCrashReporting` set `enabled = true` merely because `Sentry.init()` had been
+*called*, but an invalid or whitespace DSN makes Sentry construct **no transport**
+and silently discard every event. Worse, `reportCrashLoopMarker` deleted the
+once-ever crash-loop marker *only when that flag was true* — so a bad DSN
+destroyed the sole record of a degrading device without ever reporting it. The
+flag now asks `Sentry.getClient()?.getTransport()`. **Any earlier statement in
+this wave that a mechanism is "surfaced, not swallowed" should be read as
+conditional on a validly-configured DSN, which this repo still does not have.**
+
+**3. "The legacy backend never sends `tenantId`."**
+Asserted as the justification for tolerating its absence at pairing. **Wrong.**
+The deployed backend at `d323434e` emits it — `pairing.service.ts:511`,
+`tenantId: display?.organizationId`, with the comment at `:507-510` stating the
+Device Revocation Contract v1.1 requires the device to bind cache and playlist to
+it. The decision to tolerate absence stands, but on the correct premise: the
+field is emitted as `display?.organizationId`, so a degenerate response where
+`display` is null yields `undefined` while still reporting `paired`, and making
+that fatal would convert a backend defect into a **fleet-wide pairing outage**.
+Consequence for telemetry: `pairing_without_tenant` is **not** a benign legacy
+path — it is an anomaly indicating a server-side defect and must be read that way.
+
+---
+
+## Convergence metric
+
+The wave's own defect rate, per implementation round, as evidence rather than
+judgement. "Self-inflicted" means a defect introduced by *this wave's* earlier
+work, found by a later round.
+
+| Round | New production defects found | **Self-inflicted** | False alarm / already-fixed |
+|---|---|---|---|
+| Discovery (Agents A–E) | 13 REAL in shipped 1.3.15 | 0 (nothing built yet) | ~34 ALREADY_FIXED, 4 FALSE_ALARM |
+| Review wave 1 (6 reviewers) | 9 | **2** — terminal crash HOLD; cache fix that made a failed purge fail-open | 3 |
+| Mutation-integrity audit | 10 unguarded lines | **1** — `slice(-0)` unbounding the ring at zero budget | 1 |
+| Pre-merge reviews | 5 | **1** — the `pairing → holding` guard stranding every freshly-paired device | 2 |
+| Guard-predicate audit | 11 | **1** — the frozen marker count, claim living only in a javadoc | 3 (incl. the stale audit verdict above) |
+| Convergence round | 4 | **2** — the suspension fail-closed stranding healthy devices; a 90 kB shipped-artifact regression that **passed CI** | 1 |
+
+**Self-inflicted rate has NOT reached zero.** Four distinct defects have been
+introduced into this wave's own work: the pairing-stranding guard, the frozen
+marker count, the stale audit verdict, and the bundle regression. The last is the
+most serious class, because it reached a **pushed, green commit** — no test in
+this repo could have caught it, and it was found only because a build number
+looked wrong and someone stopped to explain it rather than shipping it.
+
+**Convergence criterion for the final round:** a full round, with reviewers
+actively hunting, that produces **zero** self-inflicted defects. Until that
+happens, another loop is warranted and no release identity is settled. The native
+head reached CONVERGED; the client head has not.
+
+---
+
 ## The vanishing-tests sweep, and what it found
 
 A suite whose **test count is derived from production data** can silently become
