@@ -58,3 +58,29 @@ jobs:
       - name: Run JVM unit tests (F36 RendererRecoveryGuard, etc.)
         working-directory: android
         run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
+
+      # Negative control for the fail-closed signing guard. The runner has no keystore,
+      # which is exactly the condition that used to produce an UNSIGNED release apk under
+      # the shipping filename. Both release lanes are exercised because they are matched by
+      # two separate anchored patterns, and a refactor that collapses them would silently
+      # reopen one: assembleRelease covers the apk lane, packageReleaseUniversalApk covers
+      # the bundle lane (it is the bundletool-style route and is NOT reachable from the
+      # first pattern even transitively).
+      #
+      # This is cheap: the guard throws at task-graph-ready, before any compilation.
+      - name: Negative control — release packaging must REFUSE without signing material
+        working-directory: android
+        run: |
+          set -o pipefail
+          for task in :app:assembleRelease :app:packageReleaseUniversalApk; do
+            echo "--- $task must refuse ---"
+            if ./gradlew "$task" --no-daemon 2>&1 | tee out.txt; then
+              echo "FAIL: $task succeeded with no signing material — the guard is not firing."
+              exit 1
+            fi
+            grep -q "Refusing to package a release artifact" out.txt || {
+              echo "FAIL: $task failed, but NOT with the signing guard's message."
+              echo "A failure for some other reason would let this control pass vacuously."
+              exit 1
+            }
+          done
