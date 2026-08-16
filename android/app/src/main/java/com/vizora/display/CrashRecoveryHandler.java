@@ -319,13 +319,39 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
             return CrashLoopGuard.UPTIME_UNKNOWN;
         }
         try {
-            long uptime = SystemClock.elapsedRealtime() - Process.getStartElapsedRealtime();
-            return uptime >= 0 ? uptime : CrashLoopGuard.UPTIME_UNKNOWN;
+            return uptimeFrom(Process.getStartElapsedRealtime(), SystemClock.elapsedRealtime());
         } catch (Throwable t) {
             // Never let a telemetry-grade measurement cost us the restart.
             Log.e(TAG, "Could not measure process uptime; falling back to the gap heuristic", t);
             return CrashLoopGuard.UPTIME_UNKNOWN;
         }
+    }
+
+    /**
+     * The uptime arithmetic, and the plausibility check on the platform's answer.
+     *
+     * {@code startElapsedRealtime <= 0} is rejected as IMPLAUSIBLE rather than taken at face
+     * value. A real app process cannot start at the boot instant — zygote, system_server and the
+     * launcher all come first, and even a BOOT_COMPLETED-triggered start is many seconds in — so
+     * 0 does not mean "started at boot", it means the platform did not answer. An OEM build that
+     * stubs {@link Process#getStartElapsedRealtime()} would otherwise make this return time since
+     * BOOT: every crash on a box that has been powered on for ten minutes would look like a
+     * healthy run, the chain would reset every time, and loop containment would be silently
+     * disabled. Falling back to {@link CrashLoopGuard#UPTIME_UNKNOWN} degrades to the gap
+     * heuristic — the mechanism that shipped before the measurement existed — instead of to no
+     * containment at all.
+     *
+     * LIMIT, stated because it is what the hardware sitting is still for: this catches the
+     * likely stub (a default 0). A build that returns a plausible-looking but WRONG non-zero
+     * value is not detectable from inside the process, which is why the crash-path log carries
+     * the measured uptime.
+     */
+    static long uptimeFrom(long startElapsedRealtime, long nowElapsedRealtime) {
+        if (startElapsedRealtime <= 0) {
+            return CrashLoopGuard.UPTIME_UNKNOWN;
+        }
+        long uptime = nowElapsedRealtime - startElapsedRealtime;
+        return uptime >= 0 ? uptime : CrashLoopGuard.UPTIME_UNKNOWN;
     }
 
     /**

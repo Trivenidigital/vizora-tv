@@ -25,6 +25,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.robolectric.RobolectricTestRunner;
 import org.robolectric.RuntimeEnvironment;
+import org.robolectric.annotation.Config;
 import org.robolectric.shadows.ShadowAlarmManager;
 import org.robolectric.shadows.ShadowSystemClock;
 
@@ -40,6 +41,7 @@ import org.robolectric.shadows.ShadowSystemClock;
  * framework APIs rather than mocks of them.
  */
 @RunWith(RobolectricTestRunner.class)
+@Config(shadows = ShadowProcessWithStartTime.class)
 public class CrashRecoveryHandlerWiringTest {
 
     private Context context;
@@ -52,6 +54,9 @@ public class CrashRecoveryHandlerWiringTest {
         alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
         shadowAlarmManager = shadowOf(alarmManager);
         ShadowAlarmManager.setCanScheduleExactAlarms(true);
+        // A fresh test is a freshly started process: uptime begins at ~0 and grows only
+        // when a test advances the clock.
+        ShadowProcessWithStartTime.setStartElapsedRealtime(SystemClock.elapsedRealtime());
     }
 
     private ShadowAlarmManager.ScheduledAlarm lastAlarm() {
@@ -575,6 +580,50 @@ public class CrashRecoveryHandlerWiringTest {
         }
 
         assertEquals(CrashLoopGuard.CAPPED_RETRY_MS, scheduledDelayMs(lastAlarm()));
+    }
+
+    @Test
+    public void anOemBuildThatStubsProcessStartDegradesToTheGapRuleNotToNoContainment() {
+        // The disclosed residual risk from the uptime rework, now closed for the detectable
+        // case. Process.getStartElapsedRealtime() is public API since 24, but a build that stubs
+        // it to 0 would make measured uptime read as time since BOOT. On a box that has been
+        // powered on for half an hour every crash would then look like a healthy run, the chain
+        // would reset every time, and loop containment would be silently disabled — while every
+        // other test in this file stayed green, because they all run on a freshly booted clock.
+        //
+        // A real app process cannot start at the boot instant, so 0 is not an answer, it is the
+        // absence of one. Rejecting it drops us to the gap heuristic — the mechanism that
+        // shipped before the measurement existed — rather than to nothing.
+        ShadowProcessWithStartTime.setStartElapsedRealtime(0L);
+        ShadowSystemClock.advanceBy(Duration.ofMinutes(30));
+
+        for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
+            CrashRecoveryHandler.recordAndScheduleRelaunch(
+                context, CrashRecoveryHandler.REASON_UNCAUGHT_EXCEPTION);
+        }
+
+        assertEquals("containment is disabled on this build: every crash looked like a healthy "
+                + "run, so the ladder reset each time and the device hot-loops",
+            CrashLoopGuard.CAPPED_RETRY_MS, scheduledDelayMs(lastAlarm()));
+    }
+
+    @Test
+    public void anImplausibleProcessStartIsRejectedRatherThanBelieved() {
+        assertEquals("0 means the platform did not answer, not 'started at the boot instant'",
+            CrashLoopGuard.UPTIME_UNKNOWN, CrashRecoveryHandler.uptimeFrom(0L, 30 * 60_000L));
+        assertEquals("negative is not an answer either",
+            CrashLoopGuard.UPTIME_UNKNOWN, CrashRecoveryHandler.uptimeFrom(-1L, 30 * 60_000L));
+        assertEquals("a clock that ran backwards is not an answer either",
+            CrashLoopGuard.UPTIME_UNKNOWN, CrashRecoveryHandler.uptimeFrom(60_000L, 30_000L));
+    }
+
+    @Test
+    public void aPlausibleProcessStartIsMeasuredNormally() {
+        // Negative control for the rejection above: the guard must not swallow real answers.
+        assertEquals(5 * 60_000L,
+            CrashRecoveryHandler.uptimeFrom(60_000L, 60_000L + 5 * 60_000L));
+        assertEquals("a process that just started measures zero, not unknown",
+            0L, CrashRecoveryHandler.uptimeFrom(60_000L, 60_000L));
     }
 
     // ---- one key, shared by both causes: a write must not downgrade the record --------------
