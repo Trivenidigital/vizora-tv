@@ -243,6 +243,26 @@ dedupe ring (17/19), ack behaviour (16/16), cache managers (28/31), pairing
 
 ---
 
+## The vanishing-tests sweep, and what it found
+
+A suite whose **test count is derived from production data** can silently become
+vacuous the moment that data shrinks, and nothing in a green run reports it. The
+trap has two shapes: cases *generated* from a production array (empty array →
+zero tests → green), and a loop that *carries* the assertions (empty iterable →
+no assertions → green).
+
+| Finding | Disposition | Evidence |
+|---|---|---|
+| **`src/main.spec.ts:97` — the test asserting no device token leaks into crash reports was vacuous** | **REAL_FIXED — test-quality defect, NOT a live token leak** | It iterated `scrubEvent`'s returned `exception.values` with no count assertion, and the count is *production output*. Proven both ways: with `scrubEvent` mutated to return an empty array the test **passed having asserted nothing**; with a `toHaveLength(2)` added it goes red on the same mutant. **The scrubbing itself was and is correct** — the fixed test passes against unmutated production code. This matters for anyone reading the security row later: the *verifier* was broken, the *product* was not |
+| Origins-derived test generation | **REAL_FIXED** | Cases generated from `RELEASE_ORIGINS` meant emptying the array yields zero generated tests and a green suite. Guarded with cardinality meta-assertions; emptying the array now goes red |
+| Rest of the repo swept | **FALSE_ALARM** (clean, with reasons) | Every `it.each` table is an inline literal, so its cardinality lives in the spec and cannot shrink without a visible diff; the three derived loops already carry cardinality guards. One of them carries a comment naming this exact vacuity risk — someone reached the rule independently in that file, which is the argument for `tasks/lessons.md` existing |
+
+Both rules are now in `tasks/lessons.md` rather than only in a review thread,
+along with the two mutation-tooling mechanics that stopped this batch producing a
+false survivor.
+
+---
+
 ## Mutation-result trust boundary
 
 There were **three independent tooling failures** in this wave, each capable of
