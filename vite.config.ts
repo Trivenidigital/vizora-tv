@@ -6,6 +6,7 @@ import {
   releaseSentryWarning,
   resolveAppVersion,
   resolveReleaseOrigins,
+  resolveSentryDsn,
   type ResolvedOrigins,
 } from './src/build-provenance';
 
@@ -128,6 +129,10 @@ export default defineConfig(({ mode }) => {
   // Whether the artifact gets to claim crash reporting is live, and the build-time
   // warning when it does not — see isSentryConfigured/releaseSentryWarning in
   // src/build-provenance.ts for why this is not fail-closed.
+  // One source for both: the DSN compiled in and the flag that claims one was. They
+  // are derived from the same trimmed value so the artifact cannot claim telemetry is
+  // live while carrying a DSN Sentry will reject.
+  const sentryDsn = resolveSentryDsn(env);
   const sentryConfigured = isSentryConfigured(env);
   const sentryWarning = releaseSentryWarning(mode, sentryConfigured);
   if (sentryWarning) {
@@ -223,7 +228,7 @@ export default defineConfig(({ mode }) => {
           dashboard: origins.VITE_DASHBOARD_URL,
         }),
       ),
-      'import.meta.env.VITE_SENTRY_DSN': JSON.stringify(env.VITE_SENTRY_DSN || ''),
+      'import.meta.env.VITE_SENTRY_DSN': JSON.stringify(sentryDsn),
       // Whether this artifact was built with a crash-reporting DSN. Stamped as a
       // literal so the publish-side verifier can read it back out of the built
       // bundle (see the __VIZORA_SENTRY_CONFIGURED__ comment in src/main.ts). The

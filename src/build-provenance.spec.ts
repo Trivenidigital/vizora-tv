@@ -28,6 +28,7 @@ import {
   releaseSentryWarning,
   resolveAppVersion,
   resolveReleaseOrigins,
+  resolveSentryDsn,
 } from './build-provenance';
 
 /** A value nothing correct may ever return — the shape of the bug, not just a decoy. */
@@ -381,15 +382,47 @@ describe('isSentryConfigured', () => {
     );
   });
 
-  it('KNOWN RESIDUAL: a padded-but-otherwise-valid DSN still reports configured', () => {
-    // Documented, not fixed. The trim only decides emptiness; the DSN VALUE compiled
-    // into the bundle is still untrimmed, so ' https://…/42 ' stamps true while
-    // Sentry's regex rejects the leading space at runtime. Closing this means trimming
-    // the stamped value too, which changes what the client receives — reported rather
-    // than folded into a test-coverage change.
-    expect(isSentryConfigured({ VITE_SENTRY_DSN: ' https://abc@o1.ingest.sentry.io/42 ' })).toBe(
-      true,
+  it('reports configured for a padded DSN — because the compiled value is trimmed too', () => {
+    // Was a known residual: the flag trimmed, the compiled DSN did not, so a padded
+    // DSN stamped `true` while Sentry's regex rejected the leading space at runtime —
+    // the same false positive through a narrower entrance. Closed by deriving both
+    // from resolveSentryDsn. The pairing is what makes this assertion honest, so it is
+    // asserted here as a pair, not as a lone boolean.
+    const env = { VITE_SENTRY_DSN: ' https://abc@o1.ingest.sentry.io/42 ' };
+
+    expect(isSentryConfigured(env)).toBe(true);
+    expect(resolveSentryDsn(env)).toBe('https://abc@o1.ingest.sentry.io/42');
+  });
+
+  it('never claims configured while compiling a DSN Sentry would reject as empty', () => {
+    // The invariant the two functions exist to hold, stated once: the flag is true
+    // exactly when the compiled DSN is non-empty. Nothing may satisfy one and not
+    // the other.
+    for (const dsn of [undefined, '', '   ', '\t\n ', 'https://abc@o1.ingest.sentry.io/42']) {
+      const env = { VITE_SENTRY_DSN: dsn };
+      expect(isSentryConfigured(env)).toBe(resolveSentryDsn(env).length > 0);
+    }
+  });
+});
+
+describe('resolveSentryDsn', () => {
+  it('returns an empty string when no DSN is set', () => {
+    expect(resolveSentryDsn({})).toBe('');
+  });
+
+  it('returns an empty string for a whitespace-only DSN', () => {
+    expect(resolveSentryDsn({ VITE_SENTRY_DSN: '   ' })).toBe('');
+  });
+
+  it('strips the padding Sentry would choke on', () => {
+    expect(resolveSentryDsn({ VITE_SENTRY_DSN: '  https://abc@o1.ingest.sentry.io/42\n' })).toBe(
+      'https://abc@o1.ingest.sentry.io/42',
     );
+  });
+
+  it('leaves an already-clean DSN byte-identical', () => {
+    const dsn = 'https://abc@o1.ingest.sentry.io/42';
+    expect(resolveSentryDsn({ VITE_SENTRY_DSN: dsn })).toBe(dsn);
   });
 });
 
@@ -514,7 +547,22 @@ describe('vite.config.ts stamps what build-provenance decided', () => {
     const config = await buildConfig('production');
 
     expect(config.define['__RELEASE_SENTRY_CONFIGURED__']).toBe('false');
+    expect(config.define['import.meta.env.VITE_SENTRY_DSN']).toBe(JSON.stringify(''));
     expect(console.warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('compiles the TRIMMED DSN into the bundle, not the padded one', async () => {
+    process.env.VITE_SENTRY_DSN = '  https://abc@o1.ingest.sentry.io/42  ';
+
+    const config = await buildConfig('production');
+
+    // The bytes that ship are what Sentry parses at runtime. Padding here is the
+    // difference between working telemetry and a single console.error in logcat.
+    expect(config.define['import.meta.env.VITE_SENTRY_DSN']).toBe(
+      JSON.stringify('https://abc@o1.ingest.sentry.io/42'),
+    );
+    expect(config.define['__RELEASE_SENTRY_CONFIGURED__']).toBe('true');
+    expect(console.warn).not.toHaveBeenCalled();
   });
 
   it('compiles the PINNED origins into a release build', async () => {

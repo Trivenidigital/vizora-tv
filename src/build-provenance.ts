@@ -187,25 +187,47 @@ export function resolveAppVersion(mode: string, cwd: string = process.cwd()): st
 }
 
 /**
+ * The crash-reporting DSN compiled into the bundle — TRIMMED, or '' when there is none.
+ *
+ * The trim is not cosmetic. Surrounding whitespace makes a DSN dead on arrival:
+ * @sentry/core matches it against `^(?:(\w+):)\/\/…`, so a leading space fails the
+ * regex, makeDsn returns undefined, `client._dsn` stays unset, no transport is ever
+ * constructed and every event is dropped. Verified against the installed
+ * @sentry/core — it does NOT throw, so the app boots normally and looks healthy.
+ *
+ * Field-diagnosis note, because this is what makes it expensive to find: the ONLY
+ * runtime clue is a single `console.error('Invalid Sentry Dsn: …')` from
+ * dsnFromString. That line is not DEBUG_BUILD-gated and terser does not strip it
+ * (the production build drops console.log/warn and keeps console.error), so one
+ * logcat line is the entire signal that telemetry is dead.
+ *
+ * Trimming is safe in one direction only, which is the good direction: a padded DSN
+ * does not work today, so trimming can only turn broken telemetry into working
+ * telemetry, and trimming an unpadded DSN is a no-op. There is no input this
+ * converts from working to broken.
+ */
+export function resolveSentryDsn(env: Record<string, string | undefined>): string {
+  return env.VITE_SENTRY_DSN?.trim() ?? '';
+}
+
+/**
  * Whether this artifact was built with a crash-reporting DSN.
  *
  * Stamped into the bundle as __RELEASE_SENTRY_CONFIGURED__ and read back out by the
- * publish-side verifier, so this is an assertion the artifact makes about itself: a
- * `true` with no DSN behind it is a lie the verifier would confirm. The DSN itself is
- * a credential and is never what gets checked — only whether one was present.
+ * publish-side verifier, so this is an assertion the artifact makes about itself. The
+ * DSN itself is a credential and is never what gets checked — only whether one was
+ * present.
  *
- * TRIMMED, and that is the whole point of the function rather than an inline
- * `Boolean(env.VITE_SENTRY_DSN)`. `Boolean('   ')` is true, so `VITE_SENTRY_DSN="   "`
- * — a plausible typo in a CI secret or a .env line — used to stamp `true` onto an
- * artifact whose crash reporting is dead: @sentry/core's DSN regex rejects the string,
- * makeDsn returns undefined, no transport is constructed and every event is dropped
- * (verified against the installed @sentry/core; it does not throw, it silently
- * disables). The stamp exists so the verifier can assert telemetry is live in the
- * exact bytes being uploaded — a false positive there does not weaken the mechanism,
- * it defeats it entirely, because the verifier's confirmation is the only check.
+ * Defined in terms of resolveSentryDsn ON PURPOSE: the stamp is true exactly when the
+ * DSN compiled into the same bundle is non-empty, so the claim and the thing it claims
+ * about cannot drift apart. `Boolean(env.VITE_SENTRY_DSN)` could not make that
+ * promise — `Boolean('   ')` is true, so a typo in a CI secret stamped `true` over
+ * dead telemetry, and the verifier would then read the stamp and CONFIRM the lie. A
+ * verifier defeated by a false positive is not a weakened check; it is no check at
+ * all, and it is the only one guarding this.
  */
 export function isSentryConfigured(env: Record<string, string | undefined>): boolean {
-  return Boolean(env.VITE_SENTRY_DSN?.trim());
+  return resolveSentryDsn(env).length > 0;
 }
 
 /**
