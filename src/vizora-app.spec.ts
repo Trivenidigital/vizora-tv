@@ -8119,6 +8119,25 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     expect(await reportedEvents()).not.toContain('frame_url_refused');
   });
 
+  it('P4 NEGATIVE CONTROL: a PLAIN http:// signage page is accepted, not silently dropped', async () => {
+    // Both other controls use https, so the http arm of the protocol check was
+    // unpinned in the ACCEPTING direction. It is accepted today and deliberately so —
+    // `isRenderableFrameUrl` allows http: and https: and refuses everything else,
+    // because plenty of on-prem signage endpoints are plain http on a LAN.
+    //
+    // Nothing here asks to change that. What this pins is that a one-notch tightening
+    // to https-only cannot land silently: without this test, such a change breaks every
+    // http signage page in the field while the whole suite stays green, and the failure
+    // is invisible at the device (the item is treated as a content error and SKIPPED, so
+    // playback advances past it and nothing looks broken).
+    await playItems([{ type: 'webpage', url: 'http://signage.lan/board', id: 'plain-http' }]);
+
+    const frames = findCreatedElements('iframe');
+    expect(frames).toHaveLength(1);
+    expect(frames[0].src).toBe('http://signage.lan/board');
+    expect(await reportedEvents()).not.toContain('frame_url_refused');
+  });
+
   // ======================================================================
   // P2. THE PURGE'S IN-MEMORY HALF, ASSERTED DIRECTLY
   // ======================================================================
