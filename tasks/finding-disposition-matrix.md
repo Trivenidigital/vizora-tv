@@ -243,6 +243,75 @@ dedupe ring (17/19), ack behaviour (16/16), cache managers (28/31), pairing
 
 ---
 
+## Mutation-result trust boundary
+
+There were **three independent tooling failures** in this wave, each capable of
+silently invalidating a mutation result. Any of them can produce a *surviving
+mutation that was never actually applied* — which reads as "the test is weak"
+when it means "the tool did nothing" — or a *killed mutation on a contaminated
+file*, which reads as strong evidence and is not. So mutation totals are reported
+per-provenance, never as one undifferentiated number.
+
+| Failure | How it was caught | What it invalidates |
+|---|---|---|
+| A revert's replacement string became ambiguous (2 occurrences) and silently no-op'd; the next mutation ran on a still-mutated tree | Noticed when a later result contradicted a fix already applied | **Every result after it in that session**, not just the one repaired |
+| Two restores failed mid-batch; one had already reported a **survivor that was contaminated** | The byte-snapshot guard, which recovered from the snapshot and flagged the run untrustworthy | Both runs; re-run with unique anchors |
+| Git-Bash/MSYS silently swallowed the file-path argument, so the tool opened the needle **text** as a filename | A mutation reported `NEEDLE NOT FOUND` instead of passing silently | Any run where a mutation "survived" without being applied |
+
+**Provenance of the results quoted in this document:**
+
+- The **independent mutation-integrity audit (176 mutations, 122 killed)** was
+  re-derived from scratch on a confirmed-clean tree *after* all three tooling
+  failures, using `git checkout --` restores with a verified-clean check between
+  every one. **176 of 176 restores verified; zero failures.** This is the
+  highest-trust dataset in the wave and is the basis for the "unguarded lines"
+  findings.
+- The **build-provenance mutations (9 of 9 red)** were run after the fix, with
+  sha256-verified byte-identical restores.
+- **Per-batch implementer mutations** run before the tooling was hardened are
+  reported only where a later independent run agrees with them. Where they are
+  the sole evidence, they are marked as such rather than folded into a total.
+
+**The guard that made this recoverable:** `git diff --quiet` was proposed first
+and is *useless here* — these worktrees legitimately carry uncommitted work, so
+it can never pass, making it a guard incapable of firing. That is the same defect
+class this wave found three times in the product. It was replaced with a
+byte-for-byte `cmp` against a pre-mutation snapshot, with auto-recovery and a
+non-zero exit. It caught two live failures. **Committing per round makes both
+guards available**, which is why committing is now treated as part of finishing a
+slice rather than a follow-up step.
+
+---
+
+## Honestly unverified — recorded so the verified parts are believable
+
+These are **not** closed. Each was attempted or considered and left open, with the
+reason. A reader must be able to see exactly what is unverified.
+
+| Item | Status | Why |
+|---|---|---|
+| `purgeDeviceState`'s two `clearTimeout` blocks | **NOT PINNED — no honest observable exists** | Three attempts. With `currentPlaylist` already null, a surviving timer wakes, finds nothing, renders nothing, and its attempt to take the screen is refused by the pairing guard. The second attempt asserted on the refusal log line and *also* survived, because the timer is not reliably armed at purge time. The probe was **deleted rather than shipped green**. These two lines are genuine defence in depth behind two other guards |
+| Six further `purgeDeviceState` field clears (`deviceId`, `tenantId`, `temporaryContent`, `savedPlaylistState`, `currentContentPlaylistId`, `playbackGeneration++`) | **STILL UNPINNED — not attempted** | Each needs its own observable; ran out of runway. Flagged rather than implied covered |
+| `scheduleAuthProbe()` after a non-200 revalidate | **NOT DONE** | Out of runway. Still open |
+| `applyContentQueue`'s `.catch` | **NOT PINNABLE TODAY** | The queue cannot hold a rejection — `applyContentExclusive` catches its only throwing site internally and returns normally. The test pins the *property* (a malformed playlist does not stop the next one) and says in its own comment that it does not pin the `.catch` |
+| Push-path purge-generation read | **CONFIRMED UNPINNED; production CONFIRMED correct** | The read is synchronous at the delivery site, so the window is zero. The mutation opens a one-microtask window that cannot be hit deterministically through a real entry point without building a scheduling race — which would be a flaky test. Left deliberately |
+| `anyHomeAccepted`'s rejection arm | **FIXED, NOT PINNABLE** | Exercising it would require breaking production: both inner functions catch internally |
+| The `shouldApplyContent` re-check in `applyContentExclusive` | **UNREACHABLE — verified, not excused** | The independent auditor confirmed the author's comment is accurate rather than an excuse |
+
+## Claims that did NOT survive checking
+
+Recorded because writing a test, watching it fail, and reporting the failure **as
+the finding** is the behaviour this process exists to produce.
+
+| Claim | Outcome |
+|---|---|
+| "A relative URL throws and then gets framed at app origin" | **Unreachable.** By the time `isRenderableFrameUrl` runs, `transformContentUrl` has already absolutized against `config.apiUrl`. The test was written, it failed, and the failure was the finding |
+| "The purge's suspension-latch removal is an unguarded line" | **Wrong framing — redundant by design.** `purgeDeviceState` calls `exitTenantSuspended` first, which clears the same key while the latch is still on. Deleting *both* turns two tests red, so the pair is covered. Kept as defence in depth |
+| An implementer's own first frame-URL test, named "the catch fails CLOSED" | **Was pinning the wrong line.** `'ht!tp://%%%not a url%%%'` does not throw — with a base supplied it parses as relative and is refused by the same-origin rule, so the catch-flip mutation survived a green test. Fixed with a host containing a space, which genuinely throws. Self-caught |
+| An implementer's own first F1 negative control | **Was vacuous.** Post-purge the socket is torn down, so the triggered event never reached the app and the assertion held on nothing. Deleted and replaced with a unit-layer test at the real production ordering, where credentials arrive mid-sequence. Self-caught |
+
+---
+
 ## Two findings the implementer surfaced in their own work
 
 Both were caught by mutations that **failed to go red when they should have** —
