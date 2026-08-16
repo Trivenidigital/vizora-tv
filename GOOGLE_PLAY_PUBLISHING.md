@@ -74,9 +74,19 @@ no signing config at all, AGP produced `app-release-unsigned.apk`, and the outpu
 renamed it to `vizora-display-<version>-release.apk` — unsigned bytes under the shipping
 filename, with nothing in the build log saying so.
 
-The refusal is scoped to release **packaging** tasks (`assembleRelease`, `bundleRelease`,
-`packageRelease`). Debug builds, `testDebugUnitTest` and IDE sync all still work with no
-keystore present, which is what CI runs.
+The refusal is scoped to release **packaging** tasks — `assembleRelease`, `bundleRelease`,
+`packageRelease`, and the bundle-side `packageReleaseBundle`, `signReleaseBundle`,
+`packageReleaseUniversalApk`. Debug builds, `testDebugUnitTest`, `testReleaseUnitTest` and IDE
+sync all still work with no keystore present, which is what CI runs.
+
+`packageReleaseUniversalApk` is included deliberately: it is what produces an installable APK
+out of an AAB, and it depends on none of the other three, so it needs to be named or that route
+is unguarded.
+
+**`./gradlew build` and `./gradlew assemble` now fail without a keystore.** This is not the
+guard misfiring — both of those depend on `assembleRelease`, so they really are asking to
+package a release. Use `./gradlew assembleDebug`, `./gradlew testDebugUnitTest`, or supply the
+signing material.
 
 **Verify the certificate after every release build** — signing with the wrong key is as bad as
 not signing, and is not visible until an update fails on a fielded device:
