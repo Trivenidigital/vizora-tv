@@ -94,6 +94,10 @@ describe('Sentry scrubbing (S2 — free-text paths)', () => {
       } as Parameters<NonNullable<typeof opts.beforeSend>>[0],
       {},
     ) as { exception: { values: Array<{ value: string }> } };
+    // Cardinality first: the loop below asserts nothing at all if scrubEvent ever
+    // returns an empty (or dropped) values array, and a vacuous loop reports green.
+    // The count is production output, so it has to be pinned before it is iterated.
+    expect(out.exception.values).toHaveLength(2);
     for (const v of out.exception.values) {
       expect(v.value).not.toContain('SECRET');
     }
