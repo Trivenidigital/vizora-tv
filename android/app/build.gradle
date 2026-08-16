@@ -240,10 +240,25 @@ try {
 // keystore), every debug build, and IDE sync. Signing material is only genuinely required to
 // PACKAGE a release, so that is exactly the scope of the refusal — the task graph is inspected
 // once it is known, and the build stops before any packaging task runs.
+//
+// TWO ALTERNATIVES, NOT ONE WIDER PATTERN. The first ends at "Release" on purpose: the AGP task
+// namespace is full of names that merely BEGIN that way — bundleReleaseClasses,
+// packageReleaseUnitTestForUnitTest, assembleReleaseAndroidTest — and a pattern relaxed enough
+// to catch the bundle-side tasks below would also catch those and break `testReleaseUnitTest`
+// for anyone who runs it. The bundle side genuinely has different suffixes, so it gets its own
+// anchored alternative rather than a loosening of the first.
+//
+// The bundle-side tasks are not reachable from the first pattern even transitively:
+// packageReleaseUniversalApk is what `bundletool`-style extraction of an installable APK out of
+// an AAB actually runs, and it depends on neither bundleRelease nor packageRelease. Before this
+// alternative existed, that documented route in a keystore-less worktree produced
+// app-release-universal-unsigned.apk with no guard firing at all — verified by doing it.
 gradle.taskGraph.whenReady { graph ->
     def releasePackagingTasks = graph.allTasks.findAll { task ->
-        task.project.path == project.path &&
-            task.name ==~ /^(assemble|bundle|package)([A-Z]\w*)?Release$/
+        task.project.path == project.path && (
+            task.name ==~ /^(assemble|bundle|package)([A-Z]\w*)?Release$/ ||
+                task.name ==~ /^(package|sign)([A-Z]\w*)?Release(Bundle|UniversalApk)$/
+        )
     }
     if (releasePackagingTasks.isEmpty()) {
         return
@@ -268,6 +283,17 @@ gradle.taskGraph.whenReady { graph ->
     // Belt and braces: material resolving is not the same fact as the config being ATTACHED to
     // the release variant. If a future edit drops the `signingConfig signingConfigs.release`
     // line, everything above still reports "ready" while AGP happily emits unsigned bytes.
+    // (Not a tautology: AGP attaches a signing config to the DEBUG build type by default but
+    // leaves release null unless something assigns it, so this reads null exactly when the
+    // assignment is missing.)
+    //
+    // CONSTRAINT — this reads the BUILD TYPE, not each variant's effective signing config, and
+    // that is only equivalent while this module has no product flavors. Add flavors and it goes
+    // wrong in both directions: a flavor that sets its own signingConfig would leave the build
+    // type null and trip this as a false alarm, and a flavor that OVERRIDES the build type's
+    // config with something else would pass this check while shipping bytes signed by the wrong
+    // key — which is the failure this whole file exists to prevent. If flavors are ever added,
+    // this must iterate android.applicationVariants and assert per variant.
     if (android.buildTypes.release.signingConfig == null) {
         throw new GradleException(
             "Refusing to package a release artifact: signing material resolved, but no signing " +
