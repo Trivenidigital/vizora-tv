@@ -6804,14 +6804,22 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     }
   });
 
-  it('B1: a purge clears BOTH ring homes', async () => {
+  it('B1: a purge clears ALL THREE ring homes', async () => {
+    // Retitled and extended: it asserted two homes while the ring has three. IndexedDB
+    // was added as the independent home on TV and the purge did not clear it, so a
+    // reboot before the next command had loadSeenCommands union the revoked tenant's
+    // ring back into memory AND back out to localStorage — re-creating the exact leak
+    // the purge closes. A test whose title claims completeness has to check all of it.
     httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
       ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
       : { status: 200, data: { data: { status: 'pending' } } };
     await connectAndCommit();
     triggerSocketEvent('command', { type: 'clear_override', timestamp: 'b1-purge' }, vi.fn());
     await vi.advanceTimersByTimeAsync(50);
-    expect(localRing()).toContain('clear_override@b1-purge'); // baseline: there is state to purge
+    // Baseline on every home, so each assertion below has something to prove.
+    expect(localRing()).toContain('clear_override@b1-purge');
+    expect(preferencesStore.has('seen_command_keys')).toBe(true);
+    expect(idbRing).toContain('clear_override@b1-purge');
 
     triggerSocketEvent('device:revoked', { reason: 'operator' });
     for (let i = 0; i < 30; i++) await Promise.resolve();
@@ -6820,6 +6828,37 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     expect(secureStorageStore.has('device_token')).toBe(false); // the purge really ran
     expect(preferencesStore.has('seen_command_keys')).toBe(false);
     expect(localRing()).toEqual([]);
+    expect(idbRing).toEqual([]);
+  });
+
+  it('B1: the purged ring does not come BACK on the next boot', async () => {
+    // The consequence, not just the field: clearing three stores is only meaningful if
+    // the restore cannot resurrect the revoked tenant's keys. Boot after the purge and
+    // prove a key from the previous pairing no longer suppresses anything.
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    await connectAndCommit();
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'b1-resurrect' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+
+    triggerSocketEvent('device:revoked', { reason: 'operator' });
+    await waitUntil('purge', () => !secureStorageStore.has('device_token'), { tickMs: 100 });
+
+    // Re-pair and reboot into the new pairing.
+    secureStorageStore.set('device_token', 'tok-2');
+    secureStorageStore.set('device_id', 'dev-2');
+    await importFresh();
+    (window.location.reload as Mock).mockClear();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+
+    // The same (type, timestamp) is a NEW command for this pairing — it must run.
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'b1-resurrect' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
   });
 
   // -------- test-instrument 5: the restore bound --------
@@ -7518,6 +7557,59 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
   });
 
   // ======================================================================
+  // F1. PAIRING -> HOLDING IS REFUSED ONLY WHILE THERE IS NOTHING TO HOLD FOR
+  // ======================================================================
+  //
+  // The pairing guard was written for the stale-advance()-after-revocation race, where
+  // refusing is right: a de-paired device has nothing to hold FOR. It also fired on a
+  // device that had JUST PAIRED, which is the opposite situation.
+  //
+  // The trace: the poll-success block (main.ts:1362-1377) persists credentials, stops
+  // the pollers and calls connectToRealtime() — with NO screen transition anywhere in
+  // it, so the machine is still in `pairing`. The connect handler then finds no
+  // temporary content and no cached playlist (that load lives only in the credentialed
+  // init branch, which an unpaired boot never entered) and calls
+  // enterHolding('paired_no_playlist') — REFUSED, return value discarded, message
+  // written into a hidden screen. The device is paired, heartbeating and green on the
+  // dashboard while the glass still shows the now-dead pairing code. An installer reads
+  // that as "not paired" and re-pairs, which is also refused because canPair() is now
+  // false. Paired-but-no-content-yet IS the standard install sequence.
+  //
+  // Nothing caught it because the existing "paired device with no playlist holds on
+  // connect" test seeds credentials and boots from `boot`, never passing through
+  // `pairing`, and the C6 unit test has no notion of credentials.
+
+  it('F1: a device that pairs through the real poll shows HOLDING, not a dead pairing code', async () => {
+    secureStorageStore.clear(); // unpaired boot → the machine really is in `pairing`
+    httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
+      ? { status: 200, data: { data: { status: 'paired', deviceToken: 'tok-new', deviceId: 'dev-new', tenantId: 'tenant-A' } } }
+      : { status: 200, data: { data: { status: 'pending' } } };
+
+    await importFresh(() => domElements.get('pairing-code')!.textContent === 'ABCD1234');
+    expect(visibleScreens()).toEqual(['pairing-screen']); // baseline: we start FROM pairing
+
+    await waitUntil(
+      'the pairing poll to succeed',
+      () => secureStorageStore.get('device_token') === 'tok-new',
+      { tickMs: 2100 },
+    );
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect'); // paired, connected, and no content assigned yet
+    await vi.advanceTimersByTimeAsync(300);
+
+    // The OTHER direction — the refusal that must still fire on a de-paired device —
+    // is pinned at the unit layer by screen-state.spec C6/C6b, not here: after a purge
+    // the socket is torn down, so no app-level event can reach the machine and any
+    // app-level "still refused" assertion would pass by nothing being delivered. That
+    // is a vacuous test, so there isn't one.
+    //
+    // The holding screen is on the glass — that is the whole point, and it is what the
+    // installer sees instead of a code that no longer works. (The hidden pairing-screen
+    // div keeps its old text; harmless, and not worth asserting on.)
+    expect(visibleScreens()).toEqual(['holding-screen']);
+  });
+
+  // ======================================================================
   // P5. TWO GUARDS THAT OTHER FIXES ARE STANDING ON
   // ======================================================================
 
@@ -7987,8 +8079,13 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     await vi.advanceTimersByTimeAsync(50);
     expect(window.location.reload).toHaveBeenCalledTimes(1);
 
-    // Same id, DIFFERENT timestamp — a requeue re-stamped by a later sendCommand would
-    // defeat a timestamp-only key, and must not defeat this one.
+    // Same id, DIFFERENT timestamp. The rationale here used to claim this models a
+    // requeue "re-stamped by a later sendCommand" — it does not, and the deployed
+    // gateway never re-stamps on requeue (sendCommand stamps once at :2299 and the
+    // identical object is requeued). What this actually pins is that the id is a
+    // DEDUPE KEY and not merely a tiebreaker alongside the timestamp: the two fields
+    // disagree, and identity must still win. That property is what makes the key robust
+    // if the server's stamping ever changes; it is not evidence that it has.
     triggerSocketEvent('command', { type: 'reload', timestamp: 't-2', commandId: 'uuid-same' }, vi.fn());
     await vi.advanceTimersByTimeAsync(50);
 

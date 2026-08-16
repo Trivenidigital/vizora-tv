@@ -2300,6 +2300,13 @@ class VizoraAndroidTV {
       // (type, timestamp) key happens to collide, and it leaves the revoked tenant's
       // command history readable on the device.
       Preferences.remove({ key: VizoraAndroidTV.COMMAND_DEDUPE_PREF_KEY }),
+      // …and the THIRD home. Without this the purge cleared memory, localStorage and
+      // Preferences while IndexedDB kept the revoked tenant's ring: a reboot before the
+      // next command has loadSeenCommands union it straight back into memory AND back
+      // out to localStorage, re-creating the leak this purge exists to close. It goes
+      // in the allSettled with the rest so an IDB failure is counted by the same
+      // device_purge_incomplete accounting (CommandRing.write rejects on failure).
+      CommandRing.write([]),
       // Device-lifecycle state that was surviving a purge which claims to be
       // complete: the crash-loop breadcrumb describes an episode on the PREVIOUS
       // pairing, and the suspension latch would re-enter holding on whatever tenant
@@ -3176,8 +3183,14 @@ class VizoraAndroidTV {
           if (accepted) resolve(true);
           else if (--outstanding === 0) resolve(false);
         };
-        void a.then(settle);
-        void b.then(settle);
+        // The rejection arm is not decoration. Both inputs are documented never-reject
+        // and are correct today, but if either ever did reject, this promise would keep
+        // `outstanding` at 1 forever AND leak an unhandled rejection — the 2s race
+        // outside would mask it as a timeout, which reads as "the bridge is wedged"
+        // rather than "someone broke a contract". Treating a rejection as a refusal
+        // costs nothing and removes the dependence on a caller-side invariant.
+        void a.then(settle, () => settle(false));
+        void b.then(settle, () => settle(false));
       });
 
     const persist = await Promise.race([

@@ -84,10 +84,21 @@ export class ScreenStateMachine {
     // not be able to overwrite. A stale advance() continuation resuming after a
     // revocation has already called startPairing() fires enterHolding('no_playlist')
     // and replaces a live pairing code with "Waiting for content…" — for up to the
-    // five minutes until the code expires and a new one is requested. There is
-    // nothing to hold FOR while unpaired: pairing is the terminal screen until
-    // credentials exist, and canPair() already refuses the reverse direction.
-    if (to === 'holding' && this.current === 'pairing') {
+    // five minutes until the code expires and a new one is requested.
+    //
+    // The condition is "nothing to hold FOR", which is UNPAIRED — not "the screen says
+    // pairing". Keyed on the state alone this also refused a device that had just
+    // PAIRED: nothing in the poll-success path transitions the screen, so the machine
+    // is still in `pairing` when the connect handler holds for content that has not
+    // been assigned yet. That left a paired, heartbeating device showing a dead pairing
+    // code, with re-pairing refused too because canPair() had gone false — and
+    // paired-with-no-content-yet is the standard install sequence, not an edge case.
+    //
+    // canPair() is the credential test, so it separates the two exactly: after a purge
+    // both deviceToken and deviceId are null (canPair() true) and the stale-continuation
+    // refusal still fires; after a successful pair both are set BEFORE
+    // connectToRealtime() (canPair() false) and holding is reachable.
+    if (to === 'holding' && this.current === 'pairing' && this.guards.canPair()) {
       console.warn(`[ScreenState] REFUSED pairing -> holding (${reason}): a pairing code owns the screen`);
       return false;
     }

@@ -141,6 +141,38 @@ describe('ScreenStateMachine', () => {
     expect(m.transitions.length).toBe(1); // …only the pairing hop
   });
 
+  it('C6b: once CREDENTIALS exist, pairing -> holding is ALLOWED', () => {
+    // The guard's condition is "nothing to hold FOR", which means UNPAIRED — not
+    // "the screen currently shows pairing". Keyed on the state alone it also refused a
+    // device that had just paired: nothing in the poll-success path transitions the
+    // screen, so the machine is still in `pairing` when the connect handler holds for
+    // content that has not been assigned yet. That stranded a paired, heartbeating
+    // device on a dead pairing code, with re-pairing refused too because canPair() had
+    // gone false.
+    //
+    // canPair() is exactly the discriminator: false here (credentials present) means
+    // the refusal must NOT fire. C6 above covers the other half, where it must.
+    // Credentials have to ARRIVE mid-sequence, which is the real thing being modelled:
+    // the device enters pairing while unpaired (canPair true, or the hop is refused),
+    // the poll succeeds and writes deviceToken/deviceId, and only then does the connect
+    // handler ask to hold. A fixed-guard machine cannot express that ordering.
+    const seen: TransitionRecord[] = [];
+    let unpaired = true;
+    const m = new ScreenStateMachine(
+      { canPair: () => unpaired, canPlay: () => false },
+      rec => seen.push(rec),
+    );
+    m.transition('pairing', 'pairing_requested');
+    seen.length = 0;
+    unpaired = false; // ← the pairing poll succeeded; credentials now exist
+
+    expect(m.transition('holding', 'paired_no_playlist')).toBe(true);
+
+    expect(m.state).toBe('holding');
+    expect(visible()).toEqual(['holding-screen']);
+    expect(seen.map(r => `${r.from}->${r.to}`)).toEqual(['pairing->holding']);
+  });
+
   it('C6 NEGATIVE CONTROL: holding is still reachable from every other state', () => {
     // Same layer. Proves the guard is scoped to the pairing screen and did not turn
     // the never-black terminal into an unreachable state.
