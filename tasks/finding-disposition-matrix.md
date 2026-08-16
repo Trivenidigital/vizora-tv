@@ -240,3 +240,21 @@ dedupe ring (17/19), ack behaviour (16/16), cache managers (28/31), pairing
 | 1 non-deterministic full-suite failure in 33 runs | **REAL_FIXED** (headroom) | Unreproduced across 30 further runs, 6 loaded runs and 25 targeted runs; only correlate is duration (23.78s vs 16.51s). Prime suspect is real-time headroom — a 3000ms `waitFor` against a real Socket.IO server under vitest's 5s per-test timeout leaves ~2s of slack, and a slow run is the regime that eats it |
 | 41 fixed-count microtask drains in the spec | **NOT_WORTH_CHANGING** (this wave) | Deterministic today because I/O is mocked, but they encode an assumed promise-chain depth, and several are followed by `.not.toContain(...)` assertions that would go vacuous rather than red. Recorded as the next verification-hygiene unit of work |
 | `resolveReleaseOrigins()` zero coverage | **REAL_FIXED** | The load-bearing fail-closed provenance mechanism, exercised by the new wiring tests but asserted about not at all |
+
+---
+
+## Two findings the implementer surfaced in their own work
+
+Both were caught by mutations that **failed to go red when they should have** —
+i.e. by the verification process doing its job on the verifier.
+
+| Finding | Disposition | Evidence |
+|---|---|---|
+| `slice(-0)` returns the WHOLE array | **REAL_FIXED**, and swept as a class | `-0 === 0`, so a zero reserve budget silently became an **unbounded** one — in a ring that is JSON-stringified into three stores per command. Replaced with an explicit `newest(xs, n) = n > 0 ? xs.slice(-n) : []`. **Class sweep completed:** the only remaining variable-argument slice in `src/` is inside that guarded helper; every other `.slice()` in non-spec source uses a constant (`-2` on a split hostname, `0`, or positive) or no argument, and the cache managers have none. The pre-existing `seenCommandKeys.slice(-COMMAND_DEDUPE_MAX)` path now routes through the helper. |
+| `Promise.all` made an independent store hostage to a wedged one | **REAL_FIXED** | An early draft awaited BOTH the Preferences and IndexedDB writes, so a bridge that never settles would burn the whole 2s budget and refuse a command whose record IndexedDB had **already accepted** — defeating the point of adding an independent home. Now first-acceptance-wins. |
+
+## Latent-reachable, not dead
+
+| Finding | Disposition | Evidence |
+|---|---|---|
+| The polling-transport branch in the ack-flush reasoning | **NOT_WORTH_CHANGING**, but labelled **latent-reachable** | An earlier claim that the branch is unreachable "because transports are `['websocket']`" was **wrong** — `main.ts:1713` is `transports: ['websocket', 'polling']`. The branch is unreachable for a different reason: `tryAllTransports` defaults false (engine.io-client `socket.js:512`) and is never set, so a failed websocket open reconnects on websocket rather than shifting to polling. This matters because polling **is** in the config: flipping that option or reordering the list makes the XHR path live again. The comment cites the option rather than the transport list, and this is latent-reachable code, not dead code. |

@@ -1,5 +1,34 @@
 # Delivery-acknowledgement semantics — what "delivered" means, per event class
 
+## Release-critical precondition, verified against the deployed backend
+
+Advertising `deliveryAck` takes the server **off** its legacy delivery path. If
+the server-side handling were not actually deployed, shipping this client would
+be dangerous — the device would stop getting best-effort delivery and get nothing
+in its place. **It is deployed.**
+
+Verified in the Vizora repo at the deployed commit **`d323434e`**, file
+`realtime/src/gateways/device.gateway.ts` (exact path — note the repo also
+contains copies of this file under `.claude/worktrees/agent-*`, which must
+**never** be used to verify a cross-repo contract; only a named SHA counts):
+
+| Symbol | Line at `d323434e` |
+|---|---|
+| `getAckError` | `:254` |
+| `supportsDeliveryAck` | `:258` |
+| `deliveryAckCapable` | `:259`, `:960`, `:1036` |
+| `if (!this.supportsDeliveryAck(socket))` legacy branch | `:276` |
+
+Also confirmed at that SHA: `fleet.service.ts:91` is
+`const commandId = crypto.randomUUID();`, which is what makes `commandId` a
+usable primary dedupe key for fleet-originated commands.
+
+**This is the precondition that makes the client's capability advertisement
+safe.** If a future backend rollback removed these symbols, the client would need
+to stop advertising the capability in the same change.
+
+
+
 The TV client advertises `capabilities: ['deliveryAck']` and acknowledges
 `playlist:update` and `command`. This file states, for each event class, **which
 of received / validated / accepted / applied / executed the ack truthfully
