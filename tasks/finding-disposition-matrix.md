@@ -243,6 +243,25 @@ dedupe ring (17/19), ack behaviour (16/16), cache managers (28/31), pairing
 
 ---
 
+## Deferred at the tail, deliberately — with the fix shape named
+
+Four items were declined **late in the wave, on purpose**. The wave's signature
+failure is a behaviour change made at the tail, on an instinct that looked
+correct, producing a new defect — five times. So the stopping rule became: take
+additions that add *coverage*, decline additions that add *behaviour*.
+
+Each is recorded with its fix shape, because the shape is the part that
+evaporates.
+
+| Item | Why deferred | Fix shape, named |
+|---|---|---|
+| **CI's `tsc --noEmit` has never typechecked a single spec file** | `tsconfig.json:19` excludes `src/**/*.spec.ts`. ~91 diagnostics surface when enabled — a real cleanup, not a drive-by. Found the hard way: a test written with an undeclared variable passed tsc and failed at runtime looking like a product bug | Remove the exclusion, fix the diagnostics. **Durable-record correction: every "tsc clean" claim in this wave means production `src/` only, which is narrower than it reads** |
+| **`tenantReadFailed` is never re-tested within a process** | One transient `tenant_id` decrypt failure disables the `last_playlist` snapshot for the whole boot, so a 24/7 screen carries a weeks-stale cache into its next reboot. The permanence is deliberate, unstated and unpinned. Fixing it means re-testing the flag — a behaviour change | Re-test `tenantReadFailed` at a defined later point, or state the permanence at the site and pin it |
+| **The crash-loop storm marker is muted for the life of a no-DSN device** | The web layer keeps the marker forever when reporting is disabled, so the native no-clobber rule refuses every storm marker behind it. **A fix I believe is correct, declined anyway** — it is a behaviour change on the telemetry path, at the tail. Cost of deferring is telemetry blindness, not a device defect | A retention **bound**, not a rule change: the marker already carries a timestamp, so when reporting is disabled and the marker is older than one window, remove it anyway. A few lines in `reportCrashLoopMarker`, no native change. Converts "blocked forever" into "blocked for one window". **Moot if the DSN question is settled before release** |
+| **`http://` webpage frames unpinned** | Taken, not deferred — the one item that adds coverage without behaviour | — |
+
+---
+
 ## Deliberate deferrals whose fix lives in another repository
 
 | Finding | Disposition | Owner / evidence |
