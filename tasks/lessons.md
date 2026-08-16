@@ -85,3 +85,43 @@ Two mechanics that make this trustworthy on this repo:
   modifications (an intentional edit, a pre-existing `package-lock.json` change) that
   command can never return 0, so it reports nothing useful. Compare a sha256 against a
   pristine copy taken before the run.
+
+---
+
+## L4 — Write the assertion at the layer where the property lives
+
+Five self-inflicted defects in one wave shared one shape: the property that broke was
+real and checkable, and every assertion written about it lived at a different layer.
+A bundle-size property checked only by unit tests. A decay-boundary property checked
+only by a fixed-count wait. A zero-budget property checked only where the budget was
+never zero. A screen-state property checked via a DOM element created earlier in the
+same flow. A backend-fact property checked against our own comment about the backend.
+
+Rule: name the layer the property actually lives at — artifact, wire, clock, screen,
+server — and put the assertion there. An assertion one layer away can be green while
+the property is false, and it will be, because that is the gap it cannot see.
+
+Corollary: if the property has no layer you can assert at, that is the finding — say so
+instead of asserting nearby.
+
+Worked example from the same wave: a test driving `vite build` from inside vitest read
+the child's stdout, while Vite routes plugin logs to stderr — so the output capture
+decided the result rather than the build, and a perfectly good build failed. The fix was
+to split the layers explicitly: the DECISION is tested by driving the hook directly, the
+ARTIFACT is tested by actually building one in CI.
+
+---
+
+## L5 — A verification whose null result looks like a pass is not a verification
+
+Comparing a build before/after a change via `git stash` produced an IDENTICAL artifact
+hash, which read as "this change does not affect the bundle". It measured nothing: the
+changes had already been committed by another session, so there was nothing to stash.
+The check could not have failed.
+
+Rule: before trusting a comparison, prove the two sides actually differ — assert the
+arrange, not just the result. A null result and a passing result must be
+distinguishable, or the check is decoration.
+
+Same class as an assertion that passes because the code path never ran, and as a guard
+condition that can never evaluate true.
