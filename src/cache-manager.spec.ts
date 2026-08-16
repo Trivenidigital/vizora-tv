@@ -1293,3 +1293,270 @@ describe('AndroidCacheManager', () => {
     });
   });
 });
+
+// ===========================================================================
+// Release-review wave: C4 (the purgeFailed latch) + T6 (the getCachedUri guards)
+// ===========================================================================
+
+describe('AndroidCacheManager — purge latch & lookup guards', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    installFsFake();
+    setFsTree({});
+    setHttpFactory(() => ({ status: 200, data: 'binary-blob' }));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  /**
+   * Park the Nth manifest write and fail every manifest write after it.
+   *
+   * Asset writes are untouched. This is the only shape that can express the C4
+   * race: a saveManifest already in flight when clearCache lands, whose PRE-clear
+   * snapshot (captured at call time by JSON.stringify) reaches disk afterwards.
+   */
+  function gateManifestWrites(parkOn: number) {
+    let n = 0;
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const inCall = new Promise<void>((r) => { entered = r; });
+    (fs.writeFile as Mock).mockImplementation(async (opts: any) => {
+      if (!String(opts.path).endsWith('manifest.json')) return FS_FAKE.writeFile(opts);
+      n += 1;
+      if (n === parkOn) {
+        entered();
+        await gate;
+        return FS_FAKE.writeFile(opts);
+      }
+      if (n > parkOn) throw new Error('Read-only filesystem');
+      return FS_FAKE.writeFile(opts);
+    });
+    return { entered: inCall, release };
+  }
+
+  // -----------------------------------------------------------------------
+  // C4: the latch must not be cleared by a write that is already stale
+  // -----------------------------------------------------------------------
+  //
+  // saveManifest cleared `purgeFailed` on the strength of the write it had just
+  // completed, and only THEN noticed the clear generation had moved and recursed.
+  // But what that write put on disk is the PRE-clear manifest — populated, stamped
+  // with the tenant that was just purged. If the healing rewrite also fails, disk
+  // holds the purged tenant's manifest with purgeFailed === false, so loadManifest
+  // will NOT discard it — defeating the exact property the latch was added for.
+
+  it('C4: a stale manifest write that lands after a purge does not release the latch', async () => {
+    seedTenantManifest('tenant-A', { abc: makeEntry('abc', 'abc.png', 500) });
+    seedFile('abc.png', 500);
+    (fs.rmdir as Mock).mockRejectedValue(new Error('Permission denied'));
+
+    const cm = new AndroidCacheManager();
+    cm.setExpectedTenant('tenant-A');
+    await cm.init();
+    expect(await cm.getCachedUri('abc')).toBe('file://DATA/content-cache/abc.png'); // baseline
+
+    // Park the manifest write that commits a download; every manifest write after it
+    // fails, which is the state in which the latch is the only remaining defence.
+    const { entered, release } = gateManifestWrites(1);
+    const pending = cm.downloadContent('new1', 'https://cdn/n.png', 'image/png');
+    await entered;
+
+    // The revocation purge lands while that write is in flight.
+    await expect(cm.clearCache()).rejects.toThrow('Permission denied');
+
+    release();
+    expect(await pending).toBeNull(); // superseded, correctly
+
+    // The residue really is on disk: the parked write put the PRE-clear snapshot back.
+    expect(diskManifest()!.entries.abc).toBeDefined();
+    expect(diskManifest()!.tenantId).toBe('tenant-A');
+
+    // …and the latch is still latched, so a re-armed init discards what it reads.
+    // (setExpectedTenant(null) is exactly what purgeDeviceState does.)
+    cm.setExpectedTenant(null);
+    expect(await cm.getCachedUri('abc')).toBeNull();
+    expect(cm.getCacheStats().itemCount).toBe(0);
+    // The asset itself survived the failed rmdir — the manifest is what makes it
+    // unnameable, which is the whole point.
+    expect(getFsTree()['DATA/content-cache/abc.png']).toBeDefined();
+  });
+
+  it('C4 NEGATIVE CONTROL: with NO purge the same parked write releases the latch normally', async () => {
+    // Same gate, same parked write, no clearCache. Proves the refusal above belongs to
+    // the purge and that the latch is not now stuck on — a permanently latched manager
+    // would refuse to serve any cache at all, which is worse than the bug.
+    seedTenantManifest('tenant-A', { abc: makeEntry('abc', 'abc.png', 500) });
+    seedFile('abc.png', 500);
+
+    const cm = new AndroidCacheManager();
+    cm.setExpectedTenant('tenant-A');
+    await cm.init();
+
+    const { entered, release } = gateManifestWrites(1);
+    const pending = cm.downloadContent('new1', 'https://cdn/n.png', 'image/png');
+    await entered;
+    release();
+    expect(await pending).toBe('file://DATA/content-cache/new1.png');
+
+    cm.setExpectedTenant(null); // re-arm init: loadManifest must NOT discard
+    expect(await cm.getCachedUri('abc')).toBe('file://DATA/content-cache/abc.png');
+    expect(await cm.getCachedUri('new1')).toBe('file://DATA/content-cache/new1.png');
+  });
+
+  // -----------------------------------------------------------------------
+  // T6: each of getCachedUri's three clear-generation guards, pinned alone
+  // -----------------------------------------------------------------------
+  //
+  // The three guards were mutually redundant against a return-value assertion: a
+  // purge landing in the stat window is caught by the getUri guard too, so removing
+  // either one alone still produced null. Each test below lands the purge in exactly
+  // one window and asserts that guard's OWN observable.
+
+  it('T6/G1: a purge landing in the STAT window leaves no debounced write behind', async () => {
+    // G1's own effect is upstream of the return value: it stops
+    // `entry.lastAccessed = Date.now(); debouncedSaveManifest()` from running against
+    // an entry the purge has already dropped. Without it the return is still null
+    // (the getUri guard catches that), but a debounce timer is armed and fires 60s
+    // later against the post-purge manifest — churn on a manifest the device has
+    // deliberately emptied.
+    vi.useFakeTimers();
+    seedManifest({ abc: makeEntry('abc', 'abc.png', 500) });
+    seedFile('abc.png', 500);
+    // The rmdir must FAIL, or the purge deletes abc.png and the parked stat throws on
+    // release — which lands in the CATCH and never reaches G1's line at all. A failed
+    // disk purge is also the realistic case: it is precisely when the file is still
+    // there to be re-touched that the guard matters.
+    (fs.rmdir as Mock).mockRejectedValue(new Error('Permission denied'));
+
+    const cm = new AndroidCacheManager();
+    await cm.init();
+
+    const { entered, release } = gateFilesystem('stat', (opts) =>
+      String(opts.path).endsWith('abc.png'));
+    const pending = cm.getCachedUri('abc');
+    await entered;                       // parked INSIDE Filesystem.stat
+    await expect(cm.clearCache()).rejects.toThrow('Permission denied');
+    release();
+    expect(await pending).toBeNull();
+
+    const writesAfterPurge = manifestWriteCount();
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(manifestWriteCount()).toBe(writesAfterPurge);
+  });
+
+  it('T6/G1 NEGATIVE CONTROL: with no purge the same lookup DOES arm the debounced write', async () => {
+    // Proves the observation window can see a debounced write, so the equality above
+    // is not vacuous.
+    vi.useFakeTimers();
+    seedManifest({ abc: makeEntry('abc', 'abc.png', 500) });
+    seedFile('abc.png', 500);
+
+    const cm = new AndroidCacheManager();
+    await cm.init();
+    expect(await cm.getCachedUri('abc')).toBe('file://DATA/content-cache/abc.png');
+
+    const before = manifestWriteCount();
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(manifestWriteCount()).toBe(before + 1);
+  });
+
+  it('T6/G2: a purge landing in the getUri window is not served a live URI', async () => {
+    // G1 has already passed here (the generations still agreed when stat returned), so
+    // G2 is the only guard that can act. Without it, purged content is handed out as a
+    // playable file:// URI — and on a purge whose rmdir failed the file is genuinely
+    // still there to play.
+    seedManifest({ abc: makeEntry('abc', 'abc.png', 500) });
+    seedFile('abc.png', 500);
+    (fs.rmdir as Mock).mockRejectedValue(new Error('Permission denied'));
+
+    const cm = new AndroidCacheManager();
+    await cm.init();
+
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const inCall = new Promise<void>((r) => { entered = r; });
+    (fs.getUri as Mock).mockImplementation(async (opts: any) => {
+      if (String(opts.path).endsWith('abc.png')) { entered(); await gate; }
+      return FS_FAKE.getUri(opts);
+    });
+
+    const pending = cm.getCachedUri('abc');
+    await inCall;                                   // parked INSIDE Filesystem.getUri
+    await expect(cm.clearCache()).rejects.toThrow('Permission denied');
+    release();
+
+    expect(await pending).toBeNull();
+    // Direction: the asset really is still on disk, so this is a refusal to name it
+    // rather than the file having gone away.
+    expect(getFsTree()['DATA/content-cache/abc.png']).toBeDefined();
+  });
+
+  it('T6/G2 NEGATIVE CONTROL: the same gated lookup returns the URI with no purge', async () => {
+    seedManifest({ abc: makeEntry('abc', 'abc.png', 500) });
+    seedFile('abc.png', 500);
+
+    const cm = new AndroidCacheManager();
+    await cm.init();
+
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const inCall = new Promise<void>((r) => { entered = r; });
+    (fs.getUri as Mock).mockImplementation(async (opts: any) => {
+      if (String(opts.path).endsWith('abc.png')) { entered(); await gate; }
+      return FS_FAKE.getUri(opts);
+    });
+
+    const pending = cm.getCachedUri('abc');
+    await inCall;
+    release();
+    expect(await pending).toBe('file://DATA/content-cache/abc.png');
+  });
+
+  it('T6/G3: a purge landing in a FAILING stat does not churn the purged manifest', async () => {
+    // Neither of the other two guards is reachable here — stat threw, so the catch is
+    // the only code that runs. Its guard stops `delete this.manifest.entries[id]` +
+    // saveManifest() from self-healing against a manifest that is already a new, empty
+    // object: an extra write against state the purge has deliberately reset.
+    seedManifest({ abc: makeEntry('abc', 'abc.png', 500) }); // entry with NO file → stat throws
+    (fs.rmdir as Mock).mockRejectedValue(new Error('Permission denied'));
+
+    const cm = new AndroidCacheManager();
+    await cm.init();
+
+    const { entered, release } = gateFilesystem('stat', (opts) =>
+      String(opts.path).endsWith('abc.png'));
+    const pending = cm.getCachedUri('abc');
+    await entered;
+    await expect(cm.clearCache()).rejects.toThrow('Permission denied');
+    const writesAfterPurge = manifestWriteCount();
+    release();
+
+    expect(await pending).toBeNull();
+    expect(manifestWriteCount()).toBe(writesAfterPurge);
+  });
+
+  it('T6/G3 NEGATIVE CONTROL: with no purge the failing stat DOES self-heal the manifest', async () => {
+    // Proves the catch's self-heal is alive — the guard scopes it, it does not delete
+    // it. A manager that stopped pruning entries whose files vanished would leak
+    // unservable entries forever.
+    seedManifest({ abc: makeEntry('abc', 'abc.png', 500) });
+
+    const cm = new AndroidCacheManager();
+    await cm.init();
+    const before = manifestWriteCount();
+
+    expect(await cm.getCachedUri('abc')).toBeNull();
+
+    expect(manifestWriteCount()).toBe(before + 1);
+    expect(diskManifest()!.entries.abc).toBeUndefined();
+  });
+});

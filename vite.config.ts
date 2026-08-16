@@ -1,4 +1,4 @@
-import { defineConfig, loadEnv } from 'vite';
+import { defineConfig, loadEnv, type Plugin } from 'vite';
 import legacy from '@vitejs/plugin-legacy';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -29,6 +29,51 @@ const RELEASE_ORIGINS = [
 ] as const;
 
 type ResolvedOrigins = Record<'VITE_API_URL' | 'VITE_REALTIME_URL' | 'VITE_DASHBOARD_URL', string>;
+
+/**
+ * The app version compiled into the bundle, read from package.json.
+ *
+ * NOT `process.env.npm_package_version`: that variable exists only when the build
+ * was launched through an npm script. `npx vite build` (or any CI runner that calls
+ * vite directly) silently fell back to '1.0.0', producing an artifact that is signed,
+ * passes the origin verifier, and makes every device report `appVersion: "1.0.0"`
+ * forever — while the release gate "heartbeat records a non-zero appVersion" passes
+ * on the wrong value. Reading the file removes the dependency on how the build was
+ * invoked; the same file is already the source of truth for release-origins.json.
+ *
+ * Release modes THROW rather than fall back. A customer artifact that cannot say
+ * which version it is has no way to be recalled, and a wrong version is worse than a
+ * failed build.
+ */
+function resolveAppVersion(mode: string): string {
+  const pkgPath = resolve(process.cwd(), 'package.json');
+  let version: unknown;
+  try {
+    version = (JSON.parse(readFileSync(pkgPath, 'utf8')) as { version?: unknown }).version;
+  } catch (err) {
+    if (RELEASE_MODES.has(mode)) {
+      throw new Error(
+        `[app-version] cannot build mode "${mode}": ${pkgPath} is missing or not valid JSON ` +
+          `(${(err as Error).message}). The compiled-in __APP_VERSION__ is what every device ` +
+          `reports on its heartbeat; a release cannot ship without it.`,
+      );
+    }
+    return '0.0.0-dev';
+  }
+
+  if (typeof version !== 'string' || version.length === 0) {
+    if (RELEASE_MODES.has(mode)) {
+      throw new Error(
+        `[app-version] cannot build mode "${mode}": "version" is missing or empty in ${pkgPath}. ` +
+          `Shipping a build that reports a placeholder version would pass the release gate on the ` +
+          `wrong value.`,
+      );
+    }
+    return '0.0.0-dev';
+  }
+
+  return version;
+}
 
 /**
  * Resolve the backend origins for a release build, or throw.
@@ -103,6 +148,98 @@ function resolveReleaseOrigins(mode: string, env: Record<string, string>): Resol
   return resolved;
 }
 
+/**
+ * Post-build artifact assertions. These run on the EMITTED bundle, because the defect
+ * they exist for was invisible to every other instrument: it type-checked, it passed
+ * 595 unit tests, and it shipped green.
+ *
+ * What happened: `initCrashReporting` read the DSN as
+ * `import.meta.env.VITE_SENTRY_DSN?.trim()`. Vite statically REPLACES
+ * `import.meta.env.VITE_SENTRY_DSN` with a literal, so with no DSN the guard below it
+ * reads `if (!undefined) return;` and the whole Sentry path is dead code that gets
+ * tree-shaken away. Put ANY transform on that expression — an optional chain, a
+ * `.trim()`, a destructure, storing it via a helper — and the substitution no longer
+ * feeds a statically-decidable branch, the minifier can no longer prove the branch is
+ * dead, and the ENTIRE @sentry/browser SDK lands in the artifact. It cost +90.4 kB
+ * uncompressed in a build that cannot send a single event, on TV devices whose engines
+ * are frozen and whose storage and parse budgets are not generous.
+ *
+ * So: read `import.meta.env.X` raw, on its own line, and transform the RESULT.
+ *
+ * Both assertions THROW. A silent warning is what we already had — the build printed
+ * nothing and CI was green.
+ *
+ * WHAT THIS DOES NOT CATCH, so nobody reads it as covering the class:
+ *  - A PARTIAL SDK regression. The token check keys on sentry_key/sentry_client, which
+ *    live in the DSN/envelope code. A regression that retained, say, captureMessage
+ *    while eliminating init() and its integrations would carry neither token and could
+ *    fit inside the size headroom. The two arms overlap for the whole-SDK case only.
+ *  - The TV budget under CI: `build:tv` is not run there, so only the modern budget is
+ *    exercised automatically. The TV numbers are checked when someone builds TV.
+ */
+function artifactAssertions(opts: { isTvBuild: boolean; sentryConfigured: boolean }): Plugin {
+  // Headroom over today's output (~148 kB modern, ~282 kB TV incl. polyfills), sized so
+  // ordinary growth does not trip it but a whole vendored SDK does. Raise deliberately
+  // and say why — a budget quietly raised to make a build pass is not a budget.
+  //
+  // GATED ON THE DSN, because the SDK is ~90 kB and a build WITH a DSN is supposed to
+  // carry it. Ungated, this would have failed the first build that supplied one —
+  // punishing the exact action the telemetry argument asks for, with a message telling
+  // them to find what grew. The no-DSN budget is the one that catches the regression
+  // this instrument exists for; the with-DSN budget just keeps an upper bound.
+  const sdkAllowance = opts.sentryConfigured ? 120_000 : 0;
+  const budgetBytes = (opts.isTvBuild ? 340_000 : 200_000) + sdkAllowance;
+  return {
+    name: 'vizora-artifact-assertions',
+    writeBundle(_options, bundle) {
+      let totalJs = 0;
+      const sentryChunks: string[] = [];
+      for (const [fileName, output] of Object.entries(bundle)) {
+        if (!fileName.endsWith('.js')) continue;
+        const code = (output as { code?: string }).code ?? '';
+        totalJs += Buffer.byteLength(code, 'utf8');
+        // Matched on SDK-internal tokens, not on /sentry/i: our own log strings mention
+        // VITE_SENTRY_DSN, so a naive match flags every healthy build. `sentry_key` and
+        // `sentry_client` are DSN/envelope internals that appear ONLY when the transport
+        // code is bundled — verified against both a lean and a regressed artifact.
+        if (!opts.sentryConfigured && /sentry_key|sentry_client/.test(code)) sentryChunks.push(fileName);
+      }
+
+      if (sentryChunks.length > 0) {
+        throw new Error(
+          `[artifact] @sentry is present in a build with NO VITE_SENTRY_DSN ` +
+            `(${sentryChunks.join(', ')}).
+` +
+            `  The SDK cannot send anything without a DSN, so this is pure weight on a
+` +
+            `  frozen-engine TV device. The usual cause is a transform applied directly to
+` +
+            `  import.meta.env.VITE_SENTRY_DSN, which defeats Vite's static replacement and
+` +
+            `  stops the no-DSN branch being eliminated. Read the env var raw on its own
+` +
+            `  line, then transform the result.`,
+        );
+      }
+
+      if (totalJs > budgetBytes) {
+        throw new Error(
+          `[artifact] JS bundle is ${totalJs} bytes, over the ${budgetBytes} byte budget ` +
+            `for mode "${opts.isTvBuild ? 'tv' : 'default'}".
+` +
+            `  This budget exists because a +90 kB regression once shipped CI-green: the
+` +
+            `  entire Sentry SDK was pulled into an artifact that could not use it.
+` +
+            `  Find what grew before raising this number.`,
+        );
+      }
+
+      console.log(`[artifact] JS ${totalJs} bytes (budget ${budgetBytes}), sentry ${opts.sentryConfigured ? 'configured' : 'absent as expected'}`);
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
   // Load env file based on `mode` in the current directory
   const env = loadEnv(mode, process.cwd(), '');
@@ -125,6 +262,29 @@ export default defineConfig(({ mode }) => {
   // module scripts are unreliable anyway. Newer TVs pick the modern build.
   const isTvBuild = mode === 'tv';
 
+  const appVersion = resolveAppVersion(mode);
+
+  // Crash reporting is DSN-gated at runtime (src/crash-reporting.ts returns early
+  // without one), so an absent DSN silently turns reportEvent into a total no-op —
+  // and every safety argument that rests on telemetry (command_dedupe_*,
+  // device_purge_incomplete, crash_loop_capped, …) becomes void with no signal.
+  //
+  // Deliberately NOT fail-closed: a DSN is a credential, and blocking a release on
+  // one we may not have would be worse than shipping without telemetry knowingly.
+  // Instead the artifact SELF-DESCRIBES (see __VIZORA_SENTRY_CONFIGURED__ in
+  // src/main.ts) and the build says so out loud.
+  const sentryConfigured = Boolean(env.VITE_SENTRY_DSN);
+  if (RELEASE_MODES.has(mode) && !sentryConfigured) {
+    console.warn(
+      `\n[sentry] WARNING: building release mode "${mode}" with NO VITE_SENTRY_DSN.\n` +
+        `  Crash reporting will be a no-op in this artifact: reportEvent() returns without\n` +
+        `  sending, so command_dedupe_*, device_purge_incomplete, crash_loop_capped and every\n` +
+        `  other safety signal this release depends on will be silently unobservable.\n` +
+        `  The bundle records this as __VIZORA_SENTRY_CONFIGURED__ = false — the publish-side\n` +
+        `  verifier reads it back out of the artifact.\n`,
+    );
+  }
+
   return {
     root: '.',
     // Packaged TV apps load index.html from file:// — asset URLs must be
@@ -132,6 +292,7 @@ export default defineConfig(({ mode }) => {
     base: isTvBuild ? './' : '/',
     plugins: isTvBuild
       ? [
+          artifactAssertions({ isTvBuild, sentryConfigured }),
           legacy({
             targets: ['chrome >= 53'],
             // Legacy-only output: <script type="module"> is blocked from a
@@ -141,10 +302,24 @@ export default defineConfig(({ mode }) => {
             renderModernChunks: false,
           }),
         ]
-      : [],
+      : [artifactAssertions({ isTvBuild, sentryConfigured })],
     test: {
       environment: 'node',
       include: ['src/**/*.spec.ts'],
+      // Raised from vitest's 5s default because delivery-ack-boundary.spec.ts drives a
+      // REAL Socket.IO server over a real loopback socket, on real time — the one suite
+      // whose duration tracks machine load rather than fake-clock advancement. At 5s it
+      // had ~2s of slack over its own 3s waitFor budget, and a slow run (23.8s vs 16.5s
+      // for its neighbour) is exactly the regime that eats 2s, which is how a loaded
+      // machine manufactures a red build out of correct code.
+      //
+      // The two budgets are a PAIR: every helper deadline in that suite must stay
+      // comfortably under this, so a failure reports what never happened instead of an
+      // anonymous "Test timed out". 30s also keeps nextConnection's 20s bound — which
+      // used to exceed the 5s test timeout and could never have reported its own
+      // message — genuinely reachable.
+      testTimeout: 30_000,
+      hookTimeout: 30_000,
     },
     build: {
       outDir: isTvBuild ? 'dist-tv' : 'dist',
@@ -175,8 +350,9 @@ export default defineConfig(({ mode }) => {
       host: true,
     },
     define: {
-      // App version from package.json (avoids hardcoding)
-      '__APP_VERSION__': JSON.stringify(process.env.npm_package_version || '1.0.0'),
+      // App version read from package.json — see resolveAppVersion() for why this is
+      // no longer process.env.npm_package_version.
+      '__APP_VERSION__': JSON.stringify(appVersion),
       // Backend origins. In release modes these come from release-origins.json and
       // the build has already failed if anything disagreed; in dev/test they are
       // env-driven. Deliberately NOT `env.X || fallback` here any more: that
@@ -199,6 +375,12 @@ export default defineConfig(({ mode }) => {
         }),
       ),
       'import.meta.env.VITE_SENTRY_DSN': JSON.stringify(env.VITE_SENTRY_DSN || ''),
+      // Whether this artifact was built with a crash-reporting DSN. Stamped as a
+      // literal so the publish-side verifier can read it back out of the built
+      // bundle (see the __VIZORA_SENTRY_CONFIGURED__ comment in src/main.ts). The
+      // DSN itself is a credential and is NOT what gets checked — only whether one
+      // was present at build time.
+      '__RELEASE_SENTRY_CONFIGURED__': JSON.stringify(sentryConfigured),
     },
   };
 });

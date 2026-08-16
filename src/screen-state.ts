@@ -21,7 +21,16 @@ export interface TransitionRecord {
 export interface ScreenGuards {
   /** PAIRING is only reachable when no device credentials exist. */
   canPair(): boolean;
-  /** PLAYING requires a validated playlist with at least one item. */
+  /**
+   * PLAYING requires SOMETHING RENDERABLE: a validated playlist with at least one
+   * item, OR an active temporary content push.
+   *
+   * The second arm is load-bearing and easy to mistake for redundancy. An emergency
+   * push arrives at a device that is HOLDING — no playlist, by definition — so a
+   * predicate that only asked about the playlist would refuse every emergency push
+   * onto exactly the devices they are sent to. Do not "simplify" this to the playlist
+   * check; the previous wording of this comment described only that half.
+   */
   canPlay(): boolean;
 }
 
@@ -78,6 +87,37 @@ export class ScreenStateMachine {
     }
     if (to === 'playing' && !this.guards.canPlay()) {
       console.warn(`[ScreenState] REFUSED ${this.current} -> playing (${reason}): no renderable playlist`);
+      return false;
+    }
+    // HOLDING was the one unguarded transition, and PAIRING is the one state it must
+    // not be able to overwrite. A stale advance() continuation resuming after a
+    // revocation has already called startPairing() fires enterHolding('no_playlist')
+    // and replaces a live pairing code with "Waiting for content…" — for up to the
+    // five minutes until the code expires and a new one is requested.
+    //
+    // The condition is "nothing to hold FOR", which is UNPAIRED — not "the screen says
+    // pairing". Keyed on the state alone this also refused a device that had just
+    // PAIRED: nothing in the poll-success path transitions the screen, so the machine
+    // is still in `pairing` when the connect handler holds for content that has not
+    // been assigned yet. That left a paired, heartbeating device showing a dead pairing
+    // code, with re-pairing refused too because canPair() had gone false — and
+    // paired-with-no-content-yet is the standard install sequence, not an edge case.
+    //
+    // canPair() is the credential test, so it separates the two exactly: after a purge
+    // both deviceToken and deviceId are null (canPair() true) and the stale-continuation
+    // refusal still fires; after a successful pair both are set before
+    // connectToRealtime() (canPair() false) and holding is reachable.
+    //
+    // "Both are set" is a property of the CLIENT path, not a guarantee of the wire:
+    // the paired response optional-chains deviceId off a separate DB lookup, so a
+    // deleted Display row yields a valid token with no id. main.ts refuses to commit
+    // that half identity precisely so this predicate stays true — the two are a pair,
+    // and weakening either one re-opens the stranded device.
+    //
+    // Both HOLDING and RECOVERING render the same div, so both doors need the guard —
+    // covering only one leaves the other able to overwrite a live pairing code.
+    if ((to === 'holding' || to === 'recovering') && this.current === 'pairing' && this.guards.canPair()) {
+      console.warn(`[ScreenState] REFUSED pairing -> ${to} (${reason}): a live pairing code owns the screen`);
       return false;
     }
 

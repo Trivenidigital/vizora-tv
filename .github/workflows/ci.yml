@@ -20,6 +20,14 @@ jobs:
         run: npx tsc --noEmit
       - name: Unit tests
         run: npx vitest run
+      # The TV build is a SHIPPING release target (Tizen/webOS) that had zero CI
+      # coverage: the artifact assertions in vite.config.ts run in writeBundle, so the
+      # TV size budget was never exercised by anything automated. Both builds run here
+      # so a bundle regression fails the PR rather than the release.
+      - name: Build (modern) — runs the artifact assertions
+        run: npm run build
+      - name: Build (TV/legacy) — runs the artifact assertions for Tizen/webOS
+        run: npm run build:tv
 
   android-unit-tests:
     name: Android JVM unit tests (testDebugUnitTest)

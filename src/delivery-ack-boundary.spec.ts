@@ -451,7 +451,7 @@ async function reportedEventNames(): Promise<unknown[]> {
  * not, and a fixed sleep tuned on an idle machine is exactly the assertion that goes
  * intermittent under load and then gets deleted.
  */
-async function waitForReportedEvent(name: string, timeoutMs = 3000): Promise<void> {
+async function waitForReportedEvent(name: string, timeoutMs = 10_000): Promise<void> {
   const { reportEvent } = await import('./crash-reporting');
   await waitFor(
     () => (reportEvent as Mock).mock.calls.some((c: unknown[]) => c[0] === name),
@@ -463,11 +463,17 @@ async function waitForReportedEvent(name: string, timeoutMs = 3000): Promise<voi
 /**
  * Wait for `predicate` to hold, polling on real time.
  *
- * The default budget is deliberately UNDER vitest's 5s per-test timeout, so a broken
+ * The default budget is deliberately UNDER the per-test timeout, so a broken
  * expectation fails with this function's own message naming what never happened
- * rather than an anonymous "Test timed out in 5000ms".
+ * rather than an anonymous "Test timed out".
+ *
+ * 10s against a 30s testTimeout (vite.config.ts), raised together from 3s/5s. This is
+ * the only suite running on REAL time against a REAL Socket.IO server, so its duration
+ * tracks machine load; the old ~2s of slack was thin enough that a slow run could fail
+ * correct code. Cost: a genuinely broken expectation now reports in 10s instead of 3s
+ * — the right trade, since a false red costs far more investigation than 7s of CI.
  */
-async function waitFor(predicate: () => boolean, timeoutMs = 3000, label = 'condition'): Promise<void> {
+async function waitFor(predicate: () => boolean, timeoutMs = 10_000, label = 'condition'): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (predicate()) return;

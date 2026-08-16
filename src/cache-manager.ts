@@ -159,8 +159,6 @@ export class AndroidCacheManager {
         data: JSON.stringify(this.manifest, null, 2),
         encoding: Encoding.UTF8,
       });
-      // Disk now agrees with memory, so a previously unpersistable purge is healed.
-      this.purgeFailed = false;
     } catch (error) {
       console.error('[AndroidCache] Failed to save manifest:', error);
       return;
@@ -169,9 +167,22 @@ export class AndroidCacheManager {
     // A clearCache() that landed while this write was in flight may already have run
     // its own saveManifest(); ours would then resolve last and put the pre-clear
     // snapshot (entries AND tenant stamp) back on disk. Rewrite from current state.
+    //
+    // The generation check comes BEFORE the latch clear, and that order is the whole
+    // point. What just landed on disk is the PRE-clear manifest — populated, stamped
+    // with the purged tenant. Clearing `purgeFailed` on the strength of that write
+    // and only then noticing the generation moved meant that if the healing rewrite
+    // below also failed, disk held the purged tenant's manifest with
+    // purgeFailed === false — so loadManifest() would NOT discard it, defeating
+    // exactly the property the latch exists to provide.
     if (gen !== this.clearGeneration) {
       await this.saveManifest();
+      return;
     }
+
+    // Disk now agrees with memory, and memory is current, so a previously
+    // unpersistable purge is genuinely healed.
+    this.purgeFailed = false;
   }
 
   private debouncedSaveManifest(): void {

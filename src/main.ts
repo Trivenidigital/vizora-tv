@@ -34,9 +34,10 @@ import {
   platformIdentifierPrefix,
 } from './platform';
 import { SecureStorage } from './secure-storage';
+import { CommandRing } from './command-ring-store';
 import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature, shouldApplyContent, parseCrashLoopMarker, CRASH_LOOP_MARKER_KEY } from './utils';
 import { ScreenStateMachine } from './screen-state';
-import { initCrashReporting, setCrashReportingDevice, reportEvent } from './crash-reporting';
+import { initCrashReporting, setCrashReportingDevice, reportEvent, isCrashReportingEnabled } from './crash-reporting';
 
 initCrashReporting();
 
@@ -73,6 +74,33 @@ declare const __RELEASE_ORIGINS_JSON__: string;
 // tree-shaken out of the release bundle the gate has to read.
 (globalThis as Record<string, unknown>).__VIZORA_RELEASE_ORIGINS__ =
   typeof __RELEASE_ORIGINS_JSON__ !== 'undefined' ? __RELEASE_ORIGINS_JSON__ : '';
+
+/**
+ * Whether this bundle was COMPILED with a crash-reporting DSN (see vite.config.ts).
+ *
+ * `VITE_SENTRY_DSN` is env-driven with a silent empty default, so a release built on
+ * a machine without one ships with reportEvent() as a total no-op — and every safety
+ * argument that rests on telemetry (command_dedupe_*, device_purge_incomplete,
+ * crash_loop_capped, secure_storage_unavailable, …) is void with nothing anywhere
+ * saying so. That is the same provenance failure release-origins.json exists to
+ * prevent, on the one field it deliberately left out of scope.
+ *
+ * The build does NOT fail closed on it — a DSN is a credential and blocking a
+ * release on one we may not have is worse than shipping without telemetry
+ * KNOWINGLY. So the artifact describes itself instead, exactly like the origins
+ * above, and the build warns loudly in release modes.
+ *
+ * Read back by:
+ *  - the publish-side gate, which unpacks the APK / TV package and greps the bundle
+ *    for `__VIZORA_SENTRY_CONFIGURED__` (terser keeps the property name; the value
+ *    minifies to `!0` / `!1`), so "does this binary report crashes" is answered from
+ *    the bytes we are about to hand customers rather than from build-machine state;
+ *  - support, off a device console.
+ */
+declare const __RELEASE_SENTRY_CONFIGURED__: boolean;
+
+(globalThis as Record<string, unknown>).__VIZORA_SENTRY_CONFIGURED__ =
+  typeof __RELEASE_SENTRY_CONFIGURED__ !== 'undefined' ? __RELEASE_SENTRY_CONFIGURED__ : false;
 
 // Configuration - can be overridden via URL params or stored preferences.
 //
@@ -254,7 +282,84 @@ class VizoraAndroidTV {
   // Delivery-ack duplicate suppression for `command` (see commandDedupeKey /
   // handleCommand). PERSISTED — the whole point is surviving a reload.
   private static readonly COMMAND_DEDUPE_PREF_KEY = 'seen_command_keys';
+  /**
+   * SECOND, SYNCHRONOUS home for the same ring, written before the Preferences copy.
+   *
+   * The Preferences write is the durable cross-webview-clear copy, but it is
+   * asynchronous and goes through the Capacitor bridge, which leaves three ways for
+   * a context-destroying command to be dispatched with NOTHING recorded: the 2s
+   * persist bound elapsing, the write REJECTING (rememberCommand resolves normally
+   * either way, so the caller cannot tell), and an unkeyable command. Any one of
+   * them leaves the requeue → replay → reload loop with no terminator at all, and
+   * nothing else bounds it — the native crash ladder counts Java uncaught
+   * exceptions, and window.location.reload() is not a crash.
+   *
+   * localStorage closes all three: it is synchronous (so it lands before reload()
+   * can tear the context down), needs no bridge (so a wedged bridge cannot stop it)
+   * and survives window.location.reload(). Both sources are unioned on load.
+   *
+   * A distinct key, not COMMAND_DEDUPE_PREF_KEY: on the TV runtimes the Preferences
+   * plugin ALSO lands in localStorage, under its own `CapacitorStorage.` prefix.
+   * Sharing the bare name would work today and collide the moment that prefix
+   * changes.
+   */
+  private static readonly COMMAND_DEDUPE_LOCAL_KEY = 'vizora_seen_command_keys';
+  /**
+   * PLATFORM CAVEAT — read this before deleting any of the three ring homes as
+   * "redundant". Hoisted here from loadSeenCommands because that is exactly where
+   * nobody looks before simplifying a write.
+   *
+   * The ring has THREE homes and they are not interchangeable:
+   *
+   *   localStorage (COMMAND_DEDUPE_LOCAL_KEY) — SYNCHRONOUS. The only one that has
+   *     certainly landed before window.location.reload() can tear the context down,
+   *     and the only one that needs no Capacitor bridge.
+   *   Preferences (COMMAND_DEDUPE_PREF_KEY) — durable across a webview storage clear
+   *     that takes localStorage with it. On ANDROID this is native SharedPreferences,
+   *     genuinely independent storage.
+   *   IndexedDB (command-ring-store.ts) — the only home independent of localStorage
+   *     on the TV runtimes.
+   *
+   * The reason the third exists: on Tizen/webOS, Capacitor falls through to web
+   * implementations, and @capacitor/preferences 6.0.4's IS window.localStorage under a
+   * `CapacitorStorage.` prefix (dist/esm/web.js, `get impl()`). So on the platforms
+   * CLAUDE.md lists as shipped, the first two homes are ONE store sharing one ~5MB
+   * budget — which SecureStorageWeb and last_playlist also draw on — and a single
+   * QuotaExceededError removes the only terminator a command replay loop has.
+   * IndexedDB has its own far larger quota and is already proven on those exact
+   * runtimes (TvCacheManager caches all content through it).
+   *
+   * Two homes looked like two chances and were not. Deleting one because the other
+   * "already covers it" re-opens that.
+   */
   private static readonly COMMAND_DEDUPE_MAX = 20;
+  /**
+   * Slots inside the ring that ORDINARY command volume can never take.
+   *
+   * The keyed branch records every command that carries a key, not just the
+   * context-destroying ones, so a plain FIFO ring let ordinary traffic evict the one
+   * record whose loss actually costs something. Constructible, not theoretical: a
+   * `reload` is dispatched and its ack is lost, the server requeues `reload@T0`, and
+   * before the reconnect delivers the replay, 20 ordinary keyed commands
+   * (`push_content`, `qr-overlay-update`, `clear_override`) arrive live and push it
+   * out. The replay then lands against a ring that no longer holds it and reloads
+   * again — with, once more, no record. Narrow window, unbounded consequence.
+   *
+   * 8 of 20: comfortably more context-destroying commands than any real operator
+   * sequence produces back to back, while still leaving 12 slots for the ordinary
+   * traffic that is the common case. Ordinary keys are only ever evicted by other
+   * ordinary keys once this reserve is in use.
+   */
+  private static readonly COMMAND_DEDUPE_CD_RESERVE = 8;
+  /**
+   * Ceiling on a dedupe key. `type` and `timestamp` both arrive from the server
+   * unvalidated and the ring is JSON-stringified into two stores, so an oversized
+   * key is a way to blow the storage quota — on the TV runtimes a
+   * QuotaExceededError takes out every subsequent write identically, which disarms
+   * the terminator above for every LATER command. Over the bound we return null,
+   * which already means "execute, don't suppress".
+   */
+  private static readonly COMMAND_DEDUPE_KEY_MAX_LEN = 128;
   /**
    * Ceiling on the ring write that gates a context-destroying dispatch. A wedged
    * Capacitor bridge leaves Preferences.set pending forever — without a bound, the
@@ -265,6 +370,28 @@ class VizoraAndroidTV {
    */
   private static readonly COMMAND_DEDUPE_PERSIST_TIMEOUT_MS = 2000;
   /**
+   * Ceiling on a Capacitor Preferences READ taken on the boot path. Same reasoning
+   * as the write bound above, applied to the reads that gate init() — see
+   * boundedPrefsGet().
+   */
+  private static readonly BRIDGE_READ_TIMEOUT_MS = 2000;
+  /**
+   * Ceiling on a whole boot. Generous on purpose: init() does not await the network
+   * (startPairing is fire-and-forget), so a healthy boot is bridge calls only and
+   * settles in well under a second even on a cold TV. This is not a latency budget,
+   * it is the difference between a device that retries and a device that is bricked
+   * on the splash screen — so it is set far above any plausible healthy boot, and a
+   * device that trips it is genuinely wedged.
+   */
+  private static readonly BOOT_TIMEOUT_MS = 20_000;
+  /**
+   * Which boot attempt is current. A timed-out init() is ABANDONED, not cancelled —
+   * a wedged bridge call can still resolve later — so its tail must not run
+   * startPairing()/connectToRealtime() on top of the attempt that replaced it, which
+   * would double-pair or open a second socket.
+   */
+  private initGeneration = 0;
+  /**
    * The commands that tear down the JS context (window.location.reload). These are
    * the only ones a replay loop can be built from — a replayed `reboot` or
    * `clear_override` costs one wasted execution, a replayed `reload` costs the
@@ -272,7 +399,65 @@ class VizoraAndroidTV {
    * the ring's chance to be read back.
    */
   private static readonly CONTEXT_DESTROYING_COMMANDS = new Set(['reload', 'restart', 'clear_cache']);
+  /**
+   * Marker separating a SYNTHETIC dedupe record from a real `type@timestamp` one.
+   *
+   * A synthetic record is keyed on the command TYPE alone plus the local time it was
+   * dispatched, because the wire gave us nothing else to key on. `~` cannot appear at
+   * the start of a server timestamp we would ever produce (they are ISO strings or
+   * epoch numbers), so the two families cannot be confused in a ring that holds both.
+   */
+  private static readonly COMMAND_UNKEYED_MARK = '@~unkeyed:';
+  /**
+   * How long a synthetic record suppresses an IDENTICAL unkeyable context-destroying
+   * command. 60s, and the two bounds it sits between are both hard:
+   *
+   *  - LOWER bound — it must outlast one replay round, or it terminates nothing. The
+   *    server's ack timeout is 10s and the requeue is delivered on the next connect;
+   *    a reload plus reconnect is the ~3-5s the observed loop period is made of. 60s
+   *    covers that with an order of magnitude to spare, including a slow TV boot.
+   *  - UPPER bound — it must not eat a DELIBERATE re-issue. An operator who watches a
+   *    reload not take and presses the button again does so in tens of seconds, but
+   *    they are the kind of user who will try twice; a window measured in minutes
+   *    would silently swallow the second press with `{ ok: true }` on the dashboard.
+   *
+   * The record only ever exists for a command that arrived with NO usable dedupe key.
+   * A keyed command is matched EXACTLY and is unaffected by this window, and a
+   * non-context-destroying command is never recorded at all — a replayed
+   * `clear_override` costs one wasted execution, a replayed `reload` costs the device.
+   *
+   * CLOCK. The only time source that survives window.location.reload() is Date.now(),
+   * so that is what is used, read once per delivery and used for both the scan and the
+   * record. It can jump: TVs boot with a bogus RTC and correct it from NTP seconds
+   * later. Both directions therefore fail towards EXECUTING, never towards
+   * suppressing — a record stamped in the future (clock moved backwards) and a record
+   * that appears ancient (clock moved forwards) are both simply not "recent", so the
+   * command runs. A suppressed reload the operator wanted is recoverable by pressing
+   * it again; a permanently suppressed one is a device that has stopped taking
+   * commands, which is not.
+   */
+  private static readonly COMMAND_UNKEYED_WINDOW_MS = 60_000;
   private seenCommandKeys: string[] = [];
+
+  /**
+   * Bumped by purgeDeviceState(). Any asynchronous path that can WRITE credentials or
+   * commit content has to revalidate it after every await, or it resurrects state on a
+   * de-paired device. Same supersede primitive as `playbackGeneration`, one level up:
+   * that one invalidates frames, this one invalidates the pairing itself.
+   */
+  private purgeGeneration = 0;
+
+  /**
+   * True when tenant_id could not be READ at boot (a per-value decrypt failure), as
+   * opposed to a legacy device that never had one. Both leave `tenantId` null, but
+   * they are not the same: a legacy null means "no binding, grace is correct", while
+   * an unverifiable null means our own tenant identity is unknown and anything we
+   * stamp with it is a downgrade. See updatePlaylist's last_playlist persist.
+   */
+  private tenantReadFailed = false;
+
+  /** Serializes applyPulledContent — see the comment there. */
+  private applyContentQueue: Promise<void> = Promise.resolve();
 
   private dpadHandler: ((event: KeyboardEvent) => void) | null = null;
 
@@ -304,18 +489,69 @@ class VizoraAndroidTV {
    * error screen (F19). Backoff 5s -> 5min cap.
    */
   private startInit() {
-    this.init().catch(err => {
-      console.error('[Vizora] Initialization error, will retry:', err);
-      this.machine.transition('recovering', 'init_failure');
-      this.setHoldingMessage('Starting up — retrying…');
-      const delay = Math.min(5000 * Math.pow(2, this.initRetryCount), 300000);
-      this.initRetryCount = Math.min(this.initRetryCount + 1, 6);
-      setTimeout(() => this.startInit(), delay);
-    });
+    // BOUNDED AT THE BOOT, not per call site. Bounding individual reads was the wrong
+    // layer: a wedged Capacitor bridge is a BRIDGE-level condition, so bounding the
+    // three config reads just moved the hang two calls later — to Network.getStatus,
+    // the five migration reads, the credential reads, the last_playlist read, the
+    // marker removal, or SplashScreen.hide(), which is literally the call that takes
+    // the splash down. None of those settle either, and a hang (unlike a throw) never
+    // reaches this catch, so the retry never fires and the device sits on the splash
+    // forever with no error and no telemetry.
+    //
+    // One race here covers every unbounded bridge call in the boot path, including
+    // ones nobody has written yet, and turns "brick" into "retry".
+    // The generation is bumped at ABANDONMENT (see the timeout handler), so a retry
+    // simply adopts whatever is current rather than claiming a new one.
+    const attempt = this.initGeneration;
+
+    void Promise.race([
+      this.init().then(() => 'settled' as const),
+      this.timeoutAfter(VizoraAndroidTV.BOOT_TIMEOUT_MS),
+    ])
+      .then((outcome) => {
+        if (outcome !== 'timeout') return;
+        // Deliberately routed through the SAME catch a thrown init takes: one recovery
+        // path, one retry ladder, one screen state. A hang and a throw are the same
+        // thing to an operator.
+        console.error(`[Vizora] init() did not settle in ${VizoraAndroidTV.BOOT_TIMEOUT_MS}ms — treating as a failed boot`);
+        reportEvent('boot_timeout', { attempt });
+        // ABANDON IT HERE, not when the replacement starts. Bumping the generation in
+        // the next startInit() left this attempt's checkpoints passing for the whole
+        // backoff window — 5s, and up to 300s at the cap — so a bridge that unwedged
+        // inside that window let a boot we had already given up on run advance() and
+        // connectToRealtime(). The moment we stop waiting for it is the moment it stops
+        // being current.
+        this.initGeneration++;
+        throw new Error('init_timeout');
+      })
+      .catch(err => {
+        console.error('[Vizora] Initialization error, will retry:', err);
+        this.machine.transition('recovering', 'init_failure');
+        this.setHoldingMessage('Starting up — retrying…');
+        const delay = Math.min(5000 * Math.pow(2, this.initRetryCount), 300000);
+        this.initRetryCount = Math.min(this.initRetryCount + 1, 6);
+        setTimeout(() => this.startInit(), delay);
+      });
+  }
+
+  /**
+   * Has this boot attempt been abandoned by the timeout? Called before every side
+   * effect in init(), because a wedged bridge can strand an attempt at ANY await, not
+   * only the ones that existed when the guard was written.
+   */
+  private bootAbandoned(bootGen: number): boolean {
+    if (bootGen === this.initGeneration) return false;
+    console.warn('[Vizora] Abandoned boot attempt resumed after its timeout — discarding it');
+    reportEvent('boot_attempt_superseded', { attempt: bootGen });
+    return true;
   }
 
   private async init() {
     console.log('[Vizora] Initializing Android TV display client...');
+    // The attempt this body belongs to — see initGeneration. Checked before the
+    // terminal side effects, so a boot that timed out and later unwedged cannot
+    // pair or connect on top of the attempt that superseded it.
+    const bootGen = this.initGeneration;
 
     // Load configuration
     await this.loadConfig();
@@ -371,6 +607,7 @@ class VizoraAndroidTV {
         // already retried keystore init); recovery is device service / re-launch.
         console.error('[Vizora] Secure storage unavailable — failing closed (F39):', err);
         reportEvent('secure_storage_unavailable', {});
+        if (this.bootAbandoned(bootGen)) return; // it owns the screen below
         await SplashScreen.hide();
         this.initRetryCount = 0;
         this.machine.transition('holding', 'secure_storage_unavailable');
@@ -382,11 +619,20 @@ class VizoraAndroidTV {
       }
       console.error('[Vizora] SecureStorage credential read failing persistently — routing to pairing (F37):', err);
       reportEvent('secure_storage_read_failed', { retries: this.initRetryCount });
+      if (this.bootAbandoned(bootGen)) return; // startPairing() is a side effect too
       await SplashScreen.hide();
       this.initRetryCount = 0;
       this.startPairing();
       return;
     }
+
+    // CHECKPOINT. Re-checked before every side effect below, not once: "everything
+    // above this line is reads" was true and beside the point, because BELOW it are
+    // two more unbounded bridge awaits, a DESTRUCTIVE purge (last_playlist removal +
+    // clearCache), then advance(), connectToRealtime() and SplashScreen.hide(). An
+    // attempt that cleared one checkpoint quickly and then hung was unguarded for the
+    // rest of its life — which is exactly the shape the timeout exists for.
+    if (this.bootAbandoned(bootGen)) return;
 
     this.deviceToken = storedToken.value;
     this.deviceId = storedDeviceId.value;
@@ -403,16 +649,17 @@ class VizoraAndroidTV {
       // a READ FAILURE means our tenant is unverifiable, so a tenant-bound cache
       // must fail closed (F4) — distinct from a legacy device that never had a
       // tenant, where rendering is correct grace.
-      let tenantReadFailed = false;
       try {
         const storedTenant = await SecureStorage.get({ key: 'tenant_id' });
         this.tenantId = storedTenant.value;
+        this.tenantReadFailed = false;
       } catch (err) {
         console.warn('[Vizora] tenant_id read failed — booting in grace mode (F42):', err);
         reportEvent('tenant_read_failed', {});
         this.tenantId = null;
-        tenantReadFailed = true;
+        this.tenantReadFailed = true;
       }
+      const tenantReadFailed = this.tenantReadFailed;
       this.cacheManager.setExpectedTenant(this.tenantId);
 
       // Restore last playlist for offline resilience — tenant-bound (F4):
@@ -428,6 +675,9 @@ class VizoraAndroidTV {
           if (envelope.tenantId && this.tenantId && envelope.tenantId !== this.tenantId) {
             console.warn('[Vizora] Cached playlist belongs to a different tenant — purging (F4)');
             reportEvent('tenant_mismatch_purge', { cachedTenant: envelope.tenantId });
+            // The one IRREVERSIBLE step in init(). An abandoned attempt must not wipe
+            // the cache and last_playlist out from under the attempt that replaced it.
+            if (this.bootAbandoned(bootGen)) return;
             // Independent removals, same treatment as purgeDeviceState. As a
             // sequential await chain a failing Preferences.remove skipped the cache
             // clear entirely, and either failure landed in the outer catch below —
@@ -464,11 +714,27 @@ class VizoraAndroidTV {
         console.warn('[Vizora] Failed to restore last playlist:', err);
       }
 
+      // Re-enter suspension BEFORE any playback decision. The latch is durable
+      // precisely so a power cycle cannot be used to resume a suspended tenant's
+      // content: last_playlist is still on disk and would otherwise render straight
+      // away. Only a 200 from auth/check clears it — on connect (see the `connect`
+      // handler) or via the probe loop — so this is a hold, not a dead end.
+      // NO DURABLE SUSPENSION LATCH IS READ HERE, DELIBERATELY. See
+      // enterTenantSuspended for the full account: three attempts at making the client
+      // decide entitlement from local state all produced defects at least as bad as the
+      // gap they closed, and the durable fix is server-side.
+
       // Start playback immediately from the restored playlist (don't wait for
       // the WebSocket — BUG #7). The loading screen stays up until the first
       // frame commits; the machine enters PLAYING at commit time, so there is
       // no window where the content screen shows an empty container.
-      if (this.currentPlaylist && this.currentPlaylist.items?.length > 0) {
+      //
+      // Re-checked because the reads above are bridge calls that can each strand an
+      // attempt for the whole backoff window.
+      if (this.bootAbandoned(bootGen)) return;
+      if (this.tenantSuspended) {
+        // enterTenantSuspended already owns the screen (branded holding + message).
+      } else if (this.currentPlaylist && this.currentPlaylist.items?.length > 0) {
         void this.advance();
       } else {
         this.machine.transition('holding', 'boot_no_cached_playlist');
@@ -478,6 +744,7 @@ class VizoraAndroidTV {
       this.connectToRealtime();
     } else {
       console.log('[Vizora] No credentials found, starting pairing flow...');
+      if (this.bootAbandoned(bootGen)) return;
       this.startPairing();
     }
 
@@ -499,13 +766,33 @@ class VizoraAndroidTV {
     if (dashboardUrl) this.config.dashboardUrl = dashboardUrl;
 
     // Try to load from stored preferences
-    const storedApiUrl = await Preferences.get({ key: 'config_api_url' });
-    const storedRealtimeUrl = await Preferences.get({ key: 'config_realtime_url' });
-    const storedDashboardUrl = await Preferences.get({ key: 'config_dashboard_url' });
+    // BOUNDED and CAUGHT — this is the FIRST storage touch of the whole boot, which
+    // makes it the one place a bound was missing most. Two brick shapes, one cause:
+    //
+    //  - A WEDGED bridge leaves Preferences.get pending forever. init() then never
+    //    settles, so it never rejects, so startInit()'s retry never fires: the splash
+    //    screen stays up permanently with no error and no telemetry. Every other
+    //    bounded read in init() is downstream of this one, so none of them ever ran.
+    //  - A THROWING store rejects out of init() into startInit()'s catch, which lands
+    //    the device in `recovering` ("Starting up — retrying…") on every attempt,
+    //    forever. Live on the TV runtimes specifically: Preferences there IS
+    //    localStorage, so one storage fault takes out every read identically.
+    //
+    // This is the F37 brick shape the wave already closed for SecureStorage one call
+    // later. Stored config is an OVERRIDE of a compiled-in default, so continuing
+    // without it is always safe — the device boots against its build-time origins.
+    const stored = await Promise.all([
+      this.boundedPrefsGet('config_api_url').catch(() => 'timeout' as const),
+      this.boundedPrefsGet('config_realtime_url').catch(() => 'timeout' as const),
+      this.boundedPrefsGet('config_dashboard_url').catch(() => 'timeout' as const),
+    ]);
+    const [storedApiUrl, storedRealtimeUrl, storedDashboardUrl] = stored.map(
+      r => (r === 'timeout' ? null : r.value),
+    );
 
-    if (storedApiUrl.value && !apiUrl) this.config.apiUrl = storedApiUrl.value;
-    if (storedRealtimeUrl.value && !realtimeUrl) this.config.realtimeUrl = storedRealtimeUrl.value;
-    if (storedDashboardUrl.value && !dashboardUrl) this.config.dashboardUrl = storedDashboardUrl.value;
+    if (storedApiUrl && !apiUrl) this.config.apiUrl = storedApiUrl;
+    if (storedRealtimeUrl && !realtimeUrl) this.config.realtimeUrl = storedRealtimeUrl;
+    if (storedDashboardUrl && !dashboardUrl) this.config.dashboardUrl = storedDashboardUrl;
 
     console.log('[Vizora] Config loaded:', this.config);
   }
@@ -571,6 +858,50 @@ class VizoraAndroidTV {
   /** Coarse registrable-domain heuristic: the last two dot-labels, lowercased. */
   private static registrableDomain(hostname: string): string {
     return hostname.toLowerCase().split('.').slice(-2).join('.');
+  }
+
+  /**
+   * `window.localStorage`, or null where it is absent or throws.
+   *
+   * Every access is guarded, not just the first: reading the PROPERTY throws on some
+   * engines (disabled storage, privacy modes), and a store that hands out a handle
+   * can still throw from getItem/setItem. This is the durable copy of the
+   * command-replay terminator, so it must never be able to take a boot down with it.
+   */
+  private static localStore(): Storage | null {
+    try {
+      const store = (window as unknown as { localStorage?: Storage }).localStorage;
+      return store ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Bound a Capacitor Preferences READ in wall-clock time.
+   *
+   * The dedupe-ring WRITE is bounded because a wedged bridge would otherwise swallow
+   * the operator's command. The boot READS need the same treatment for a worse
+   * reason: they run inside init(), before credentials, so a bridge that never
+   * settles means init() never settles — which means it never REJECTS, which means
+   * the startInit() retry loop never fires and the device sits on the splash screen
+   * indefinitely with no error and no telemetry.
+   *
+   * Returns 'timeout' rather than throwing; every caller treats a missing value as
+   * "carry on without it", which is what they already do for an absent key.
+   */
+  private async boundedPrefsGet(key: string): Promise<{ value: string | null } | 'timeout'> {
+    const result = await Promise.race([
+      Preferences.get({ key }),
+      this.timeoutAfter(VizoraAndroidTV.BRIDGE_READ_TIMEOUT_MS),
+    ]);
+    if (result === 'timeout') {
+      console.warn(
+        `[Vizora] Preferences.get(${key}) did not settle in ${VizoraAndroidTV.BRIDGE_READ_TIMEOUT_MS}ms — continuing without it`,
+      );
+      reportEvent('preferences_read_timeout', { key });
+    }
+    return result;
   }
 
   private async setupCapacitor() {
@@ -723,21 +1054,58 @@ class VizoraAndroidTV {
    */
   private async reportCrashLoopMarker() {
     try {
-      const stored = await Preferences.get({ key: CRASH_LOOP_MARKER_KEY });
+      const stored = await this.boundedPrefsGet(CRASH_LOOP_MARKER_KEY);
+      if (stored === 'timeout') return;
       const marker = parseCrashLoopMarker(stored.value);
       if (!marker) {
         return;
       }
-      console.warn('[Vizora] Recovered from a native crash loop — device had degraded to the '
-        + 'slow restart rung:', stored.value);
+      console.warn(
+        `[Vizora] Recovered from a native crash loop — ${VizoraAndroidTV.crashLoopDegradation(marker.reason)}:`,
+        stored.value,
+      );
       reportEvent('crash_loop_capped', {
         at: marker.at,
         crashes: marker.crashes,
         reason: marker.reason,
       });
+      // Removed ONLY once it has actually been reported somewhere. reportEvent is a
+      // total no-op in a build with no VITE_SENTRY_DSN, and this is a once-ever
+      // breadcrumb: deleting it on the strength of a call that sent nothing destroys
+      // the only record that the device crash-looped. Keeping it costs one repeated
+      // console line per boot; the build-time warning and __VIZORA_SENTRY_CONFIGURED__
+      // are what make the underlying "no telemetry" state visible.
+      if (!isCrashReportingEnabled()) {
+        console.warn('[Vizora] Keeping the crash-loop marker — crash reporting is disabled, so nothing was reported');
+        return;
+      }
       await Preferences.remove({ key: CRASH_LOOP_MARKER_KEY });
     } catch (err) {
       console.warn('[Vizora] Failed to read/clear the crash-loop marker:', err);
+    }
+  }
+
+  /**
+   * How the native side degraded this device, phrased to match the reason it wrote.
+   *
+   * The restart ladder is only ONE of the things the native handler caps. A
+   * `renderer_recovery_storm` means the WebView renderer kept dying and kept being
+   * recovered — no restart delay changed and the device never dropped to the slow
+   * rung — so describing every marker as "degraded to the slow restart rung" tells
+   * an operator something that did not happen.
+   */
+  private static crashLoopDegradation(reason: string | null): string {
+    switch (reason) {
+      case 'renderer_recovery_storm':
+      // The native handler writes `renderer_loop` for the same condition under a
+      // different code path; without its own case it fell to the generic default and
+      // an operator was told 'the native handler capped it' with no idea what broke.
+      case 'renderer_loop':
+        return 'the WebView renderer was dying and being recovered repeatedly';
+      case 'uncaught_exception':
+        return 'the device had degraded to the slow restart rung';
+      default:
+        return `the native handler capped it (reason: ${reason ?? 'unrecorded'})`;
     }
   }
 
@@ -905,17 +1273,32 @@ class VizoraAndroidTV {
       this.displayPairingCode(data.code);
       this.startPairingCountdown();
 
-      // Generate/display QR code
+      // Start polling for pairing completion BEFORE the QR render, and never after it.
+      //
+      // The QR is COSMETIC — an operator can always type the code that is already on
+      // the glass — while the poll is the only functional path off this screen. Ordered
+      // the other way, the functional path sat downstream of the decorative one behind
+      // `await this.generateQRCode()`, which awaits a dynamic import('qrcode'). A
+      // REJECTING import is handled (generateQRCode catches and renders a text
+      // fallback), but an import that never SETTLES never returns, so the poll was
+      // never armed at all. That is unrecoverable rather than merely degraded: the only
+      // thing that replaces an expired code is the poll's own 404 branch, so the device
+      // sits on a pairing screen showing a dead code until someone visits it.
+      //
+      // A timeout bound on the render would only shorten that stall; it leaves the
+      // dependency in place. Ordering removes it. Safe in both directions: `pairingCode`
+      // is assigned above, so the callback's `!this.pairingCode` guard cannot fire, and
+      // startPairingCheck() clears any existing interval first, so arming earlier cannot
+      // double-arm on a re-request.
+      this.startPairingCheck();
+      this.updateStatus('connecting', 'Waiting for pairing...');
+
+      // Generate/display QR code — decorative, and deliberately last.
       if (data.qrCode) {
         this.displayQRCode(data.qrCode);
       } else {
         await this.generateQRCode(data.code);
       }
-
-      // Start polling for pairing completion
-      this.startPairingCheck();
-
-      this.updateStatus('connecting', 'Waiting for pairing...');
     } catch (error) {
       console.error('[Vizora] Pairing request failed:', error);
       // Stay on the pairing screen — status line reports the retry.
@@ -1068,15 +1451,67 @@ class VizoraAndroidTV {
           // downgrading cross-tenant cache isolation.
           this.pairingCommitInFlight = true;
           try {
+            // A HALF IDENTITY IS A FAILED PAIR, not a pair. Verified at deployed
+            // d323434e (middleware pairing.service.ts:503-511): the paired response
+            // returns `deviceToken: request.plaintextToken` from Redis, but
+            // `deviceId: display?.id` and `tenantId: display?.organizationId` from a
+            // SEPARATE DB lookup — optional-chained. Delete or re-create the Display
+            // row between completePairing and the device's next poll (an ordinary
+            // admin action during an install) and the wire says `paired`, hands over a
+            // VALID TOKEN, and omits the ids.
+            //
+            // Committing that is the stranded-device bug again, by a different door:
+            // canPair() requires token AND deviceId, so an empty id leaves it true and
+            // the holding refusal fires on a device that is, as far as the server is
+            // concerned, paired. `deviceId || ''` wrote exactly that empty string.
+            //
+            // Note the fallback above is legitimate and is kept: the pairing REQUEST
+            // response also carries a deviceId, so `this.deviceId` may already hold it.
+            // What is refused is having NEITHER.
+            if (!deviceId) {
+              throw new Error('paired response carried no deviceId');
+            }
             await SecureStorage.set({ key: 'device_token', value: data.deviceToken });
-            await SecureStorage.set({ key: 'device_id', value: deviceId || '' });
+            await SecureStorage.set({ key: 'device_id', value: deviceId });
             if (tenantId) {
               await SecureStorage.set({ key: 'tenant_id', value: tenantId });
+            } else {
+              // NOT fatal, deliberately — but NOT for the reason first written here.
+              //
+              // RETRACTION. The original justification was "the legacy backend genuinely
+              // never sends tenantId, so refusing would make this client unpairable
+              // against it forever." That is FALSE for the deployed backend and I should
+              // not have asserted it: I lifted "absent on the legacy backend" from the
+              // comment a few lines up and treated it as a fact about production.
+              // Verified at d323434e — pairing.service.ts:511 returns
+              // `tenantId: display?.organizationId` on every paired response, and the
+              // comment above it states the Device Revocation Contract v1.1 requires the
+              // device to bind cache and playlist to it. There is one production backend
+              // and it always sends this field.
+              //
+              // The real reason to tolerate absence is blast radius, not compatibility:
+              // the field is emitted as `display?.organizationId`, so a degenerate
+              // response where `display` is null yields `tenantId: undefined` while still
+              // reporting `status: 'paired'`. Making that fatal would convert a
+              // BACKEND-side defect into a fleet-wide pairing outage — no client-side
+              // strictness should own that. Absence is tolerated; MISMATCH is still
+              // refused at load time, so the isolation property is untouched.
+              //
+              // Which makes this signal an ANOMALY, not a benign legacy path: production
+              // always sends it, so seeing this means something is wrong server-side.
+              console.error('[Vizora] Paired WITHOUT a tenantId — the backend omitted it; this is a server-side defect, not a legacy path');
+              reportEvent('pairing_backend_omitted_tenant', { hasDeviceId: true });
             }
           } catch (error) {
             // Fail RECOVERABLE: nothing is committed and the poller is untouched, so
-            // the very next poll retries this same still-valid code, and if it does
-            // expire the 404 branch requests a fresh one. The device stays pairable.
+            // the device stays pairable.
+            //
+            // NOT by retrying the same code, which an earlier version of this comment
+            // claimed. Against deployed d323434e the paired response is ONE-SHOT:
+            // checkPairingStatus deletes the pairing request before returning `paired`,
+            // so the next poll 404s and startPairing() mints a fresh code. That is the
+            // better recovery of the two — a code whose commit just failed is not one
+            // to keep trying — but it is not what was written here.
             console.error('[Vizora] Failed to persist pairing credentials — will retry on the next poll:', error);
             reportEvent('pairing_persist_failed', {});
             return;
@@ -1094,6 +1529,9 @@ class VizoraAndroidTV {
           if (tenantId) {
             this.tenantId = tenantId;
           }
+          // A fresh pairing establishes tenant identity from the wire, so whatever
+          // the boot-time keystore read did is no longer what we know.
+          this.tenantReadFailed = false;
           this.cacheManager.setExpectedTenant(this.tenantId);
           setCrashReportingDevice(this.deviceId);
 
@@ -1254,12 +1692,32 @@ class VizoraAndroidTV {
     }
     if (token === this.deviceToken) return; // idempotent re-delivery
 
+    // Snapshot BEFORE the keystore write — see the re-check below.
+    const gen = this.purgeGeneration;
+
     try {
       await SecureStorage.set({ key: 'device_token', value: token });
     } catch (error) {
       // Keep the old token: it is still valid for now, and re-issue is retried on
       // the next connect. Adopting a token we failed to persist would lose it.
       console.error('[Vizora] Failed to persist rotated device token — keeping current credential:', error);
+      return;
+    }
+
+    // A purge that landed during that write has already run its own
+    // SecureStorage.remove, so OUR write is the one left on disk: the de-paired
+    // device would come back up holding a live credential. In memory it is worse —
+    // the assignment below resurrects `deviceToken` on a device sitting on the
+    // pairing screen, and the network / appState listeners then call
+    // connectToRealtime() with it. Same supersede primitive purgeDeviceState uses
+    // for playback; this one guards the pairing itself.
+    if (gen !== this.purgeGeneration) {
+      console.warn('[Vizora] Device was purged during a token rotation — discarding the rotated token');
+      reportEvent('token_refresh_discarded_after_purge', {});
+      await SecureStorage.remove({ key: 'device_token' }).catch((err) => {
+        console.error('[Vizora] Could not remove a token written across a purge:', err);
+        reportEvent('token_refresh_purge_cleanup_failed', {});
+      });
       return;
     }
 
@@ -1282,6 +1740,10 @@ class VizoraAndroidTV {
 
   private async pullContent(): Promise<void> {
     if (!this.deviceToken || !this.isOnline) return;
+    // The pairing this content is being fetched FOR. A de-pair cannot reach into an
+    // in-flight request (the bound is 20s), so without this the response of the OLD
+    // pairing lands on a purged device and is applied as if it were current.
+    const gen = this.purgeGeneration;
     try {
       const response: HttpResponse = await VizoraAndroidTV.httpWithTimeout(
         CapacitorHttp.get({
@@ -1299,7 +1761,7 @@ class VizoraAndroidTV {
       }
       const body = response.data;
       const payload = body?.data ?? body; // unwrap { success, data } envelope
-      await this.applyPulledContent(payload);
+      await this.applyPulledContent(payload, gen);
     } catch (error) {
       // Fail safe: a reconcile/pull failure NEVER blanks the screen — keep last-known-good.
       console.warn('[Vizora] pullContent failed — keeping last-known-good:', error);
@@ -1313,10 +1775,46 @@ class VizoraAndroidTV {
    * the CLIENT so the whole coherence model is closed end-to-end). A different playlist
    * (schedule boundary / reassignment) or a newer version applies.
    */
-  private async applyPulledContent(
+  private applyPulledContent(
     payload: { version?: string; playlist?: Playlist | null } | null | undefined,
+    gen: number,
+  ): Promise<void> {
+    // SERIALIZED. There are four entry points into this one critical section —
+    // pull-on-connect, the heartbeat reconcile pull, a versioned playlist:update and
+    // the T2 pull itself — and overlap is guaranteed by construction rather than
+    // merely possible: pullContent's bound is 20s while the heartbeat cadence is 15s,
+    // so two pulls can be in flight before the first can time out. Interleaved, the
+    // read of `current`, the await inside updatePlaylist and the version commit are
+    // three separate steps on shared state, and the LAST commit to land wins — which
+    // is not the newest version. The device then reports a version it is not
+    // rendering, the server sees agreement and the reconcile self-heal never fires.
+    //
+    // `gen` is the purge generation of the pairing this payload BELONGS TO, and every
+    // caller captures it where the payload was asked for or delivered — NOT here and
+    // not inside the critical section, both of which run arbitrarily late. A de-pair
+    // cannot reach into an in-flight pull (a 20s bound) or empty a queue that already
+    // holds a push, so a payload of the OLD pairing can enter this section entirely
+    // after the purge; a generation read at that point agrees with itself and commits
+    // the purged tenant's content onto a device sitting on the pairing screen — which
+    // pairing -> playing does NOT refuse, because canPlay() only asks whether a
+    // playlist has items.
+    const next = this.applyContentQueue.then(() => this.applyContentExclusive(payload, gen));
+    // The queue must never hold a rejection, or every later apply short-circuits.
+    this.applyContentQueue = next.catch(() => {});
+    return next;
+  }
+
+  private async applyContentExclusive(
+    payload: { version?: string; playlist?: Playlist | null } | null | undefined,
+    gen: number,
   ): Promise<void> {
     if (!payload) return;
+    if (gen !== this.purgeGeneration) {
+      // De-paired between this payload arriving and the queue reaching it.
+      console.warn('[Vizora] Content arrived for a pairing that has been purged — discarding it');
+      reportEvent('content_discarded_after_purge', { playlistId: payload.playlist?.id ?? null });
+      return;
+    }
     const incoming = { playlistId: payload.playlist?.id ?? null, version: payload.version ?? '' };
     const current = { playlistId: this.currentContentPlaylistId, version: this.currentContentVersion };
     if (!shouldApplyContent(incoming, current)) return; // stale/duplicate → no-op, no re-flash
@@ -1333,6 +1831,30 @@ class VizoraAndroidTV {
         // version, so the next reconcile still sees the drift and re-delivers.
         console.warn('[Vizora] Failed to apply content — keeping last-known-good:', error);
         reportEvent('content_apply_failed', { playlistId: incoming.playlistId });
+        return;
+      }
+
+      // updatePlaylist awaits a Preferences write, so the world can have moved on.
+      // Re-validate before committing — the version is what the server reconciles
+      // against, and a wrong one here is silent, permanent drift.
+      if (gen !== this.purgeGeneration) {
+        // De-paired mid-apply. purgeDeviceState reset these coordinates on purpose
+        // (a re-pair to the same playlist yields the identical version); writing
+        // them back would re-create the hold-forever state it just cleared.
+        console.warn('[Vizora] Device was purged while applying content — not committing the version');
+        return;
+      }
+      // DEFENCE IN DEPTH, and deliberately not independently testable: while the
+      // queue above holds, this is the only writer of these two fields apart from
+      // purgeDeviceState (guarded just above), so nothing can currently make it fire
+      // — a mutation that removes it does not turn any test red. It is kept because
+      // it is the check that stays correct if a future caller ever reaches
+      // applyContentExclusive without going through the queue; rolling the version
+      // back to ours would make the device under-report and re-apply stale content.
+      if (!shouldApplyContent(incoming, {
+        playlistId: this.currentContentPlaylistId,
+        version: this.currentContentVersion,
+      })) {
         return;
       }
     }
@@ -1444,11 +1966,21 @@ class VizoraAndroidTV {
       // push remains the low-latency fast-path. Fails safe — keeps last-known-good.
       void this.pullContent();
 
-      // A successful handshake means the tenant is active — clear any stale
-      // suspension latch so playback can resume (F41). The block below owns the
-      // actual resume; do not double-render here.
+      // A successful handshake does NOT mean the tenant is active. Verified against
+      // the deployed gateway (d323434e): its handshake checks token revocation,
+      // device existence, org match, isDisabled and token currency — there is no
+      // tenant-suspension check anywhere in it; the only suspension code there is the
+      // outbound `tenant:suspended` emitter. TENANT_SUSPENDED comes solely from the
+      // REST auth/check. So clearing the latch here fails OPEN on every reconnect,
+      // and a 24/7 screen reconnects: a suspended tenant's content silently resumes,
+      // permanently, with no probe loop left running to catch it.
+      //
+      // Re-check instead, and clear only on a 200. The probe stays scheduled while
+      // the answer is anything else, so the device can still LEAVE suspension the
+      // moment the tenant is genuinely resumed (that, and the `tenant:resumed`
+      // event, are the two exits — neither is removed here).
       if (this.tenantSuspended) {
-        this.exitTenantSuspended('reconnect_active');
+        void this.revalidateTenantSuspension('reconnect');
       }
 
       // An active temporary push owns the screen — a reconnect must never cut it
@@ -1551,7 +2083,9 @@ class VizoraAndroidTV {
       // re-apply (no re-flash). A legacy push without a version falls back to
       // updatePlaylist, whose signature no-op still absorbs an identical re-send (PD-1).
       if (typeof data?.version === 'string' && data.version) {
-        void this.applyPulledContent({ version: data.version, playlist });
+        // The generation at DELIVERY: this handler runs synchronously on the socket
+        // event, but the queue can hold the payload across a de-pair before it applies.
+        void this.applyPulledContent({ version: data.version, playlist }, this.purgeGeneration);
       } else {
         // Same failure handling as the versioned path above (which gets it via
         // applyPulledContent's try). validatePlaylist only checks that `items` is an
@@ -1578,7 +2112,9 @@ class VizoraAndroidTV {
       // touching either half. Duplicate suppression lives inside handleCommand,
       // AFTER this line, so a suppressed replay is still acked — otherwise the
       // server just requeues the thing we deliberately ignored.
-      VizoraAndroidTV.ackDelivery(ack);
+      // The status rides along with the SAME positive ack, computed from the type
+      // alone so it costs nothing and cannot delay the frame — see commandAckStatus.
+      VizoraAndroidTV.ackDelivery(ack, VizoraAndroidTV.commandAckStatus(command));
       console.log('[Vizora] Received command:', command);
       void this.handleCommand(command).catch((error) => {
         // The receipt is already sent and stays sent: it reports delivery, not
@@ -1732,6 +2268,7 @@ class VizoraAndroidTV {
       if (status === 404) {
         // Legacy backend — the endpoint teaches us nothing; stop probing and
         // let the socket reconnection loop carry recovery.
+        //
         console.log('[Vizora] Auth-check endpoint absent (legacy backend) — probe loop stopped');
         return;
       }
@@ -1774,17 +2311,82 @@ class VizoraAndroidTV {
     this.hideAuthDegradedBadge();
   }
 
-  /** Tenant suspension: fail closed for rendering, keep credentials (§3.1). */
+  /**
+   * Re-check a live suspension against the ONLY endpoint that knows about it.
+   *
+   * The realtime handshake does not verify tenant suspension (see the `connect`
+   * handler), so a successful reconnect is not evidence of anything. `auth/check` is,
+   * and only a 200 clears the latch. Anything else — 403, an error, an unreachable
+   * endpoint — leaves the device held and (re)starts the probe loop, so the device
+   * can still leave suspension without another reconnect when the tenant is resumed.
+   */
+  private async revalidateTenantSuspension(source: string): Promise<void> {
+    const status = await this.runAuthCheck();
+
+    if (status === 200) {
+      this.exitTenantSuspended(`${source}_auth_check_200`);
+      // This path owns the resume, the same way the tenant:resumed handler does —
+      // the `connect` handler's playback block already ran (and held) before this
+      // async probe settled.
+      if (!this.temporaryContent) {
+        if (this.currentPlaylist?.items?.length) {
+          this.ensurePlaying();
+        } else {
+          this.enterHolding('paired_no_playlist');
+        }
+      }
+      return;
+    }
+
+    console.warn(`[Vizora] Tenant still suspended after ${source} (auth-check=${status}) — staying held`);
+    reportEvent('tenant_suspension_confirmed', { source, authCheckStatus: status });
+    // Keep the disambiguation loop alive so a later resume is noticed even if no
+    // further reconnect ever happens. Idempotent — it no-ops if already scheduled.
+    this.scheduleAuthProbe();
+  }
+
+  /**
+   * Tenant suspension: fail closed for rendering, keep credentials (§3.1).
+   *
+   * IN-MEMORY ONLY, AND DELIBERATELY SO. A power cycle clears this, so a suspended
+   * tenant's cached content can come back on screen after a reboot. That is a REAL
+   * GAP, it is the behaviour that shipped in 1.3.15, and it is recorded as a known
+   * gap rather than fixed here — because three attempts to fix it client-side each
+   * produced a defect at least as bad as the gap:
+   *
+   *  1. DURABLE LATCH, cleared on any reconnect. Fail-open: a 24/7 screen reconnects,
+   *     so a suspended tenant resumed silently and permanently.
+   *  2. DURABLE LATCH, fail-CLOSED on an unreadable read. Stranded HEALTHY devices on
+   *     "Display paused — contact your administrator", permanently, triggered by a 2s
+   *     storage timeout. The trigger population was strictly larger than the one it
+   *     fixed: the old failure needed the tenant genuinely suspended AND the latch
+   *     unreadable; this needed the latch unreadable AND any of three everyday states
+   *     (expired token, legacy backend, site outage).
+   *  3. PROVISIONAL hold, released by any non-403. Worst of the three: the release ran
+   *     through exitTenantSuspended, which REMOVES the durable key — so a hold entered
+   *     precisely because the latch could not be READ went on to DELETE it. On a
+   *     genuinely suspended tenant with an expired token (auth/check returns 401
+   *     before it reaches the suspension check, and most of the fleet is past the
+   *     90-day expiry) two probes released the hold and erased the latch, leaving
+   *     every later boot with no latch, no hold, and no way to re-latch.
+   *
+   * The common structural fact, and the reason there is no version 4: the client
+   * cannot determine entitlement from local state it may be unable to read, when the
+   * only authority that could confirm it answers 401 for most of the fleet. Each
+   * attempt only chose which direction to fail in. THE DURABLE FIX IS A SUSPENSION
+   * CHECK IN THE GATEWAY HANDSHAKE — the deployed gateway has none, and entitlement
+   * belongs where it can be answered authoritatively. Do not re-add a local latch
+   * without that; the failure is not in this file.
+   */
   private enterTenantSuspended(source: string) {
     console.warn('[Vizora] Tenant suspended:', source);
     reportEvent('tenant_suspended', { source });
     this.tenantSuspended = true;
     // Invalidate any prepare() already in flight. advance() checks the suspend gate
-    // once at entry (:1696) and its ONLY post-await check is the playback generation
-    // (:1715), so without this a frame prepared BEFORE this signal commits on top of
-    // the holding screen we are about to enter — and the transition out of holding
-    // then cancels the 30s self-heal retry (:236-239). Same supersede primitive
-    // purgeDeviceState() already uses for the same reason (:1537).
+    // once at entry and its ONLY post-await check is the playback generation, so
+    // without this a frame prepared BEFORE this signal commits on top of the holding
+    // screen we are about to enter — and the transition out of holding then cancels
+    // the 30s self-heal retry. Same supersede primitive purgeDeviceState() uses.
     this.playbackGeneration++;
     this.enterHolding('tenant_suspended');
     this.setHoldingMessage('Display paused — contact your administrator');
@@ -1811,8 +2413,10 @@ class VizoraAndroidTV {
     console.warn('[Vizora] Purging device state:', reason);
     reportEvent('device_purged', { reason });
 
-    // Halt playback first: no further frame of this tenant's content renders.
+    // Halt playback first: no further frame of this tenant's content renders, and
+    // invalidate every in-flight credential/content write (see purgeGeneration).
     this.playbackGeneration++;
+    this.purgeGeneration++;
     if (this.playbackTimer) {
       clearTimeout(this.playbackTimer);
       this.playbackTimer = null;
@@ -1822,8 +2426,19 @@ class VizoraAndroidTV {
       this.temporaryContentTimer = null;
     }
     this.exitAuthDegraded();
+    this.exitTenantSuspended('device_purged'); // clears the durable latch too
     this.tenantSuspended = false;
+    this.tenantReadFailed = false;
     this.currentPlaylist = null;
+    // The content coordinates MUST be reset with the playlist. The server derives
+    // `version` from content updatedAt stamps, so it is byte-identical across
+    // unpair → re-pair to the same playlist: leaving these set meant the re-pair's
+    // pullContent hit shouldApplyContent({P,V},{P,V}) === false, no-op'd, and left
+    // currentPlaylist null — the device holds FOREVER while its heartbeat reports a
+    // contentVersion that matches the server's truth, so the reconcile self-heal
+    // never fires either.
+    this.currentContentVersion = '';
+    this.currentContentPlaylistId = null;
     this.savedPlaylistState = null;
     this.temporaryContent = null;
     this.deviceToken = null;
@@ -1833,6 +2448,7 @@ class VizoraAndroidTV {
     // de-pair in memory as well as on disk, and rememberCommand would write the old
     // tenant's keys straight back out on the next command after re-pairing.
     this.seenCommandKeys = [];
+    this.writeLocalRing(); // and its synchronous durable copy
     // Unbind the cache too. Nulling only `this.tenantId` left the cache manager still
     // expecting the purged tenant, so its tenant-mismatch purge could not fire for
     // whatever is paired next.
@@ -1862,6 +2478,18 @@ class VizoraAndroidTV {
       // (type, timestamp) key happens to collide, and it leaves the revoked tenant's
       // command history readable on the device.
       Preferences.remove({ key: VizoraAndroidTV.COMMAND_DEDUPE_PREF_KEY }),
+      // …and the THIRD home. Without this the purge cleared memory, localStorage and
+      // Preferences while IndexedDB kept the revoked tenant's ring: a reboot before the
+      // next command has loadSeenCommands union it straight back into memory AND back
+      // out to localStorage, re-creating the leak this purge exists to close. It goes
+      // in the allSettled with the rest so an IDB failure is counted by the same
+      // device_purge_incomplete accounting (CommandRing.write rejects on failure).
+      CommandRing.write([]),
+      // Device-lifecycle state that was surviving a purge which claims to be
+      // complete: the crash-loop breadcrumb describes an episode on the PREVIOUS
+      // pairing, and the suspension latch would re-enter holding on whatever tenant
+      // is paired next.
+      Preferences.remove({ key: CRASH_LOOP_MARKER_KEY }),
       this.cacheManager.clearCache(),
     ]);
 
@@ -1913,6 +2541,12 @@ class VizoraAndroidTV {
   }
 
   private async updatePlaylist(playlist: Playlist) {
+    // Snapshot BEFORE the persist await below — see the re-check after it. Same
+    // supersede primitive handleTokenRefresh uses for a credential; this one is for
+    // the CONTENT commit, which was the half applyContentExclusive's guard did not
+    // cover (it guards the version only).
+    const gen = this.purgeGeneration;
+
     // PD-1 idempotency: a redundant delivery of the playlist ALREADY playing must
     // be a no-op — no rotation restart, no re-render flash, no duplicate
     // content:impression. The Finding-2 backend fix deliberately re-sends the
@@ -1940,18 +2574,70 @@ class VizoraAndroidTV {
 
     // Persist playlist for offline resilience, tenant-bound (contract §2):
     // the envelope's tenantId is verified at load time before any render.
-    try {
-      await Preferences.set({
-        key: 'last_playlist',
-        value: JSON.stringify({
-          tenantId: this.tenantId ?? undefined,
-          deviceId: this.deviceId ?? undefined,
-          savedAt: Date.now(),
-          playlist,
-        }),
-      });
-    } catch (err) {
-      console.warn('[Vizora] Failed to persist playlist:', err);
+    //
+    // SKIPPED while our own tenant identity is unverifiable. `tenantId ?? undefined`
+    // writes the SAME envelope for "legacy device, never had a tenant" and "the
+    // tenant_id read threw this boot" — and the loader treats an absent tenantId as
+    // the legacy no-binding grace branch and renders it unconditionally. So one
+    // transient decrypt failure permanently downgrades that record's tenant binding,
+    // for every boot after. Keeping the PREVIOUS (correctly stamped) record is
+    // strictly better: it is still tenant-bound, and live delivery is unaffected.
+    let persisted = false;
+    if (this.tenantReadFailed) {
+      console.warn('[Vizora] Not persisting last_playlist — tenant identity is unverifiable this boot (F4/F42)');
+      reportEvent('playlist_persist_skipped_tenant_unverified', { playlistId: playlist.id ?? null });
+    } else {
+      try {
+        await Preferences.set({
+          key: 'last_playlist',
+          value: JSON.stringify({
+            tenantId: this.tenantId ?? undefined,
+            deviceId: this.deviceId ?? undefined,
+            savedAt: Date.now(),
+            playlist,
+          }),
+        });
+        persisted = true;
+      } catch (err) {
+        console.warn('[Vizora] Failed to persist playlist:', err);
+      }
+    }
+
+    // A purge that landed inside that write is the whole reason the snapshot exists.
+    // purgeDeviceState removes last_playlist as part of its own purge, so a write
+    // parked in the bridge lands AFTER that removal and OURS is the copy left on disk:
+    // the de-paired device reboots straight back into the purged tenant's playlist.
+    // And everything below this point runs off the `playlist` ARGUMENT rather than
+    // this.currentPlaylist (which the purge nulled), so the preloader re-populates the
+    // cache the purge had just cleared with that tenant's assets. Both are the exact
+    // leak purgeDeviceState exists to prevent, so decline the whole commit.
+    //
+    // The sibling hazard — a payload that reaches updatePlaylist entirely AFTER a
+    // purge, which this entry snapshot cannot see because it is taken too late — is
+    // closed one level up, by the generation applyPulledContent's callers capture at
+    // the point the payload was asked for. See the comment there.
+    if (gen !== this.purgeGeneration) {
+      console.warn('[Vizora] Device was purged while applying a playlist — discarding it');
+      reportEvent('playlist_discarded_after_purge', { playlistId: playlist.id ?? null });
+      // Only what WE put there, and only if it is still ours: a purge implies a
+      // pairing screen, but a re-pair inside the same window is not impossible and
+      // its content must not be collateral.
+      if (this.currentPlaylist === playlist) {
+        this.currentPlaylist = null;
+        this.currentIndex = 0;
+      }
+      if (this.savedPlaylistState?.playlist === playlist) this.savedPlaylistState = null;
+      if (persisted) {
+        void Preferences.remove({ key: 'last_playlist' }).catch((err) => {
+          console.error('[Vizora] Could not remove a playlist persisted across a purge:', err);
+          reportEvent('playlist_purge_cleanup_failed', {});
+        });
+      }
+      // No advance(), no preload, and no screen transition: the revocation path owns
+      // the screen and is already heading for pairing. An enterHolding() from here is
+      // refused while pairing owns it, but it would still fire before that transition
+      // lands, and there is nothing to hold FOR on a de-paired device.
+      return;
     }
 
     if (this.playbackTimer) {
@@ -2266,16 +2952,30 @@ class VizoraAndroidTV {
   //     ack emitted after that call has no chance at all of leaving the device.
   //
   //     Ordering is NECESSARY BUT NOT SUFFICIENT, and the difference matters — do
-  //     not read this rule as closing the loop on its own. On an established
-  //     WebSocket the emit does reach ws.send() synchronously, but engine.io-client's
-  //     flush() bails when `!transport.writable` or `this.upgrading`
-  //     (engine.io-client socket.js:342-346), leaving the frame sitting in
-  //     writeBuffer — which window.location.reload() then discards. On the polling
-  //     fallback the write is an XHR POST that the reload aborts. So acking first
-  //     BUYS a chance to flush; it does not guarantee delivery.
+  //     not read this rule as closing the loop on its own. Scoped to what THIS build
+  //     can actually do (socket.io-client 4.8.3 / engine.io-client 6.6.4, verified in
+  //     node_modules rather than assumed):
+  //
+  //       - `upgrading` cannot be true: `transports` lists websocket FIRST, so the
+  //         connection opens on websocket and there is no polling→websocket upgrade.
+  //       - The polling XHR-POST path is not reached either. `polling` IS in the
+  //         transports list, but falling back to it requires `tryAllTransports`
+  //         (engine.io-client socket.js:512, `_onError`), which this build never sets
+  //         and which defaults to FALSE — a failed websocket open reconnects on
+  //         websocket instead of shifting transport. Note the reason: it is the
+  //         option, NOT the transports list. Setting `tryAllTransports: true` or
+  //         reordering that list makes the XHR path live again.
+  //       - What remains reachable is `!transport.writable` (socket.js:342-346) — a
+  //         send already in flight — which leaves the frame in writeBuffer for
+  //         window.location.reload() to discard.
+  //
+  //     So on this build the ack normally does reach ws.send() synchronously before
+  //     handleCommand begins. It is still BEST-EFFORT, not a guarantee: the last hop
+  //     — whether the bytes leave the machine before navigation tears the context
+  //     down — is browser behaviour, not something the spec promises us.
   //
   //     The thing that actually terminates the loop is the PERSISTED dedupe ring
-  //     (loadSeenCommands / rememberCommand): when the ack is lost, the server times
+  //     (loadSeenCommands / recordCommandDurably): when the ack is lost, the server times
   //     out at 10s and requeues, the device reconnects and the identical
   //     (type, timestamp) arrives again — and the on-disk ring is what stops the
   //     second execution. Deleting the ring on the strength of this ordering rule
@@ -2290,11 +2990,51 @@ class VizoraAndroidTV {
   // ack-wrapped, so every call site goes through this helper rather than invoking
   // `ack` directly.
 
+  /**
+   * The command types this client can actually ACT on. Anything else — `reboot`,
+   * `update`, `screenshot` and any type we do not know — reaches the switch and does
+   * nothing but log, so it must not ack indistinguishably from a working command.
+   *
+   * MUST mirror the actionable cases in handleCommand's switch. The pairing is covered
+   * by a test that drives every type through the socket and reads the ack, so adding a
+   * case without adding it here fails loudly rather than silently reporting
+   * "unsupported" for something that works.
+   */
+  private static readonly ACTIONABLE_COMMANDS = new Set([
+    'reload', 'restart', 'clear_cache', 'unpair',
+    'update_config', 'push_content', 'qr-overlay-update', 'clear_override',
+  ]);
+
+  /**
+   * `'unsupported'` for a command this client will not act on, undefined otherwise.
+   *
+   * Why this exists: `reboot`/`update`/`screenshot`/unknown acked `{ ok: true }` and
+   * did nothing, and the dashboard renders that in the same green as a working reload
+   * — a permanent, 100%-reproducible false positive telling an operator their action
+   * landed when it never will. Our reportEvent telemetry goes to US, not to the person
+   * who pressed the button.
+   *
+   * Still `ok: true`, never a nack: a nack means "retry this" and the server has no
+   * give-up (see rule 1), so nacking an unsupported type would loop it forever.
+   * Verified wire-safe against the deployed gateway rather than assumed — getAckError
+   * (device.gateway.ts:254-256) treats an ack as an error ONLY on `ok === false` and
+   * reads nothing else off the object, so the extra field is ignored today and gives
+   * the backend something to start reading when it is ready to.
+   */
+  private static commandAckStatus(command: { type?: unknown }): 'unsupported' | undefined {
+    const type = command?.type;
+    return typeof type === 'string' && VizoraAndroidTV.ACTIONABLE_COMMANDS.has(type)
+      ? undefined
+      : 'unsupported';
+  }
+
   /** Answer a delivery-guaranteed emit. Positive, once, and never throws. */
-  private static ackDelivery(ack: unknown): void {
+  private static ackDelivery(ack: unknown, status?: 'unsupported'): void {
     if (typeof ack !== 'function') return; // legacy / unacked emit — rule above
     try {
-      (ack as (response: { ok: boolean }) => void)({ ok: true });
+      const response: { ok: boolean; status?: string } = { ok: true };
+      if (status) response.status = status;
+      (ack as (response: { ok: boolean; status?: string }) => void)(response);
     } catch (error) {
       // A throwing callback must not take the handler down with it, and must not
       // tempt a retry: from the server's side the ack either arrived or it did not.
@@ -2305,26 +3045,106 @@ class VizoraAndroidTV {
   // ==================== COMMANDS ====================
 
   /**
-   * Idempotency key for a delivered command: `(type, timestamp)`.
+   * Idempotency key for a delivered command: `commandId` when the server sent one,
+   * `(type, timestamp)` otherwise.
    *
-   * NOT `commandId`. That exists only on fleet-originated commands — the
-   * POST /api/push/content path constructs `{ type, payload }` with no id at all,
-   * and the realtime DeviceCommand type does not declare one. `timestamp` is
-   * stamped ONCE server-side and the identical object is requeued verbatim, so it
-   * is stable across every replay and every reconnect, which is exactly the
-   * property a dedupe key needs.
+   * Both halves are needed, and the order matters.
    *
-   * Returns null when the command carries no timestamp: an unkeyable command is
-   * EXECUTED (never suppressed on a guess) — and, as always, still acked. That is a
-   * cross-repo invariant failing OPEN, so handleCommand reports it whenever the
-   * command is one that destroys the context; see the `else if` there.
+   * `commandId` is the IDENTITY of an operator action: fleet.service.ts:91 mints one
+   * `crypto.randomUUID()` per action and passes it in the command shape (:137), and
+   * sendCommand spreads the command before queueing/emitting it
+   * (device.gateway.ts:2299), so it survives requeue verbatim. Preferring it fixes a
+   * real collision: `(type, timestamp)` ignores `payload`, and the timestamp is an ISO
+   * string with millisecond resolution, so two DISTINCT `push_content` commands issued
+   * in the same millisecond produce the identical key — and the second is suppressed
+   * and acked green, i.e. silently dropped content.
+   *
+   * `(type, timestamp)` stays as the fallback because it is all the other producer
+   * has: the POST /api/push/content path (realtime app.controller.ts) constructs
+   * `{ type, payload }` with no id, and sendCommand stamps `timestamp` onto it.
+   * Dropping the fallback would leave that whole path unkeyed.
+   *
+   * Returns null when neither is usable: an unkeyable command is EXECUTED (never
+   * suppressed on a guess) — and, as always, still acked. That is a cross-repo
+   * invariant failing OPEN, so handleCommand reports it whenever the command is one
+   * that destroys the context; see the `else if` there.
    */
-  private static commandDedupeKey(command: { type?: unknown; timestamp?: unknown }): string | null {
+  private static commandDedupeKey(
+    command: { type?: unknown; timestamp?: unknown; commandId?: unknown },
+  ): string | null {
     const type = command?.type;
+    const commandId = command?.commandId;
     const timestamp = command?.timestamp;
     if (typeof type !== 'string' || !type) return null;
-    if (typeof timestamp !== 'string' && typeof timestamp !== 'number') return null;
-    return `${type}@${timestamp}`;
+    // `#` and `@` are distinct separators so the two key families can never alias each
+    // other in a ring that holds both.
+    let key: string;
+    if (typeof commandId === 'string' && commandId) {
+      key = `${type}#${commandId}`;
+    } else if (
+      (typeof timestamp === 'string' || typeof timestamp === 'number') &&
+      // `timestamp` is unvalidated wire data and the synthetic-record family is keyed
+      // `type@~unkeyed:<ms>`. A server timestamp beginning with `~` would land in that
+      // namespace and could be read back as a synthetic record — letting a crafted
+      // stamp suppress a later unkeyable reload, or be aged out by its window. No real
+      // timestamp (ISO string or epoch number) starts with `~`, so refusing costs
+      // nothing and returning null already means "execute, do not suppress".
+      !String(timestamp).startsWith('~')
+    ) {
+      key = `${type}@${timestamp}`;
+    } else {
+      return null;
+    }
+    if (key.length > VizoraAndroidTV.COMMAND_DEDUPE_KEY_MAX_LEN) {
+      // Unbounded, this is a way to blow the storage quota from the wire: the ring is
+      // JSON-stringified into Preferences AND localStorage, and on the TV runtimes a
+      // QuotaExceededError then fails every LATER write identically — disarming the
+      // terminator for every subsequent command. Refusing the key costs at most one
+      // duplicate execution of this one command.
+      console.warn(`[Vizora] Dedupe key too long (${key.length} chars) — not recorded`);
+      reportEvent('command_dedupe_key_oversize', {
+        type: type.slice(0, 64),
+        length: key.length,
+      });
+      return null;
+    }
+    return key;
+  }
+
+  /**
+   * The key for a SYNTHETIC dedupe record: the command type plus the local time it is
+   * being dispatched at. Null when it would not fit the same length bound a real key
+   * has — `type` is unvalidated wire data, and this key goes into the same two stores.
+   */
+  private static syntheticUnkeyedKey(type: string, at: number): string {
+    // No length bound here, deliberately, and this does NOT weaken the one on
+    // commandDedupeKey. That bound exists because `timestamp` is unvalidated wire data
+    // and an oversized key is a way to blow the storage quota from the network. A
+    // synthetic key contains no wire data at all: the caller reaches this only for a
+    // `type` it has already matched against CONTEXT_DESTROYING_COMMANDS, so the longest
+    // possible result is `clear_cache` + the 10-char mark + a 13-digit epoch = 34
+    // chars. A bound that cannot fire is a branch nobody can test and everybody has to
+    // reason about.
+    return `${type}${VizoraAndroidTV.COMMAND_UNKEYED_MARK}${at}`;
+  }
+
+  /**
+   * When, if ever, an identical unkeyable command was dispatched inside the window —
+   * see COMMAND_UNKEYED_WINDOW_MS for why the window exists and what the clock can do
+   * to it. Newest match first; `elapsed >= 0` is the clock-went-backwards guard, and
+   * dropping such a record means the command EXECUTES.
+   */
+  private recentUnkeyedDispatch(type: string, now: number): number | null {
+    const mark = `${type}${VizoraAndroidTV.COMMAND_UNKEYED_MARK}`;
+    for (let i = this.seenCommandKeys.length - 1; i >= 0; i--) {
+      const key = this.seenCommandKeys[i];
+      if (key.slice(0, mark.length) !== mark) continue;
+      const at = Number(key.slice(mark.length));
+      if (!Number.isFinite(at)) continue;
+      const elapsed = now - at;
+      if (elapsed >= 0 && elapsed < VizoraAndroidTV.COMMAND_UNKEYED_WINDOW_MS) return at;
+    }
+    return null;
   }
 
   /**
@@ -2346,19 +3166,65 @@ class VizoraAndroidTV {
    * console output nobody is reading is the only trace.
    */
   private async loadSeenCommands(): Promise<void> {
-    try {
-      const stored = await Preferences.get({ key: VizoraAndroidTV.COMMAND_DEDUPE_PREF_KEY });
-      if (!stored.value) return;
-      const parsed: unknown = JSON.parse(stored.value);
+    const merged: string[] = [];
+    const absorb = (raw: string | null | undefined) => {
+      if (!raw) return;
+      const parsed: unknown = JSON.parse(raw);
       if (!Array.isArray(parsed)) return;
-      this.seenCommandKeys = parsed
-        .filter((k): k is string => typeof k === 'string')
-        .slice(-VizoraAndroidTV.COMMAND_DEDUPE_MAX);
+      for (const k of parsed) {
+        if (typeof k === 'string' && merged.indexOf(k) === -1) merged.push(k);
+      }
+    };
+
+    // UNION of both homes, and the synchronous one first. They can legitimately
+    // disagree: the localStorage copy lands even when the Preferences write times
+    // out or rejects, and the Preferences copy survives a webview storage clear that
+    // takes localStorage with it. Whichever one has the key is enough to suppress
+    // the replay — the ring only ever needs to answer "have I run this".
+    try {
+      absorb(VizoraAndroidTV.localStore()?.getItem(VizoraAndroidTV.COMMAND_DEDUPE_LOCAL_KEY));
+    } catch (error) {
+      console.warn('[Vizora] Could not restore the local command dedupe ring:', error);
+      reportEvent('command_dedupe_ring_load_failed', { store: 'localStorage', error: String(error) });
+    }
+
+    // The independent home on the TV runtimes — bounded like the bridge read, since a
+    // blocked IndexedDB open would otherwise hang boot.
+    try {
+      const fromIdb = await Promise.race([
+        CommandRing.read(),
+        this.timeoutAfter(VizoraAndroidTV.BRIDGE_READ_TIMEOUT_MS),
+      ]);
+      if (fromIdb !== 'timeout' && fromIdb) {
+        for (const k of fromIdb) {
+          if (typeof k === 'string' && merged.indexOf(k) === -1) merged.push(k);
+        }
+      } else if (fromIdb === 'timeout') {
+        reportEvent('command_dedupe_ring_load_failed', { store: 'indexeddb', error: 'timeout' });
+      }
+    } catch (error) {
+      console.warn('[Vizora] Could not restore the IndexedDB command dedupe ring:', error);
+      reportEvent('command_dedupe_ring_load_failed', { store: 'indexeddb', error: String(error) });
+    }
+
+    try {
+      const stored = await this.boundedPrefsGet(VizoraAndroidTV.COMMAND_DEDUPE_PREF_KEY);
+      if (stored !== 'timeout') absorb(stored.value);
     } catch (error) {
       console.warn('[Vizora] Could not restore command dedupe ring — duplicates may re-execute:', error);
       // Distinct from the persist failure below: this one means the ring did not
       // survive the restart, which is precisely the replay window it guards.
-      reportEvent('command_dedupe_ring_load_failed', { error: String(error) });
+      reportEvent('command_dedupe_ring_load_failed', { store: 'preferences', error: String(error) });
+    }
+
+    // Bounded on restore as well as on write: a ring that grew (an older build, a
+    // hand-edited store, or the union of two copies that diverged) must not come
+    // back unbounded and be written straight back out at full size. Through the SAME
+    // prune as the write path — restoring with a plain tail-slice would drop exactly
+    // the context-destroying records the reserve exists to keep, at exactly the moment
+    // they matter most: the boot right after the reload whose replay is inbound.
+    if (merged.length > 0) {
+      this.seenCommandKeys = VizoraAndroidTV.pruneRing(merged);
     }
   }
 
@@ -2378,19 +3244,198 @@ class VizoraAndroidTV {
    * localStorage web implementation on Tizen/webOS) fails EVERY subsequent write the
    * same way — so the loop, once started, has nothing left to stop it.
    */
-  private async rememberCommand(key: string): Promise<void> {
+  /**
+   * Is this ring entry a record of a context-destroying dispatch?
+   *
+   * Reads the type off the key itself rather than tracking it separately, so it works
+   * identically for a live entry and one restored from disk by an older build. Both
+   * key families put the type first: `type@timestamp`, `type#commandId` and the
+   * synthetic `type@~unkeyed:ms`.
+   */
+  private static isContextDestroyingKey(key: string): boolean {
+    const cut = key.search(/[@#]/);
+    return cut > 0 && VizoraAndroidTV.CONTEXT_DESTROYING_COMMANDS.has(key.slice(0, cut));
+  }
+
+  /**
+   * Trim the ring to COMMAND_DEDUPE_MAX while honouring the reserve — see
+   * COMMAND_DEDUPE_CD_RESERVE for why a plain FIFO was not safe here. Newest entries
+   * win within each class, and the surviving entries keep their original order.
+   */
+  private static pruneRing(keys: string[]): string[] {
+    if (keys.length <= VizoraAndroidTV.COMMAND_DEDUPE_MAX) return keys;
+    const max = VizoraAndroidTV.COMMAND_DEDUPE_MAX;
+    const destroying = keys.filter(k => VizoraAndroidTV.isContextDestroyingKey(k));
+    const ordinary = keys.filter(k => !VizoraAndroidTV.isContextDestroyingKey(k));
+    // Ordinary traffic may use everything the reserve does not claim; the reserve only
+    // claims what context-destroying records actually need.
+    const ordinarySlots = Math.min(
+      ordinary.length,
+      max - Math.min(destroying.length, VizoraAndroidTV.COMMAND_DEDUPE_CD_RESERVE),
+    );
+    // …and context-destroying records take the rest, which is all of it when there is
+    // no ordinary traffic to make room for.
+    const destroyingSlots = Math.min(destroying.length, max - ordinarySlots);
+    // `newest(xs, 0)` rather than `xs.slice(-0)`: -0 === 0, so slice(-0) returns the
+    // WHOLE array instead of none of it. That silently inverts a zero budget into an
+    // unbounded one — the ring is JSON-stringified into two stores on every command, so
+    // "keep everything" is the failure this bound exists to prevent. (Found by a
+    // mutation that should have gone red and did not: with the reserve set to 0 the
+    // reserved records survived anyway, via exactly this path.)
+    const newest = (xs: string[], n: number) => (n > 0 ? xs.slice(-n) : []);
+    const kept = new Set([
+      ...newest(destroying, destroyingSlots),
+      ...newest(ordinary, ordinarySlots),
+    ]);
+    return keys.filter(k => kept.has(k));
+  }
+
+  private rememberCommandLocally(key: string): boolean {
     this.seenCommandKeys.push(key);
-    if (this.seenCommandKeys.length > VizoraAndroidTV.COMMAND_DEDUPE_MAX) {
-      this.seenCommandKeys = this.seenCommandKeys.slice(-VizoraAndroidTV.COMMAND_DEDUPE_MAX);
+    this.seenCommandKeys = VizoraAndroidTV.pruneRing(this.seenCommandKeys);
+
+    // SYNCHRONOUS durable write FIRST, before anything asynchronous can be raced or
+    // wedged. This is the write that actually terminates the replay loop: it has
+    // landed by the time this function yields, so the 2s bound, a rejecting bridge and
+    // a reload() firing on the next turn can none of them leave the dispatch
+    // unrecorded. The Preferences write stays — it is the copy that survives a webview
+    // storage clear — but it is no longer the only one.
+    return this.writeLocalRing();
+  }
+
+  /**
+   * Persist the ring to IndexedDB — the one home that is genuinely independent of
+   * localStorage on the TV runtimes, where Preferences IS localStorage. Never rejects;
+   * reports what it returns. See command-ring-store.ts for why it exists.
+   */
+  private async persistCommandRingToIdb(): Promise<boolean> {
+    try {
+      await CommandRing.write(this.seenCommandKeys);
+      return true;
+    } catch (error) {
+      console.warn('[Vizora] Could not persist the command dedupe ring to IndexedDB:', error);
+      reportEvent('command_dedupe_idb_persist_failed', { error: String(error) });
+      return false;
     }
+  }
+
+  /** Persist the ring through the bridge. Never rejects; reports what it returns. */
+  private async persistCommandRing(): Promise<boolean> {
     try {
       await Preferences.set({
         key: VizoraAndroidTV.COMMAND_DEDUPE_PREF_KEY,
         value: JSON.stringify(this.seenCommandKeys),
       });
+      return true;
     } catch (error) {
       console.warn('[Vizora] Could not persist command dedupe ring:', error);
       reportEvent('command_dedupe_ring_persist_failed', { error: String(error) });
+      return false;
+    }
+  }
+
+  /**
+   * Record `key` and answer the only question the dispatch decision needs: did a home
+   * that SURVIVES window.location.reload() accept it?
+   *
+   * The in-memory entry is added unconditionally either way — it still suppresses a
+   * same-process replay, which is the common case and does not depend on any disk.
+   *
+   * The two homes are independent on ANDROID (native SharedPreferences vs WebView
+   * localStorage) and NOT independent on Tizen/webOS: @capacitor/preferences 6.0.4's
+   * web implementation is literally `window.localStorage` under a `CapacitorStorage.`
+   * prefix (dist/esm/web.js — `get impl() { return window.localStorage; }`). One quota
+   * failure therefore takes BOTH out on exactly the platforms where the quota failure
+   * was the motivating scenario. The sync write still closes the timing hole and the
+   * wedged-bridge hole everywhere; what it cannot do there is be a SECOND store. So the
+   * caller has to be told, rather than assuming two homes means two chances.
+   */
+  private async recordCommandDurably(key: string, type: string): Promise<boolean> {
+    const localAccepted = this.rememberCommandLocally(key);
+    // BOUNDED, and the two asynchronous homes are raced TOGETHER against one bound
+    // rather than sequentially: a wedged Capacitor bridge must not spend the whole
+    // budget before IndexedDB is even tried. Without the bound the operator's command
+    // would never run at all, with `{ ok: true }` already sent and no rejection to
+    // report because the promise does not settle.
+    // FIRST ACCEPTANCE WINS, and neither home can hold up the other. `Promise.all` was
+    // wrong here: it waits for BOTH, so a wedged Capacitor bridge — the exact failure
+    // the bound exists for — would swallow the whole budget and mask an IndexedDB
+    // write that had already succeeded, refusing a command that was in fact durable.
+    // Resolve true the moment either lands; false only once both have failed.
+    const anyHomeAccepted = (a: Promise<boolean>, b: Promise<boolean>): Promise<boolean> =>
+      new Promise<boolean>((resolve) => {
+        let outstanding = 2;
+        const settle = (accepted: boolean) => {
+          if (accepted) resolve(true);
+          else if (--outstanding === 0) resolve(false);
+        };
+        // The rejection arm is not decoration. Both inputs are documented never-reject
+        // and are correct today, but if either ever did reject, this promise would keep
+        // `outstanding` at 1 forever AND leak an unhandled rejection — the 2s race
+        // outside would mask it as a timeout, which reads as "the bridge is wedged"
+        // rather than "someone broke a contract". Treating a rejection as a refusal
+        // costs nothing and removes the dependence on a caller-side invariant.
+        void a.then(settle, () => settle(false));
+        void b.then(settle, () => settle(false));
+      });
+
+    const persist = await Promise.race([
+      anyHomeAccepted(this.persistCommandRing(), this.persistCommandRingToIdb())
+        .then((ok): 'persisted' | 'failed' => (ok ? 'persisted' : 'failed')),
+      this.timeoutAfter(VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS),
+    ]);
+    if (persist === 'timeout') {
+      console.warn(
+        `[Vizora] Dedupe ring persist did not settle in ${VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS}ms — ${type} is guarded by the local copy alone`,
+      );
+      reportEvent('command_dedupe_persist_timeout', { type });
+    }
+    return localAccepted || persist === 'persisted';
+  }
+
+  /**
+   * FAIL CLOSED, and only here: a context-destroying command whose dedupe record no
+   * durable store would accept is REFUSED rather than dispatched.
+   *
+   * The asymmetry is the whole argument. Dispatching it risks the unterminated loop —
+   * reload → ack lost → requeue → replay → reload at a ~3-5s period, a screen that
+   * never reaches content and a truck roll to fix. Refusing it leaves the device doing
+   * exactly what it was already doing, which is at worst stale, and puts the event in
+   * telemetry where we can see it. The loop is strictly worse than the refusal, so when
+   * we cannot prove we would be able to suppress the replay, we decline the command.
+   *
+   * Deliberately narrow: only when NEITHER home accepted (one is enough), and only for
+   * the context-destroying set. Every other command still runs — a replayed
+   * `clear_override` costs one wasted execution, not the device — and the normal path,
+   * where at least one store works, is untouched.
+   */
+  private refuseUndurableCommand(type: string): void {
+    console.error(`[Vizora] ${type} REFUSED — no durable store accepted its dedupe record, so a replay could not be stopped`);
+    reportEvent('command_refused_no_durable_dedupe', { type });
+  }
+
+  /**
+   * Write the ring to localStorage. Synchronous, bridge-free, survives
+   * window.location.reload(). Returns whether the write actually landed — a missing
+   * store (no localStorage at all) counts as a failure, not a success.
+   *
+   * Reported on failure for the same reason the Preferences write is: when BOTH homes
+   * are unwritable the device has no terminator at all, and that state has to be
+   * visible to us.
+   */
+  private writeLocalRing(): boolean {
+    try {
+      const store = VizoraAndroidTV.localStore();
+      if (!store) return false;
+      store.setItem(
+        VizoraAndroidTV.COMMAND_DEDUPE_LOCAL_KEY,
+        JSON.stringify(this.seenCommandKeys),
+      );
+      return true;
+    } catch (error) {
+      console.warn('[Vizora] Could not persist the local command dedupe ring:', error);
+      reportEvent('command_dedupe_local_persist_failed', { error: String(error) });
+      return false;
     }
   }
 
@@ -2407,35 +3452,59 @@ class VizoraAndroidTV {
         reportEvent('command_duplicate_suppressed', { type: command.type });
         return;
       }
-      // BOUNDED await. The await itself is required (see rememberCommand), but an
-      // UNBOUNDED one is its own failure: a wedged Capacitor bridge leaves the
-      // persist pending forever, and the operator's reload/restart/clear_cache then
-      // never runs at all — with `{ ok: true }` already sent, a dashboard row saying
-      // delivered, and no rejection to report, because the promise does not settle.
-      // On timeout we DISPATCH ANYWAY: losing the ring entry risks one duplicate
-      // execution, losing the command loses the operator's action outright.
-      const persist = await Promise.race([
-        this.rememberCommand(dedupeKey).then(() => 'persisted' as const),
-        this.timeoutAfter(VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS),
-      ]);
-      if (persist === 'timeout') {
-        console.warn(
-          `[Vizora] Dedupe ring persist did not settle in ${VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS}ms — dispatching ${command.type} unguarded`,
-        );
-        reportEvent('command_dedupe_persist_timeout', { type: command.type });
+      // The await is required (see recordCommandDurably) and is bounded there. A
+      // timeout or a rejecting bridge is NOT by itself a reason to drop the operator's
+      // command — the synchronous local copy still guards the replay, and losing the
+      // command loses the operator's action outright. Only losing BOTH homes is.
+      const durable = await this.recordCommandDurably(dedupeKey, command.type);
+      if (!durable && VizoraAndroidTV.CONTEXT_DESTROYING_COMMANDS.has(command.type)) {
+        this.refuseUndurableCommand(command.type);
+        return; // still acked by the caller — a nack would only requeue it
       }
     } else if (VizoraAndroidTV.CONTEXT_DESTROYING_COMMANDS.has(command.type)) {
-      // An unkeyable context-destroying command is the one shape this whole guard
-      // cannot cover: it executes (never suppressed on a guess) and records NOTHING,
-      // so a requeue after a lost ack replays it with no terminator at all. The
-      // scheme's safety rests on the gateway always stamping `timestamp` — one line
-      // in another repo, with no compiler between us. Failing open there is right;
-      // failing open SILENTLY is how it would first be discovered as a field loop.
-      console.warn(`[Vizora] ${command.type} arrived with no dedupe key — replay cannot be suppressed`);
+      // An unkeyable context-destroying command was the one shape this guard could not
+      // cover: it executes (never suppressed on a guess) and, with no key to record,
+      // recorded NOTHING — so a requeue after a lost ack replayed it with no
+      // terminator at all, at the ~3-5s period of reload → reconnect → replay →
+      // reload, forever. The scheme's safety otherwise rests on the gateway always
+      // stamping `timestamp`: one line in another repo, with no compiler between us.
+      //
+      // So key it on what we DO have — the type, and our own clock. A TIME-WINDOWED
+      // SYNTHETIC RECORD (COMMAND_UNKEYED_WINDOW_MS) terminates the loop after ONE
+      // execution while leaving a deliberate re-issue a minute later working. It is
+      // deliberately not a permanent record: the replay is a machine retrying inside
+      // seconds, a second press is a human, and only the window tells them apart.
+      //
+      // It goes through rememberCommand — the SAME durable mechanism as a real key
+      // (synchronous localStorage first, then Preferences) — because it has to survive
+      // the very reload it exists to survive. An in-memory-only record is read back
+      // empty by the reloaded context and terminates nothing.
+      const now = Date.now();
+      const recordedAt = this.recentUnkeyedDispatch(command.type, now);
+      if (recordedAt !== null) {
+        // Still acked by the caller, exactly like a keyed duplicate (rule 1): a nack
+        // would just requeue the delivery we are deliberately declining to repeat.
+        console.warn(`[Vizora] Unkeyable ${command.type} repeated after ${now - recordedAt}ms — suppressed as a replay`);
+        reportEvent('command_unkeyed_replay_suppressed', { type: command.type, ageMs: now - recordedAt });
+        return;
+      }
+      // Failing open is right; failing open SILENTLY is how a missing stamp would
+      // first be discovered as a field loop. This fires on the FIRST delivery only.
+      console.warn(`[Vizora] ${command.type} arrived with no dedupe key — guarding the replay on a synthetic record`);
       reportEvent('command_dedupe_key_missing', { type: command.type });
+
+      const synthetic = VizoraAndroidTV.syntheticUnkeyedKey(command.type, now);
+      // Same fail-closed rule as the keyed path above, for the same reason — and this
+      // path needs it more, since an unkeyable command has no exact key to fall back on.
+      const durable = await this.recordCommandDurably(synthetic, command.type);
+      if (!durable) {
+        this.refuseUndurableCommand(command.type);
+        return; // still acked by the caller
+      }
       // Give the ack frame the same task boundary the keyed path gets from its
       // persist, so the tightest flush window does not land on exactly the case that
-      // also has no dedupe protection.
+      // also has the weakest dedupe protection. Kept unconditional: the record above
+      // is skipped entirely when the synthetic key does not fit.
       await this.timeoutAfter(0);
     }
 
@@ -2842,6 +3911,39 @@ class VizoraAndroidTV {
     container.appendChild(contentDiv);
   }
 
+  /**
+   * May a content frame navigate to this URL?
+   *
+   * Two refusals, both anchored to the running document rather than to a list:
+   *  - anything that is not http(s). `javascript:` executes in the frame's context,
+   *    `data:`/`blob:` inherit nothing useful but bypass every network control, and
+   *    `file:` reads the device's own storage.
+   *  - anything on the APP's OWN origin. Under Capacitor the app document is served
+   *    from `https://localhost` (androidScheme: 'https', no hostname), and the local
+   *    server injects the Capacitor bridge into every frame it serves — so a frame at
+   *    the app origin, granted allow-same-origin, can read the device JWT straight
+   *    out of SecureStorage through `parent`.
+   *
+   * The base is the app document, matching the resolution an iframe would do. Note
+   * what this does NOT buy in practice: every caller passes transformContentUrl's
+   * output, which has already resolved a root-relative `/x` against the API origin,
+   * so such a URL never reaches here still relative and is never judged app-origin.
+   * The base is kept as defence in depth for a future caller that passes a raw URL —
+   * it is not the mechanism that closes the same-origin hole.
+   */
+  private static isRenderableFrameUrl(candidate: string): boolean {
+    const here = (window as unknown as { location?: { href?: string; origin?: string } }).location;
+    let url: URL;
+    try {
+      url = here?.href ? new URL(candidate, here.href) : new URL(candidate);
+    } catch {
+      return false;
+    }
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return false;
+    if (here?.origin && url.origin === here.origin) return false;
+    return true;
+  }
+
   // ==================== HTML CONTENT SECURITY ====================
 
   /**
@@ -2879,12 +3981,23 @@ class VizoraAndroidTV {
     const useCache = options?.useCache ?? true;
     let ready: Promise<'ready' | 'error'> = Promise.resolve('ready');
 
-    // Transform URL (skip for HTML/template which contain raw markup)
+    // Transform URL (skip for HTML/template which contain raw markup).
+    //
+    // The device JWT is withheld for `webpage`/`url` (S3). transformContentUrl's
+    // rationale for appending it — "img/video tags can't send headers" — does not
+    // apply to a FRAME NAVIGATION: the token lands in the frame's own document URL,
+    // where any script in that document can read it off `location`, and the TV
+    // engines put it in the `Referer` of every sub-resource the page fetches. Same
+    // origin or not, a signage page never needs to be handed the device credential.
+    const isFrameNavigation = contentType === 'webpage' || contentType === 'url';
     const contentUrl = (contentType === 'html' || contentType === 'template')
       ? content.url
-      : transformContentUrl(content.url, this.config.apiUrl, this.deviceToken, {
-          rewriteLocalhostForEmulator: isNativeCapacitor(),
-        });
+      : transformContentUrl(
+          content.url,
+          this.config.apiUrl,
+          isFrameNavigation ? null : this.deviceToken,
+          { rewriteLocalhostForEmulator: isNativeCapacitor() },
+        );
 
     // Resolve through cache for media content
     let resolvedUrl = contentUrl;
@@ -2949,6 +4062,34 @@ class VizoraAndroidTV {
       }
       case 'webpage':
       case 'url': {
+        // REFUSE the navigation before an element exists, not after (B2).
+        //
+        // Two unguarded things met here. First, `content.url` reached iframe.src with
+        // no scheme validation at all, so `javascript:` / `data:` / `file:` were
+        // client-side unchecked. Second — and the reason the origin check is not
+        // optional — the app document is NOT served from an unmatchable app scheme.
+        // capacitor.config.ts sets `androidScheme: 'https'` with no `hostname`, so
+        // the Android app origin is exactly `https://localhost`, which a content item
+        // can name. Granted allow-same-origin below, such a frame is same-origin with
+        // the app document; Capacitor's WebViewLocalServer serves dist/index.html
+        // WITH the bridge injected for every frame, so the frame can call
+        // `parent.Capacitor.Plugins.SecureStorage.get({key:'device_token'})` and hand
+        // the device JWT to an attacker socket — reachable today, because the
+        // backend's PATCH /content/:id does not run the validateUrl that POST does.
+        //
+        // Anchored to location.origin rather than a scheme allowlist so this stays
+        // correct if androidScheme/hostname ever change.
+        if (!VizoraAndroidTV.isRenderableFrameUrl(contentUrl)) {
+          console.warn(`[Vizora] Refusing to frame ${content.id}: unsafe scheme or app-origin URL`);
+          reportEvent('frame_url_refused', { contentId: content.id, type: contentType });
+          // Treated as an ordinary content error so the engine SKIPS to the next item
+          // (prepare() returns null on 'error') instead of dead-airing on a blocked
+          // frame. handleError also drives the post-commit advance path.
+          handleError();
+          ready = Promise.resolve('error');
+          break;
+        }
+
         const iframe = document.createElement('iframe');
         // `allow-top-navigation` is DELIBERATELY excluded. This build targets old
         // Chromium (Tizen 4 ≈ 56, webOS 4 ≈ 53), where an un-sandboxed frame can run
@@ -2960,16 +4101,12 @@ class VizoraAndroidTV {
         // break outright under an opaque origin, so dropping it is not an option on
         // the TV platforms.
         iframe.sandbox.add('allow-scripts');
-        // …but NOT on the plain-web platform. There, and only there, the DOCUMENT's
-        // own origin can equal a content origin — the app is served over http(s)
-        // from a host a `webpage` item can also point at. Granted allow-same-origin,
-        // such a frame is same-origin with the app document: it can reach `parent`,
-        // strip this very sandbox attribute and reload itself unsandboxed, which
-        // gives back everything S4 took away. It is also the case where
-        // transformContentUrl has already appended the device JWT (it does so for
-        // any content URL whose origin matches apiUrl). On capacitor/tizen/webos the
-        // app document is served from a local app scheme no remote URL can match, so
-        // the grant cannot produce a same-origin frame there.
+        // …but NOT on the plain-web platform, where the app document is served over
+        // http(s) from a host a `webpage` item can also point at. The origin guard
+        // above now refuses that URL on EVERY platform, so this is defence in depth
+        // rather than the only line: a same-origin frame with allow-same-origin can
+        // reach `parent`, strip this very sandbox attribute and reload itself
+        // unsandboxed, giving back everything the sandbox took away.
         if (detectPlatform() !== 'web') {
           iframe.sandbox.add('allow-same-origin');
         }
