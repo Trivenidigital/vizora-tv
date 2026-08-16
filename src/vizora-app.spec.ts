@@ -266,6 +266,7 @@ function resetCapacitorFakes() {
   preferencesStore = new Map();
   secureStorageStore = new Map();
   resetLocalStorage();
+  resetIdbRing();
   preferencesFailNext = false;
   networkListeners = new Map();
   appListeners = new Map();
@@ -318,6 +319,27 @@ vi.mock('./secure-storage', () => ({
     has: vi.fn(async ({ key }: { key: string }) => ({
       value: secureStorageStore.has(key),
     })),
+  },
+}));
+
+// The IndexedDB ring home. Behind an interface for the same reason TvCacheStore is:
+// the raw IDB plumbing stays out of the suite and the tests drive an in-memory store.
+let idbRing: string[] | null = null;
+let idbThrowOn: { read?: boolean; write?: boolean } = {};
+function resetIdbRing() {
+  idbRing = null;
+  idbThrowOn = {};
+}
+vi.mock('./command-ring-store', () => ({
+  CommandRing: {
+    read: vi.fn(async () => {
+      if (idbThrowOn.read) throw new Error('IndexedDB unavailable');
+      return idbRing;
+    }),
+    write: vi.fn(async (keys: string[]) => {
+      if (idbThrowOn.write) throw new Error('QuotaExceededError');
+      idbRing = [...keys];
+    }),
   },
 }));
 
@@ -4468,7 +4490,15 @@ describe('Client correctness & security residuals (S1–S6)', () => {
   it('S1: one failing SecureStorage.remove cannot skip the other removals', async () => {
     revokedBackend();
     await connectAndCommit();
+    // tenant_id is SEEDED here on purpose. connectAndCommit never writes one, so the
+    // `has('tenant_id') === false` assertion below used to hold whether or not the
+    // production removal ran at all — proven vacuous: replacing that removal with
+    // Promise.resolve() left this test green. An assertion that cannot fail is worse
+    // than no assertion, because it reads as coverage. Every key asserted absent below
+    // now has an explicit baseline proving it was present first.
+    secureStorageStore.set('tenant_id', 'tenant-A');
     expect(secureStorageStore.has('device_id')).toBe(true); // baseline: there is state to purge
+    expect(secureStorageStore.has('tenant_id')).toBe(true);
     expect(preferencesStore.has('last_playlist')).toBe(true);
 
     const { SecureStorage } = await import('./secure-storage');
@@ -6037,8 +6067,10 @@ describe('deliveryAck — delivery-guaranteed emits (client capability)', () => 
     '12: %s is acked ok:true AND reported as unsupported',
     async (type) => {
       // Nacking a permanent failure would make the server replay it forever, so
-      // these ack. The gap has to be visible to US instead — via telemetry, not via
-      // a fake implementation and not via silence.
+      // these ack. The gap is now visible to the OPERATOR too, not only to us:
+      // telemetry goes to us, while the dashboard renders a bare `{ ok: true }` in the
+      // same green as a working reload — a permanent false positive telling someone
+      // their action landed when it never will.
       await connectAndCommit();
       const ack = vi.fn();
 
@@ -6046,7 +6078,7 @@ describe('deliveryAck — delivery-guaranteed emits (client capability)', () => 
       await vi.advanceTimersByTimeAsync(50);
 
       expect(ack).toHaveBeenCalledTimes(1);
-      expect(ack).toHaveBeenCalledWith({ ok: true });
+      expect(ack).toHaveBeenCalledWith({ ok: true, status: 'unsupported' });
       const calls = await reportedEventCalls();
       expect(calls.some(c => c[0] === 'command_unsupported' && (c[1] as { type?: string })?.type === type)).toBe(true);
       // NOT stubbed with fake behaviour: nothing pretended to happen.
@@ -6317,6 +6349,12 @@ describe('deliveryAck — delivery-guaranteed emits (client capability)', () => 
     const { reportEvent } = await import('./crash-reporting');
     (reportEvent as Mock).mockClear();
     await breakRingWrites(NEVER);
+    // IndexedDB is disabled here on purpose: this test is about what happens when the
+    // ONLY remaining async home is wedged. With a healthy IndexedDB the record is
+    // accepted immediately and the command dispatches at once — first acceptance wins,
+    // which is the improvement, not a regression — and the bound is never reached, so
+    // there would be no bound left to exercise.
+    idbThrowOn.write = true;
     const ack = vi.fn();
 
     triggerSocketEvent('command', { type: 'reload', timestamp: 'a10' }, ack);
@@ -6379,6 +6417,7 @@ describe('deliveryAck — delivery-guaranteed emits (client capability)', () => 
     mockCacheManager.clearCache.mockImplementation(async () => { order.push('clearCache'); });
     (window.location.reload as Mock).mockImplementation(() => { order.push('reload'); });
     await breakRingWrites(NEVER);
+    idbThrowOn.write = true; // same reason as A10 — leave the wedge as the only home
 
     triggerSocketEvent('command', { type: 'clear_cache', timestamp: 'a10b' }, vi.fn());
     await vi.advanceTimersByTimeAsync(1500);
@@ -6636,6 +6675,9 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
   it('B1: a WEDGED bridge (persist never settles) still leaves a durable record', async () => {
     await connectAndCommit();
     await breakRingPreferences(NEVER);
+    // The SYNCHRONOUS home is what this test is about, so the other async home is
+    // disabled — otherwise IndexedDB accepts first and the bound is never reached.
+    idbThrowOn.write = true;
 
     triggerSocketEvent('command', { type: 'reload', timestamp: 'b1-wedge' }, vi.fn());
     // The synchronous write has landed before the bound has even started running out.
@@ -6694,6 +6736,8 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     await breakRingPreferences(() => Promise.reject(new Error('QuotaExceededError')));
     localStorageThrowOn.setItem = true;
     localStorageThrowOn.getItem = true;
+    idbThrowOn.write = true;  // the independent home too — refusal needs EVERY home dead
+    idbThrowOn.read = true;
 
     const ack = vi.fn();
     triggerSocketEvent('command', { type: 'reload', timestamp: 'b1-none' }, ack);
@@ -6721,6 +6765,17 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
 
     expect(window.location.reload).not.toHaveBeenCalled();
     expect(await reportedEvents()).toContain('command_dedupe_ring_load_failed');
+
+    // The property this phase exists to keep: the device is ALIVE, not merely silent.
+    // Both assertions above are satisfied by a device that never booted —
+    // `reload` not called is trivially true when nothing runs, and the load-failure
+    // event is emitted BEFORE any throw would propagate. Make an unreadable ring abort
+    // loadSeenCommands and the whole suite stays green without this line. A negative
+    // observable cannot tell "correctly refused" from "dead"; only a positive one can,
+    // which is where the original's toHaveBeenCalledTimes(1) got its power.
+    triggerSocketEvent('command', { type: 'reboot', timestamp: 'b1-none-alive' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(await reportedEvents()).toContain('command_unsupported');
   });
 
   it('B1: the two ring homes are UNIONED, either one alone suppresses', async () => {
@@ -7463,49 +7518,676 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
   });
 
   // ======================================================================
-  // D1. THE TWO RING HOMES ARE ONE STORE ON TIZEN/webOS — FAIL CLOSED THERE
+  // P5. TWO GUARDS THAT OTHER FIXES ARE STANDING ON
+  // ======================================================================
+
+  it('P5: a re-requested pairing code does not leave TWO pollers running', async () => {
+    // startPairingCheck() clears the existing interval first. That guard is exactly
+    // what makes the pairing-poll reordering safe (arming earlier must not double-arm),
+    // so it should be pinned by its own test rather than trusted. Doubled, the device
+    // polls twice per period forever, and every later re-request adds another.
+    secureStorageStore.clear();
+    let requests = 0;
+    httpPostHandler = () => {
+      requests++;
+      return { status: 200, data: { data: { code: requests === 1 ? 'ABCD1234' : 'WXYZ9999', deviceId: 'dev-1', expiresInSeconds: 300 } } };
+    };
+    const { CapacitorHttp } = await import('@capacitor/core');
+    await importFresh(() => domElements.get('pairing-code')!.textContent === 'ABCD1234');
+
+    // Expire the code, forcing startPairing() — and so startPairingCheck() — to run again.
+    httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
+      ? { status: 404, data: {} }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    await waitUntil(
+      'the re-requested code',
+      () => domElements.get('pairing-code')!.textContent === 'WXYZ9999',
+      { tickMs: 2000 },
+    );
+
+    // Now count polls across exactly one interval period.
+    httpGetHandler = () => ({ status: 200, data: { data: { status: 'pending' } } });
+    (CapacitorHttp.get as Mock).mockClear();
+    await vi.advanceTimersByTimeAsync(2000);
+
+    const polls = (CapacitorHttp.get as Mock).mock.calls
+      .filter((c: unknown[]) => (c[0] as { url: string }).url.includes('/pairing/status/'));
+    expect(polls).toHaveLength(1);
+  });
+
+  it('P5: a malformed playlist does not stop the NEXT one from rendering', async () => {
+    // What this pins is the PROPERTY, not the line: a bad payload must not wedge
+    // content delivery for the rest of the process.
+    //
+    // SCOPE, verified rather than claimed: it does NOT pin
+    // `applyContentQueue = next.catch(() => {})`. That mutation ships green here and I
+    // am not going to imply otherwise. The reason is that the queue cannot currently
+    // hold a rejection at all — applyContentExclusive catches the only throwing site
+    // (updatePlaylist, via computePlaylistSignature) internally and returns normally,
+    // so `next` always resolves. The `.catch` is defence in depth against a rejection
+    // no present path produces, like the shouldApplyContent re-check the audit
+    // confirmed is unreachable. It stays: it is one edit from mattering if anything
+    // ever throws outside that try, and pinning it would mean injecting a throw
+    // production cannot make.
+    await connectAndCommit();
+
+    // A malformed item makes computePlaylistSignature throw inside updatePlaylist.
+    triggerSocketEvent('playlist:update', {
+      version: 'v-bad',
+      playlist: { id: 'pl-bad', name: 'bad', loopPlaylist: true, items: [null] },
+    });
+    await vi.advanceTimersByTimeAsync(200);
+    expect(await reportedEvents()).toContain('content_apply_failed');
+
+    // A perfectly good playlist arriving afterwards must still render.
+    triggerSocketEvent('playlist:update', playlistV('v-good', 'cgood', '/cgood.jpg', 'pl-good'));
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(findCreatedElements('img').some(i => i.src.includes('cgood.jpg'))).toBe(true);
+    expect(await reportedContentVersion()).toBe('v-good');
+  });
+
+  // ======================================================================
+  // P4. FRAME-URL REFUSAL: THE EDGE, NOT JUST THE TWO STATED RULES
   // ======================================================================
   //
-  // The durability argument for B1 assumed two independent homes. That holds on
-  // Android (native SharedPreferences vs WebView localStorage) and does NOT hold on
+  // The two refusals (non-http(s), same-origin) and the call site were pinned; the
+  // failure semantics were not. Flipping `catch { return false }` to `return true`
+  // ships an unparseable URL straight into a frame, and dropping the `here.href` base
+  // stops relative URLs resolving against the app document — which makes them throw,
+  // and then the flipped catch frames them AT APP ORIGIN. That is the same-origin
+  // token-theft hole this guard exists to close, reachable through two edits neither
+  // of which any test noticed.
+  //
+  // SCOPE, verified rather than assumed: the `new URL(candidate, here.href)` BASE is
+  // NOT reachable as a hole on this path. The call site passes the output of
+  // transformContentUrl (main.ts:3879), which has already resolved a relative content
+  // URL against config.apiUrl — so by the time the guard runs the URL is absolute and
+  // dropping the base changes nothing. I tried to pin it with a relative URL and the
+  // test proved the opposite: the frame is created at the API origin, correctly. The
+  // base stays as defence in depth for any future caller that passes a raw URL; it is
+  // deliberately not pinned, because a test asserting it here would be asserting a
+  // rewrite that transformContentUrl performs, not this guard.
+
+  it('P4: an UNPARSEABLE frame URL is refused — the catch fails CLOSED', async () => {
+    // The candidate has to be one that genuinely THROWS in `new URL(candidate, base)`.
+    // My first attempt ('ht!tp://%%%not a url%%%') did not: with a base supplied it
+    // parses as a RELATIVE URL, resolves to the app origin and is refused by the
+    // same-origin rule instead — so the catch-flip mutation survived and the test was
+    // pinning a different line than its name claimed. A space in the host still throws.
+    await playItems([{ type: 'webpage', url: 'https://ex ample.com/board', id: 'bad' }]);
+
+    expect(findCreatedElements('iframe')).toHaveLength(0);
+    expect(await reportedEvents()).toContain('frame_url_refused');
+  });
+
+  it('P4 NEGATIVE CONTROL: a legitimate cross-origin page still frames', async () => {
+    // Proves the two refusals above are the guard discriminating, not refusing
+    // everything — signage pages are the entire point of the webpage content type.
+    await playItems([{ type: 'webpage', url: 'https://example.com/board', id: 'ok' }]);
+
+    const frames = findCreatedElements('iframe');
+    expect(frames).toHaveLength(1);
+    expect(frames[0].src).toBe('https://example.com/board');
+    expect(await reportedEvents()).not.toContain('frame_url_refused');
+  });
+
+  // ======================================================================
+  // P3. THE SUSPENSION LATCH IS CLEARED ON BOTH EXITS
+  // ======================================================================
+  //
+  // The latch is durable so a power cycle cannot be used to resume a suspended tenant.
+  // That makes CLEARING it safety-critical in the other direction: the write and the
+  // boot read were pinned, both clears were not, and a stranded latch means a
+  // genuinely resumed tenant re-enters holding on every future boot, forever — a
+  // black-screen fleet event that no amount of server-side "resume" can fix.
+
+  const suspendAndSettle = async () => {
+    triggerSocketEvent('tenant:suspended');
+    await waitUntil('the latch', () => preferencesStore.get('tenant_suspended') === '1', { tickMs: 100 });
+  };
+
+  it('P3: tenant:resumed clears the DURABLE latch, not just the in-memory flag', async () => {
+    await connectAndCommit();
+    await suspendAndSettle();
+
+    triggerSocketEvent('tenant:resumed');
+    await waitUntil('the latch clear', () => !preferencesStore.has('tenant_suspended'), { tickMs: 100 });
+
+    expect(preferencesStore.has('tenant_suspended')).toBe(false);
+    expect(await reportedEvents()).toContain('tenant_unsuspended');
+  });
+
+  it('P3: a purge clears it too — the next pairing must not inherit a suspension', async () => {
+    await connectAndCommit();
+    await suspendAndSettle();
+    await revokeAndSettleHere();
+
+    expect(preferencesStore.has('tenant_suspended')).toBe(false);
+  });
+
+  it('P3 NEGATIVE CONTROL: while still suspended the latch STAYS — it is not cleared by any traffic', async () => {
+    // The clears must be bound to a real resume/purge. A latch that any event could
+    // clear would defeat the whole point of persisting it, which is that a power cycle
+    // cannot resume a suspended tenant.
+    await connectAndCommit();
+    await suspendAndSettle();
+
+    triggerSocketEvent('playlist:update', playlistV('v2', 'c2', '/c2.jpg', 'pl-shared'));
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(preferencesStore.get('tenant_suspended')).toBe('1');
+  });
+
+  // ======================================================================
+  // P2. THE PURGE'S IN-MEMORY HALF, ASSERTED DIRECTLY
+  // ======================================================================
+  //
+  // The revocation suites assert on mock STORES, on visibleScreens() and on event
+  // names. None of those reach the in-memory half of purgeDeviceState, and the
+  // `pairing-screen` result they rely on comes from confirmRevocation's startPairing(),
+  // not from the field clears — so deleting `this.deviceToken = null` (the credential
+  // surviving revocation), or the whole socket teardown, shipped green.
+  //
+  // These assert what a revoked device IS, through paths a revoked device really takes:
+  // the network-restore reconnect, the heartbeat, and the playback clock.
+
+  const revokeAndSettleHere = async () => {
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    triggerSocketEvent('device:revoked', { reason: 'operator' });
+    await waitUntil('purge', () => !secureStorageStore.has('device_token'), { tickMs: 100 });
+    await waitUntil(
+      'pairing code',
+      () => domElements.get('pairing-code')!.textContent === 'ABCD1234',
+      { tickMs: 200 },
+    );
+  };
+
+  it('P2: the credential is gone from MEMORY — a network restore cannot reconnect with it', async () => {
+    // THE security claim. Removing the credential from disk but leaving it in memory
+    // is not revocation: this listener (main.ts:813) reconnects on `status.connected &&
+    // this.deviceToken`, so a surviving token puts the revoked device straight back on
+    // the gateway — authenticated — the next time the wifi blips.
+    await connectAndCommit();
+    await revokeAndSettleHere();
+
+    const connectionsBefore = ioFactory.mock.calls.length;
+    triggerNetworkChange(false);
+    triggerNetworkChange(true);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(ioFactory.mock.calls.length).toBe(connectionsBefore);
+  });
+
+  it('P2 NEGATIVE CONTROL: without a revocation the same network restore DOES reconnect', async () => {
+    // Proves the assertion above is the credential being gone and not the probe being
+    // dead — a test that can never observe a reconnect would pass on a broken purge and
+    // on a broken listener alike.
+    await connectAndCommit();
+    currentMockSocket.connected = false;
+
+    const connectionsBefore = ioFactory.mock.calls.length;
+    triggerNetworkChange(false);
+    triggerNetworkChange(true);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(ioFactory.mock.calls.length).toBeGreaterThan(connectionsBefore);
+  });
+
+  it('P2: the socket is torn down — a revoked device stops beating', async () => {
+    // Left connected, a revoked device keeps a live authenticated socket and keeps
+    // reporting itself healthy on the dashboard. The heartbeat is the observable that
+    // survives the mock: it is emitted on a timer, so it keeps firing if the teardown
+    // is skipped.
+    await connectAndCommit();
+    const socket = currentMockSocket;
+    await revokeAndSettleHere();
+
+    expect(socket.disconnect).toHaveBeenCalled();
+    const beatsAfterPurge = socket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'heartbeat').length;
+    await vi.advanceTimersByTimeAsync(60_000); // four heartbeat periods
+    const beatsNow = socket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'heartbeat').length;
+
+    expect(beatsNow).toBe(beatsAfterPurge);
+  });
+
+  it('P2 NEGATIVE CONTROL: an un-revoked device keeps beating over the same window', async () => {
+    // The counter really can go up — otherwise "it stopped beating" is unfalsifiable.
+    await connectAndCommit();
+    const socket = currentMockSocket;
+    const before = socket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'heartbeat').length;
+
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(socket.emit.mock.calls.filter((c: unknown[]) => c[0] === 'heartbeat').length)
+      .toBeGreaterThan(before);
+  });
+
+  it('P2: no playback or temp-push timer survives the purge', async () => {
+    // The rotation timer is armed at commit time and the temp-push timer at push time;
+    // both fire long afterwards. Left armed, they wake up on a de-paired device and
+    // drive the engine at the pairing screen.
+    //
+    // HONEST SCOPE: this pins the OUTER statement (a de-paired device renders nothing
+    // and keeps its pairing code), not the clearTimeout lines themselves. Deleting
+    // both of those still ships green here and I could not make it fail without
+    // asserting on private state or on a log line that does not reliably fire — see
+    // the note to the audit. The reason is that the clears are defence in depth behind
+    // two other guards: currentPlaylist is already null, so a surviving timer wakes,
+    // finds nothing to play and renders nothing; and its attempt to take the screen is
+    // REFUSED by the pairing guard (screen-state.ts, pinned by screen-state.spec C6).
+    // A probe that cannot fail is worse than no probe, so there is no fake one here.
+    await connectAndCommit();
+    // Arm the temp-push timer too, so both clears are under test.
+    triggerSocketEvent('command', {
+      type: 'push_content', timestamp: 'p2-push',
+      payload: { content: { id: 'tmp', name: 'tmp', type: 'image', url: '/tmp.jpg' }, duration: 30 },
+    }, vi.fn());
+    await vi.advanceTimersByTimeAsync(100);
+
+    await revokeAndSettleHere();
+
+    const impressionsBefore = currentMockSocket.emit.mock.calls
+      .filter((c: unknown[]) => c[0] === 'content:impression').length;
+    const imagesBefore = findCreatedElements('img').length;
+    await vi.advanceTimersByTimeAsync(120_000); // many rotation and push periods
+
+    expect(findCreatedElements('img').length).toBe(imagesBefore);
+    expect(currentMockSocket.emit.mock.calls
+      .filter((c: unknown[]) => c[0] === 'content:impression').length).toBe(impressionsBefore);
+    expect(visibleScreens()).toEqual(['pairing-screen']);
+  });
+
+  it('P2: the purge announces itself and unbinds crash reporting', async () => {
+    // Both are one-liners that shipped green when deleted. The telemetry is how a purge
+    // is seen at all after the fact, and a crash report still tagged with the revoked
+    // device attributes the next tenant's crashes to the previous pairing.
+    const { setCrashReportingDevice } = await import('./crash-reporting');
+    await connectAndCommit();
+    (setCrashReportingDevice as Mock).mockClear();
+
+    await revokeAndSettleHere();
+
+    expect(setCrashReportingDevice).toHaveBeenCalledWith(null);
+    const purged = (await reportedEventCalls()).find(c => c[0] === 'device_purged');
+    expect(purged).toBeDefined();
+    expect((purged![1] as { reason?: string }).reason).toContain('revocation_confirmed');
+  });
+
+  // ======================================================================
+  // E1. THE ACK TELLS THE OPERATOR WHEN A COMMAND WILL NEVER RUN
+  // ======================================================================
+  //
+  // `reboot`/`update`/`screenshot` and any unknown type reach the switch and do
+  // nothing. They acked a bare `{ ok: true }`, which the dashboard renders in the same
+  // green as a working reload — a permanent, 100%-reproducible false positive, and one
+  // our telemetry does nothing about because reportEvent goes to US, not to the person
+  // who pressed the button. Still `ok: true` (a nack means "retry", and the server has
+  // no give-up), with the status alongside it.
+
+  /** The ack payload the device answered a command with. */
+  const ackFor = async (command: Record<string, unknown>) => {
+    const ack = vi.fn();
+    triggerSocketEvent('command', command, ack);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(ack).toHaveBeenCalledTimes(1);
+    return ack.mock.calls[0][0] as { ok: boolean; status?: string };
+  };
+
+  it.each([['reboot'], ['update'], ['screenshot'], ['some_future_type']])(
+    'E1: %s acks ok:true WITH status unsupported',
+    async (type) => {
+      await connectAndCommit();
+      expect(await ackFor({ type, timestamp: `e1-${type}` })).toEqual({ ok: true, status: 'unsupported' });
+    },
+  );
+
+  it.each([
+    ['clear_override'], ['qr-overlay-update'], ['push_content'], ['update_config'],
+  ])('E1 NEGATIVE CONTROL: %s — an ACTIONABLE command carries no status', async (type) => {
+    // The other direction, and the anti-drift guard: if a case is added to the switch
+    // without being added to ACTIONABLE_COMMANDS, the device starts telling operators
+    // that a working command is unsupported. That is the same false report with the
+    // sign flipped, so it gets the same coverage.
+    await connectAndCommit();
+    expect(await ackFor({ type, timestamp: `e1-ok-${type}` })).toEqual({ ok: true });
+  });
+
+  it.each([['reload'], ['restart'], ['clear_cache'], ['unpair']])(
+    'E1 NEGATIVE CONTROL: %s — the context-destroying/destructive set carries no status either',
+    async (type) => {
+      // Driven separately from the four above only because each of these tears the
+      // world down (reload, or a purge), so they cannot share one boot.
+      await connectAndCommit();
+      expect(await ackFor({ type, timestamp: `e1-cd-${type}` })).toEqual({ ok: true });
+    },
+  );
+
+  // ======================================================================
+  // E2. ORDINARY COMMAND VOLUME CANNOT EVICT A LIVE reload RECORD
+  // ======================================================================
+  //
+  // The keyed branch records EVERY command that carries a key, and the ring was a plain
+  // 20-slot FIFO, so ordinary traffic could push out the one record whose loss costs
+  // the device. Fully constructible: reload dispatched → ack lost → server requeues
+  // reload@T0 → ≥20 ordinary keyed commands arrive live and evict it → the reconnect
+  // replays reload@T0 against a ring that no longer holds it.
+
+  it('E2: 25 ordinary commands do NOT evict the reload record — the replay is still suppressed', async () => {
+    await connectAndCommit();
+
+    // The reload the operator sent, whose ack we will assume was lost in flight.
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'T0' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+
+    // Ordinary keyed traffic, more than the whole ring, while the requeue is pending.
+    for (let i = 0; i < 25; i++) {
+      triggerSocketEvent('command', { type: 'clear_override', timestamp: `ord-${i}` }, vi.fn());
+      await vi.advanceTimersByTimeAsync(5);
+    }
+    expect(localRing().length).toBeLessThanOrEqual(20); // the bound still holds
+
+    // The server's requeue arrives on the next reconnect.
+    (window.location.reload as Mock).mockClear();
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'T0' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).not.toHaveBeenCalled();
+    expect(await reportedEvents()).toContain('command_duplicate_suppressed');
+  });
+
+  it('E2: the reserve survives the RESTORE path too', async () => {
+    // The restore used a plain tail-slice, which would drop the reserved records at
+    // exactly the moment they matter most — the boot right after the reload whose
+    // replay is inbound. Seeded oldest-first: the reload is the OLDEST entry, so a
+    // tail-slice keeps the 20 newest ordinary keys and loses it.
+    const seeded = [
+      'reload@T0',
+      ...Array.from({ length: 25 }, (_, i) => `clear_override@ord-${i}`),
+    ];
+    localStorageStore.set(LOCAL_RING_KEY, JSON.stringify(seeded));
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    (window.location.reload as Mock).mockClear();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'T0' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).not.toHaveBeenCalled();
+  });
+
+  it('E2 NEGATIVE CONTROL: ordinary keys are still evicted, and the ring is still bounded', async () => {
+    // The reserve must not turn into "never evict anything" — the bound exists because
+    // the ring is JSON-stringified into two stores on every command. The OLDEST
+    // ordinary key must still fall out and re-execute.
+    await connectAndCommit();
+    const { reportEvent } = await import('./crash-reporting');
+
+    for (let i = 0; i < 25; i++) {
+      triggerSocketEvent('command', { type: 'reboot', timestamp: `evict-${i}` }, vi.fn());
+      await vi.advanceTimersByTimeAsync(5);
+    }
+    expect(localRing().length).toBeLessThanOrEqual(20);
+
+    (reportEvent as Mock).mockClear();
+    triggerSocketEvent('command', { type: 'reboot', timestamp: 'evict-0' }, vi.fn()); // evicted
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(await reportedEvents()).toContain('command_unsupported'); // it RAN again
+    expect(await reportedEvents()).not.toContain('command_duplicate_suppressed');
+  });
+
+  // ======================================================================
+  // E3. commandId IS PREFERRED OVER (type, timestamp) WHEN THE SERVER SENDS ONE
+  // ======================================================================
+  //
+  // `(type, timestamp)` ignores `payload`, and the server's timestamp is an ISO string
+  // with millisecond resolution (device.gateway.ts:2299), so two DISTINCT commands
+  // issued in the same millisecond collide — the second is suppressed AND acked green,
+  // i.e. silently dropped. fleet.service.ts:91 mints a UUID per operator action and
+  // sendCommand spreads it through the requeue verbatim, so when it is there it is a
+  // strictly better key. The POST /api/push/content path has no id, so the
+  // (type, timestamp) fallback stays.
+
+  it('E3: two DISTINCT commands in the same millisecond both run when they carry commandIds', async () => {
+    await connectAndCommit();
+    const pushed: string[] = [];
+    mockCacheManager.getCachedUri.mockImplementation(async (id: string) => { pushed.push(id); return null; });
+
+    const sameMs = '2026-08-15T00:00:00.000Z';
+    triggerSocketEvent('command', {
+      type: 'push_content', timestamp: sameMs, commandId: 'uuid-A',
+      payload: { content: { id: 'cA', name: 'A', type: 'image', url: '/a.jpg' }, duration: 5 },
+    }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    triggerSocketEvent('command', {
+      type: 'push_content', timestamp: sameMs, commandId: 'uuid-B',
+      payload: { content: { id: 'cB', name: 'B', type: 'image', url: '/b.jpg' }, duration: 5 },
+    }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    // Both were acted on, and both keys are recorded under the id, not the timestamp.
+    expect(pushed).toContain('cA');
+    expect(pushed).toContain('cB');
+    expect(localRing()).toContain('push_content#uuid-A');
+    expect(localRing()).toContain('push_content#uuid-B');
+    expect(await reportedEvents()).not.toContain('command_duplicate_suppressed');
+  });
+
+  it('E3 NEGATIVE CONTROL: the SAME commandId replayed is still suppressed', async () => {
+    // The id must be a dedupe key, not merely a disambiguator — a genuine requeue of
+    // one operator action carries the identical id and must not run twice.
+    await connectAndCommit();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 't-1', commandId: 'uuid-same' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+
+    // Same id, DIFFERENT timestamp — a requeue re-stamped by a later sendCommand would
+    // defeat a timestamp-only key, and must not defeat this one.
+    triggerSocketEvent('command', { type: 'reload', timestamp: 't-2', commandId: 'uuid-same' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(await reportedEvents()).toContain('command_duplicate_suppressed');
+  });
+
+  it('E3 NEGATIVE CONTROL: with NO commandId the (type, timestamp) fallback still keys it', async () => {
+    // The push path (realtime app.controller.ts) sends no id at all. Losing the
+    // fallback would leave that entire path unkeyed.
+    await connectAndCommit();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'fallback-1' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(localRing()).toContain('reload@fallback-1');
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'fallback-1' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+  });
+
+  // ======================================================================
+  // D1. A REAL THIRD HOME ON TV, AND FAIL-CLOSED ONLY WHEN ALL OF THEM FAIL
+  // ======================================================================
+  //
+  // The durability argument assumed two independent homes. That holds on Android
+  // (native SharedPreferences vs WebView localStorage) and does NOT hold on
   // Tizen/webOS, where Capacitor falls through to web implementations and
   // @capacitor/preferences 6.0.4's is literally window.localStorage under a
-  // `CapacitorStorage.` prefix (node_modules/@capacitor/preferences/dist/esm/web.js —
-  // `get impl() { return window.localStorage; }`). One QuotaExceededError takes out
-  // both writes at once, on exactly the platform where that failure was the motivating
-  // scenario, leaving a context-destroying command with no terminator at all.
+  // `CapacitorStorage.` prefix (dist/esm/web.js — `get impl()`). One
+  // QuotaExceededError took out both writes at once, on exactly the platforms
+  // CLAUDE.md lists as shipped, leaving a context-destroying command with no
+  // terminator at all.
   //
-  // So for that set only, and only when NEITHER home accepted, the command is refused.
-  // Dispatching risks an unterminated reload loop (a screen that never reaches content,
-  // a truck roll); refusing leaves the device doing what it was already doing and puts
-  // the event in telemetry. The loop is strictly worse.
+  // The primary answer is a genuinely independent store: IndexedDB, which has its own
+  // far larger quota and is already proven on those runtimes (TvCacheManager caches all
+  // content through it). So the quota failure no longer costs the operator their
+  // command — it just lands somewhere else.
+  //
+  // Fail-closed is the BACKSTOP beneath that, for the case where every home refuses:
+  // dispatching then risks an unterminated reload loop (a screen that never reaches
+  // content, a truck roll), while refusing leaves the device doing what it was already
+  // doing and puts the event in telemetry. The loop is strictly worse. Narrow by
+  // construction — context-destroying types only, and only when NOTHING accepted.
 
-  /** Kill BOTH durable homes — the single-store quota failure, as seen on TV. */
-  const killBothRingStores = async () => {
+  /** The TV quota failure: localStorage dies, and Preferences dies with it. */
+  const killLocalStorageBackedStores = async () => {
     await breakRingPreferences(() => Promise.reject(new Error('QuotaExceededError')));
     localStorageThrowOn.setItem = true;
   };
 
-  it('D1: with NEITHER home accepting, a context-destroying command is refused and reported', async () => {
-    await connectAndCommit();
-    await killBothRingStores();
-    const ack = vi.fn();
+  /** Kill every durable home, including the independent one. */
+  const killAllRingStores = async () => {
+    await killLocalStorageBackedStores();
+    idbThrowOn.write = true;
+  };
 
-    triggerSocketEvent('command', { type: 'reload', timestamp: 'd1' }, ack);
+  it('D1: the TV quota failure no longer costs the operator the command — IndexedDB takes it', async () => {
+    // Both localStorage-backed homes dead, which on Tizen/webOS is ONE quota error.
+    // Before the third home this was the fail-closed refusal; now it just works.
+    await connectAndCommit();
+    await killLocalStorageBackedStores();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'd1-idb' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(await reportedEvents()).not.toContain('command_refused_no_durable_dedupe');
+    // The record really is somewhere durable, and it is the independent store.
+    expect(idbRing).toContain('reload@d1-idb');
+    expect(localStorageStore.has(LOCAL_RING_KEY)).toBe(false);
+    expect(preferencesStore.has('seen_command_keys')).toBe(false);
+  });
+
+  it('D1: the IndexedDB record alone terminates the replay ACROSS a reload', async () => {
+    // Durability that is not read back is not durability. Same both-dead state, then
+    // the reload actually happens (a fresh context), and the replay must be suppressed
+    // off the IndexedDB copy alone.
+    await connectAndCommit();
+    await killLocalStorageBackedStores();
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'd1-across' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50);
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+
+    await importFresh(); // the reload: nothing survives but storage
+    (window.location.reload as Mock).mockClear();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'd1-across' }, vi.fn());
     await vi.advanceTimersByTimeAsync(50);
 
     expect(window.location.reload).not.toHaveBeenCalled();
-    expect(ack).toHaveBeenCalledWith({ ok: true }); // never a nack, per the ack contract
-    const refused = (await reportedEventCalls()).find(c => c[0] === 'command_refused_no_durable_dedupe');
-    expect(refused).toBeDefined();
-    expect((refused![1] as { type?: string }).type).toBe('reload');
+    expect(await reportedEvents()).toContain('command_duplicate_suppressed');
+  });
+
+  it('D1: a runtime with NO localStorage AT ALL reports undurable, not durable', async () => {
+    // writeLocalRing's `if (!store) return false`. Flipped to `true` it claims the
+    // record is durable on a runtime that has nowhere to put it — disarming the
+    // fail-closed refusal precisely where it is most needed, since a runtime with no
+    // localStorage is exactly the degraded environment the refusal exists for.
+    await connectAndCommit();
+    const realLocalStorage = (window as unknown as { localStorage: unknown }).localStorage;
+    (window as unknown as { localStorage: unknown }).localStorage = undefined;
+    await breakRingPreferences(() => Promise.reject(new Error('QuotaExceededError')));
+    idbThrowOn.write = true;
+
+    try {
+      triggerSocketEvent('command', { type: 'reload', timestamp: 'no-ls' }, vi.fn());
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(window.location.reload).not.toHaveBeenCalled();
+      expect(await reportedEvents()).toContain('command_refused_no_durable_dedupe');
+    } finally {
+      (window as unknown as { localStorage: unknown }).localStorage = realLocalStorage;
+    }
+  });
+
+  it('D1 NEGATIVE CONTROL: no localStorage but a healthy IndexedDB still executes', async () => {
+    // The absence of one home is not by itself a refusal — otherwise a runtime without
+    // localStorage could never take a reload at all, even with a working IDB.
+    await connectAndCommit();
+    const realLocalStorage = (window as unknown as { localStorage: unknown }).localStorage;
+    (window as unknown as { localStorage: unknown }).localStorage = undefined;
+    await breakRingPreferences(() => Promise.reject(new Error('QuotaExceededError')));
+
+    try {
+      triggerSocketEvent('command', { type: 'reload', timestamp: 'no-ls-idb' }, vi.fn());
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(window.location.reload).toHaveBeenCalledTimes(1);
+      expect(idbRing).toContain('reload@no-ls-idb');
+    } finally {
+      (window as unknown as { localStorage: unknown }).localStorage = realLocalStorage;
+    }
+  });
+
+  it.each([['reload'], ['restart'], ['clear_cache']])(
+    'D1: with NEITHER home accepting, %s is refused and reported',
+    async (type) => {
+      // All three members of CONTEXT_DESTROYING_COMMANDS, not just `reload`: the set is
+      // what the rule keys off, so membership should be pinned by the rule that depends
+      // on it rather than incidentally by an unrelated unkeyed-path test.
+      await connectAndCommit();
+      await killAllRingStores();
+      const ack = vi.fn();
+
+      triggerSocketEvent('command', { type, timestamp: `d1-${type}` }, ack);
+      await vi.advanceTimersByTimeAsync(50);
+
+      expect(window.location.reload).not.toHaveBeenCalled();
+      expect(ack).toHaveBeenCalledWith({ ok: true }); // never a nack, per the ack contract
+      const refused = (await reportedEventCalls()).find(c => c[0] === 'command_refused_no_durable_dedupe');
+      expect(refused).toBeDefined();
+      expect((refused![1] as { type?: string }).type).toBe(type);
+    },
+  );
+
+  it('D1: a WEDGED bridge with the other homes dead is also undurable — refused', async () => {
+    // Every other both-dead test uses a REJECTING Preferences write. A write that never
+    // SETTLES is a different shape and the one the 2s bound exists for, and it must not
+    // count as durable: `persist !== 'failed'` would treat the timeout as success and
+    // dispatch a reload with no terminator anywhere.
+    await connectAndCommit();
+    await breakRingPreferences(NEVER);
+    localStorageThrowOn.setItem = true;
+    idbThrowOn.write = true;
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'd1-wedged' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(2100); // past the persist bound
+
+    expect(window.location.reload).not.toHaveBeenCalled();
+    expect(await reportedEvents()).toContain('command_dedupe_persist_timeout');
+    expect(await reportedEvents()).toContain('command_refused_no_durable_dedupe');
+  });
+
+  it('D1: a WEDGED bridge does NOT mask a successful IndexedDB write', async () => {
+    // The composition hazard in the other direction. Waiting for BOTH async homes
+    // (Promise.all) would let a wedged bridge consume the entire budget and refuse a
+    // command whose record IndexedDB had already accepted — turning the independent
+    // store into a hostage of the broken one. First acceptance must win.
+    await connectAndCommit();
+    await breakRingPreferences(NEVER);
+    localStorageThrowOn.setItem = true;
+    // IndexedDB stays healthy.
+
+    triggerSocketEvent('command', { type: 'reload', timestamp: 'd1-idb-wins' }, vi.fn());
+    await vi.advanceTimersByTimeAsync(50); // well INSIDE the 2s bound
+
+    expect(window.location.reload).toHaveBeenCalledTimes(1);
+    expect(idbRing).toContain('reload@d1-idb-wins');
+    expect(await reportedEvents()).not.toContain('command_refused_no_durable_dedupe');
   });
 
   it('D1: the UNKEYABLE context-destroying command is refused on the same rule', async () => {
     // This path needs it more than the keyed one: with no timestamp there is no exact
     // key to fall back on, so an undurable synthetic record leaves nothing at all.
     await connectAndCommit();
-    await killBothRingStores();
+    await killAllRingStores();
     const ack = vi.fn();
 
     triggerSocketEvent('command', { type: 'clear_cache' }, ack); // no timestamp
@@ -7548,7 +8230,7 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     // or `reboot` costs one wasted execution, not the device, so declining those would
     // be pure loss — the operator's command dropped for no safety gain.
     await connectAndCommit();
-    await killBothRingStores();
+    await killAllRingStores();
     const { reportEvent } = await import('./crash-reporting');
     (reportEvent as Mock).mockClear();
     const ack = vi.fn();
@@ -7558,7 +8240,9 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
 
     expect(await reportedEvents()).toContain('command_unsupported'); // it RAN
     expect(await reportedEvents()).not.toContain('command_refused_no_durable_dedupe');
-    expect(ack).toHaveBeenCalledWith({ ok: true });
+    // `reboot` is never-executable, so it carries the unsupported status too — the
+    // fail-closed refusal and the unsupported status are independent things.
+    expect(ack).toHaveBeenCalledWith({ ok: true, status: 'unsupported' });
   });
 
   it('D1: the IN-MEMORY ring still suppresses a same-process replay while both stores are dead', async () => {
@@ -7566,7 +8250,7 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     // replay ACROSS a reload needs; a replay within this process is covered by the
     // in-memory entry, which is added whether or not any store accepted it.
     await connectAndCommit();
-    await killBothRingStores();
+    await killAllRingStores();
 
     // A harmless command, so the first delivery genuinely executes and is recorded.
     triggerSocketEvent('command', { type: 'reboot', timestamp: 'd1-mem' }, vi.fn());

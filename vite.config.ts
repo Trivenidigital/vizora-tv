@@ -213,6 +213,20 @@ export default defineConfig(({ mode }) => {
     test: {
       environment: 'node',
       include: ['src/**/*.spec.ts'],
+      // Raised from vitest's 5s default because delivery-ack-boundary.spec.ts drives a
+      // REAL Socket.IO server over a real loopback socket, on real time — the one suite
+      // whose duration tracks machine load rather than fake-clock advancement. At 5s it
+      // had ~2s of slack over its own 3s waitFor budget, and a slow run (23.8s vs 16.5s
+      // for its neighbour) is exactly the regime that eats 2s, which is how a loaded
+      // machine manufactures a red build out of correct code.
+      //
+      // The two budgets are a PAIR: every helper deadline in that suite must stay
+      // comfortably under this, so a failure reports what never happened instead of an
+      // anonymous "Test timed out". 30s also keeps nextConnection's 20s bound — which
+      // used to exceed the 5s test timeout and could never have reported its own
+      // message — genuinely reachable.
+      testTimeout: 30_000,
+      hookTimeout: 30_000,
     },
     build: {
       outDir: isTvBuild ? 'dist-tv' : 'dist',

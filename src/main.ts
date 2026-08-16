@@ -34,6 +34,7 @@ import {
   platformIdentifierPrefix,
 } from './platform';
 import { SecureStorage } from './secure-storage';
+import { CommandRing } from './command-ring-store';
 import { transformContentUrl, injectContentSecurityPolicy, computePlaylistSignature, shouldApplyContent, parseCrashLoopMarker, CRASH_LOOP_MARKER_KEY } from './utils';
 import { ScreenStateMachine } from './screen-state';
 import { initCrashReporting, setCrashReportingDevice, reportEvent, isCrashReportingEnabled } from './crash-reporting';
@@ -303,7 +304,53 @@ class VizoraAndroidTV {
    * changes.
    */
   private static readonly COMMAND_DEDUPE_LOCAL_KEY = 'vizora_seen_command_keys';
+  /**
+   * PLATFORM CAVEAT — read this before deleting any of the three ring homes as
+   * "redundant". Hoisted here from loadSeenCommands because that is exactly where
+   * nobody looks before simplifying a write.
+   *
+   * The ring has THREE homes and they are not interchangeable:
+   *
+   *   localStorage (COMMAND_DEDUPE_LOCAL_KEY) — SYNCHRONOUS. The only one that has
+   *     certainly landed before window.location.reload() can tear the context down,
+   *     and the only one that needs no Capacitor bridge.
+   *   Preferences (COMMAND_DEDUPE_PREF_KEY) — durable across a webview storage clear
+   *     that takes localStorage with it. On ANDROID this is native SharedPreferences,
+   *     genuinely independent storage.
+   *   IndexedDB (command-ring-store.ts) — the only home independent of localStorage
+   *     on the TV runtimes.
+   *
+   * The reason the third exists: on Tizen/webOS, Capacitor falls through to web
+   * implementations, and @capacitor/preferences 6.0.4's IS window.localStorage under a
+   * `CapacitorStorage.` prefix (dist/esm/web.js, `get impl()`). So on the platforms
+   * CLAUDE.md lists as shipped, the first two homes are ONE store sharing one ~5MB
+   * budget — which SecureStorageWeb and last_playlist also draw on — and a single
+   * QuotaExceededError removes the only terminator a command replay loop has.
+   * IndexedDB has its own far larger quota and is already proven on those exact
+   * runtimes (TvCacheManager caches all content through it).
+   *
+   * Two homes looked like two chances and were not. Deleting one because the other
+   * "already covers it" re-opens that.
+   */
   private static readonly COMMAND_DEDUPE_MAX = 20;
+  /**
+   * Slots inside the ring that ORDINARY command volume can never take.
+   *
+   * The keyed branch records every command that carries a key, not just the
+   * context-destroying ones, so a plain FIFO ring let ordinary traffic evict the one
+   * record whose loss actually costs something. Constructible, not theoretical: a
+   * `reload` is dispatched and its ack is lost, the server requeues `reload@T0`, and
+   * before the reconnect delivers the replay, 20 ordinary keyed commands
+   * (`push_content`, `qr-overlay-update`, `clear_override`) arrive live and push it
+   * out. The replay then lands against a ring that no longer holds it and reloads
+   * again — with, once more, no record. Narrow window, unbounded consequence.
+   *
+   * 8 of 20: comfortably more context-destroying commands than any real operator
+   * sequence produces back to back, while still leaving 12 slots for the ordinary
+   * traffic that is the common case. Ordinary keys are only ever evicted by other
+   * ordinary keys once this reserve is in use.
+   */
+  private static readonly COMMAND_DEDUPE_CD_RESERVE = 8;
   /**
    * Ceiling on a dedupe key. `type` and `timestamp` both arrive from the server
    * unvalidated and the ring is JSON-stringified into two stores, so an oversized
@@ -1906,7 +1953,9 @@ class VizoraAndroidTV {
       // touching either half. Duplicate suppression lives inside handleCommand,
       // AFTER this line, so a suppressed replay is still acked — otherwise the
       // server just requeues the thing we deliberately ignored.
-      VizoraAndroidTV.ackDelivery(ack);
+      // The status rides along with the SAME positive ack, computed from the type
+      // alone so it costs nothing and cannot delay the frame — see commandAckStatus.
+      VizoraAndroidTV.ackDelivery(ack, VizoraAndroidTV.commandAckStatus(command));
       console.log('[Vizora] Received command:', command);
       void this.handleCommand(command).catch((error) => {
         // The receipt is already sent and stays sent: it reports delivery, not
@@ -2719,16 +2768,30 @@ class VizoraAndroidTV {
   //     ack emitted after that call has no chance at all of leaving the device.
   //
   //     Ordering is NECESSARY BUT NOT SUFFICIENT, and the difference matters — do
-  //     not read this rule as closing the loop on its own. On an established
-  //     WebSocket the emit does reach ws.send() synchronously, but engine.io-client's
-  //     flush() bails when `!transport.writable` or `this.upgrading`
-  //     (engine.io-client socket.js:342-346), leaving the frame sitting in
-  //     writeBuffer — which window.location.reload() then discards. On the polling
-  //     fallback the write is an XHR POST that the reload aborts. So acking first
-  //     BUYS a chance to flush; it does not guarantee delivery.
+  //     not read this rule as closing the loop on its own. Scoped to what THIS build
+  //     can actually do (socket.io-client 4.8.3 / engine.io-client 6.6.4, verified in
+  //     node_modules rather than assumed):
+  //
+  //       - `upgrading` cannot be true: `transports` lists websocket FIRST, so the
+  //         connection opens on websocket and there is no polling→websocket upgrade.
+  //       - The polling XHR-POST path is not reached either. `polling` IS in the
+  //         transports list, but falling back to it requires `tryAllTransports`
+  //         (engine.io-client socket.js:512, `_onError`), which this build never sets
+  //         and which defaults to FALSE — a failed websocket open reconnects on
+  //         websocket instead of shifting transport. Note the reason: it is the
+  //         option, NOT the transports list. Setting `tryAllTransports: true` or
+  //         reordering that list makes the XHR path live again.
+  //       - What remains reachable is `!transport.writable` (socket.js:342-346) — a
+  //         send already in flight — which leaves the frame in writeBuffer for
+  //         window.location.reload() to discard.
+  //
+  //     So on this build the ack normally does reach ws.send() synchronously before
+  //     handleCommand begins. It is still BEST-EFFORT, not a guarantee: the last hop
+  //     — whether the bytes leave the machine before navigation tears the context
+  //     down — is browser behaviour, not something the spec promises us.
   //
   //     The thing that actually terminates the loop is the PERSISTED dedupe ring
-  //     (loadSeenCommands / rememberCommand): when the ack is lost, the server times
+  //     (loadSeenCommands / recordCommandDurably): when the ack is lost, the server times
   //     out at 10s and requeues, the device reconnects and the identical
   //     (type, timestamp) arrives again — and the on-disk ring is what stops the
   //     second execution. Deleting the ring on the strength of this ordering rule
@@ -2743,11 +2806,51 @@ class VizoraAndroidTV {
   // ack-wrapped, so every call site goes through this helper rather than invoking
   // `ack` directly.
 
+  /**
+   * The command types this client can actually ACT on. Anything else — `reboot`,
+   * `update`, `screenshot` and any type we do not know — reaches the switch and does
+   * nothing but log, so it must not ack indistinguishably from a working command.
+   *
+   * MUST mirror the actionable cases in handleCommand's switch. The pairing is covered
+   * by a test that drives every type through the socket and reads the ack, so adding a
+   * case without adding it here fails loudly rather than silently reporting
+   * "unsupported" for something that works.
+   */
+  private static readonly ACTIONABLE_COMMANDS = new Set([
+    'reload', 'restart', 'clear_cache', 'unpair',
+    'update_config', 'push_content', 'qr-overlay-update', 'clear_override',
+  ]);
+
+  /**
+   * `'unsupported'` for a command this client will not act on, undefined otherwise.
+   *
+   * Why this exists: `reboot`/`update`/`screenshot`/unknown acked `{ ok: true }` and
+   * did nothing, and the dashboard renders that in the same green as a working reload
+   * — a permanent, 100%-reproducible false positive telling an operator their action
+   * landed when it never will. Our reportEvent telemetry goes to US, not to the person
+   * who pressed the button.
+   *
+   * Still `ok: true`, never a nack: a nack means "retry this" and the server has no
+   * give-up (see rule 1), so nacking an unsupported type would loop it forever.
+   * Verified wire-safe against the deployed gateway rather than assumed — getAckError
+   * (device.gateway.ts:254-256) treats an ack as an error ONLY on `ok === false` and
+   * reads nothing else off the object, so the extra field is ignored today and gives
+   * the backend something to start reading when it is ready to.
+   */
+  private static commandAckStatus(command: { type?: unknown }): 'unsupported' | undefined {
+    const type = command?.type;
+    return typeof type === 'string' && VizoraAndroidTV.ACTIONABLE_COMMANDS.has(type)
+      ? undefined
+      : 'unsupported';
+  }
+
   /** Answer a delivery-guaranteed emit. Positive, once, and never throws. */
-  private static ackDelivery(ack: unknown): void {
+  private static ackDelivery(ack: unknown, status?: 'unsupported'): void {
     if (typeof ack !== 'function') return; // legacy / unacked emit — rule above
     try {
-      (ack as (response: { ok: boolean }) => void)({ ok: true });
+      const response: { ok: boolean; status?: string } = { ok: true };
+      if (status) response.status = status;
+      (ack as (response: { ok: boolean; status?: string }) => void)(response);
     } catch (error) {
       // A throwing callback must not take the handler down with it, and must not
       // tempt a retry: from the server's side the ack either arrived or it did not.
@@ -2758,26 +2861,47 @@ class VizoraAndroidTV {
   // ==================== COMMANDS ====================
 
   /**
-   * Idempotency key for a delivered command: `(type, timestamp)`.
+   * Idempotency key for a delivered command: `commandId` when the server sent one,
+   * `(type, timestamp)` otherwise.
    *
-   * NOT `commandId`. That exists only on fleet-originated commands — the
-   * POST /api/push/content path constructs `{ type, payload }` with no id at all,
-   * and the realtime DeviceCommand type does not declare one. `timestamp` is
-   * stamped ONCE server-side and the identical object is requeued verbatim, so it
-   * is stable across every replay and every reconnect, which is exactly the
-   * property a dedupe key needs.
+   * Both halves are needed, and the order matters.
    *
-   * Returns null when the command carries no timestamp: an unkeyable command is
-   * EXECUTED (never suppressed on a guess) — and, as always, still acked. That is a
-   * cross-repo invariant failing OPEN, so handleCommand reports it whenever the
-   * command is one that destroys the context; see the `else if` there.
+   * `commandId` is the IDENTITY of an operator action: fleet.service.ts:91 mints one
+   * `crypto.randomUUID()` per action and passes it in the command shape (:137), and
+   * sendCommand spreads the command before queueing/emitting it
+   * (device.gateway.ts:2299), so it survives requeue verbatim. Preferring it fixes a
+   * real collision: `(type, timestamp)` ignores `payload`, and the timestamp is an ISO
+   * string with millisecond resolution, so two DISTINCT `push_content` commands issued
+   * in the same millisecond produce the identical key — and the second is suppressed
+   * and acked green, i.e. silently dropped content.
+   *
+   * `(type, timestamp)` stays as the fallback because it is all the other producer
+   * has: the POST /api/push/content path (realtime app.controller.ts) constructs
+   * `{ type, payload }` with no id, and sendCommand stamps `timestamp` onto it.
+   * Dropping the fallback would leave that whole path unkeyed.
+   *
+   * Returns null when neither is usable: an unkeyable command is EXECUTED (never
+   * suppressed on a guess) — and, as always, still acked. That is a cross-repo
+   * invariant failing OPEN, so handleCommand reports it whenever the command is one
+   * that destroys the context; see the `else if` there.
    */
-  private static commandDedupeKey(command: { type?: unknown; timestamp?: unknown }): string | null {
+  private static commandDedupeKey(
+    command: { type?: unknown; timestamp?: unknown; commandId?: unknown },
+  ): string | null {
     const type = command?.type;
+    const commandId = command?.commandId;
     const timestamp = command?.timestamp;
     if (typeof type !== 'string' || !type) return null;
-    if (typeof timestamp !== 'string' && typeof timestamp !== 'number') return null;
-    const key = `${type}@${timestamp}`;
+    // `#` and `@` are distinct separators so the two key families can never alias each
+    // other in a ring that holds both.
+    let key: string;
+    if (typeof commandId === 'string' && commandId) {
+      key = `${type}#${commandId}`;
+    } else if (typeof timestamp === 'string' || typeof timestamp === 'number') {
+      key = `${type}@${timestamp}`;
+    } else {
+      return null;
+    }
     if (key.length > VizoraAndroidTV.COMMAND_DEDUPE_KEY_MAX_LEN) {
       // Unbounded, this is a way to blow the storage quota from the wire: the ring is
       // JSON-stringified into Preferences AND localStorage, and on the TV runtimes a
@@ -2799,14 +2923,16 @@ class VizoraAndroidTV {
    * being dispatched at. Null when it would not fit the same length bound a real key
    * has — `type` is unvalidated wire data, and this key goes into the same two stores.
    */
-  private static syntheticUnkeyedKey(type: string, at: number): string | null {
-    const key = `${type}${VizoraAndroidTV.COMMAND_UNKEYED_MARK}${at}`;
-    if (key.length > VizoraAndroidTV.COMMAND_DEDUPE_KEY_MAX_LEN) {
-      console.warn(`[Vizora] Synthetic dedupe key too long (${key.length} chars) — not recorded`);
-      reportEvent('command_dedupe_key_oversize', { type: type.slice(0, 64), length: key.length });
-      return null;
-    }
-    return key;
+  private static syntheticUnkeyedKey(type: string, at: number): string {
+    // No length bound here, deliberately, and this does NOT weaken the one on
+    // commandDedupeKey. That bound exists because `timestamp` is unvalidated wire data
+    // and an oversized key is a way to blow the storage quota from the network. A
+    // synthetic key contains no wire data at all: the caller reaches this only for a
+    // `type` it has already matched against CONTEXT_DESTROYING_COMMANDS, so the longest
+    // possible result is `clear_cache` + the 10-char mark + a 13-digit epoch = 34
+    // chars. A bound that cannot fire is a branch nobody can test and everybody has to
+    // reason about.
+    return `${type}${VizoraAndroidTV.COMMAND_UNKEYED_MARK}${at}`;
   }
 
   /**
@@ -2869,6 +2995,25 @@ class VizoraAndroidTV {
       reportEvent('command_dedupe_ring_load_failed', { store: 'localStorage', error: String(error) });
     }
 
+    // The independent home on the TV runtimes — bounded like the bridge read, since a
+    // blocked IndexedDB open would otherwise hang boot.
+    try {
+      const fromIdb = await Promise.race([
+        CommandRing.read(),
+        this.timeoutAfter(VizoraAndroidTV.BRIDGE_READ_TIMEOUT_MS),
+      ]);
+      if (fromIdb !== 'timeout' && fromIdb) {
+        for (const k of fromIdb) {
+          if (typeof k === 'string' && merged.indexOf(k) === -1) merged.push(k);
+        }
+      } else if (fromIdb === 'timeout') {
+        reportEvent('command_dedupe_ring_load_failed', { store: 'indexeddb', error: 'timeout' });
+      }
+    } catch (error) {
+      console.warn('[Vizora] Could not restore the IndexedDB command dedupe ring:', error);
+      reportEvent('command_dedupe_ring_load_failed', { store: 'indexeddb', error: String(error) });
+    }
+
     try {
       const stored = await this.boundedPrefsGet(VizoraAndroidTV.COMMAND_DEDUPE_PREF_KEY);
       if (stored !== 'timeout') absorb(stored.value);
@@ -2881,9 +3026,12 @@ class VizoraAndroidTV {
 
     // Bounded on restore as well as on write: a ring that grew (an older build, a
     // hand-edited store, or the union of two copies that diverged) must not come
-    // back unbounded and be written straight back out at full size.
+    // back unbounded and be written straight back out at full size. Through the SAME
+    // prune as the write path — restoring with a plain tail-slice would drop exactly
+    // the context-destroying records the reserve exists to keep, at exactly the moment
+    // they matter most: the boot right after the reload whose replay is inbound.
     if (merged.length > 0) {
-      this.seenCommandKeys = merged.slice(-VizoraAndroidTV.COMMAND_DEDUPE_MAX);
+      this.seenCommandKeys = VizoraAndroidTV.pruneRing(merged);
     }
   }
 
@@ -2903,11 +3051,55 @@ class VizoraAndroidTV {
    * localStorage web implementation on Tizen/webOS) fails EVERY subsequent write the
    * same way — so the loop, once started, has nothing left to stop it.
    */
+  /**
+   * Is this ring entry a record of a context-destroying dispatch?
+   *
+   * Reads the type off the key itself rather than tracking it separately, so it works
+   * identically for a live entry and one restored from disk by an older build. Both
+   * key families put the type first: `type@timestamp`, `type#commandId` and the
+   * synthetic `type@~unkeyed:ms`.
+   */
+  private static isContextDestroyingKey(key: string): boolean {
+    const cut = key.search(/[@#]/);
+    return cut > 0 && VizoraAndroidTV.CONTEXT_DESTROYING_COMMANDS.has(key.slice(0, cut));
+  }
+
+  /**
+   * Trim the ring to COMMAND_DEDUPE_MAX while honouring the reserve — see
+   * COMMAND_DEDUPE_CD_RESERVE for why a plain FIFO was not safe here. Newest entries
+   * win within each class, and the surviving entries keep their original order.
+   */
+  private static pruneRing(keys: string[]): string[] {
+    if (keys.length <= VizoraAndroidTV.COMMAND_DEDUPE_MAX) return keys;
+    const max = VizoraAndroidTV.COMMAND_DEDUPE_MAX;
+    const destroying = keys.filter(k => VizoraAndroidTV.isContextDestroyingKey(k));
+    const ordinary = keys.filter(k => !VizoraAndroidTV.isContextDestroyingKey(k));
+    // Ordinary traffic may use everything the reserve does not claim; the reserve only
+    // claims what context-destroying records actually need.
+    const ordinarySlots = Math.min(
+      ordinary.length,
+      max - Math.min(destroying.length, VizoraAndroidTV.COMMAND_DEDUPE_CD_RESERVE),
+    );
+    // …and context-destroying records take the rest, which is all of it when there is
+    // no ordinary traffic to make room for.
+    const destroyingSlots = Math.min(destroying.length, max - ordinarySlots);
+    // `newest(xs, 0)` rather than `xs.slice(-0)`: -0 === 0, so slice(-0) returns the
+    // WHOLE array instead of none of it. That silently inverts a zero budget into an
+    // unbounded one — the ring is JSON-stringified into two stores on every command, so
+    // "keep everything" is the failure this bound exists to prevent. (Found by a
+    // mutation that should have gone red and did not: with the reserve set to 0 the
+    // reserved records survived anyway, via exactly this path.)
+    const newest = (xs: string[], n: number) => (n > 0 ? xs.slice(-n) : []);
+    const kept = new Set([
+      ...newest(destroying, destroyingSlots),
+      ...newest(ordinary, ordinarySlots),
+    ]);
+    return keys.filter(k => kept.has(k));
+  }
+
   private rememberCommandLocally(key: string): boolean {
     this.seenCommandKeys.push(key);
-    if (this.seenCommandKeys.length > VizoraAndroidTV.COMMAND_DEDUPE_MAX) {
-      this.seenCommandKeys = this.seenCommandKeys.slice(-VizoraAndroidTV.COMMAND_DEDUPE_MAX);
-    }
+    this.seenCommandKeys = VizoraAndroidTV.pruneRing(this.seenCommandKeys);
 
     // SYNCHRONOUS durable write FIRST, before anything asynchronous can be raced or
     // wedged. This is the write that actually terminates the replay loop: it has
@@ -2916,6 +3108,22 @@ class VizoraAndroidTV {
     // unrecorded. The Preferences write stays — it is the copy that survives a webview
     // storage clear — but it is no longer the only one.
     return this.writeLocalRing();
+  }
+
+  /**
+   * Persist the ring to IndexedDB — the one home that is genuinely independent of
+   * localStorage on the TV runtimes, where Preferences IS localStorage. Never rejects;
+   * reports what it returns. See command-ring-store.ts for why it exists.
+   */
+  private async persistCommandRingToIdb(): Promise<boolean> {
+    try {
+      await CommandRing.write(this.seenCommandKeys);
+      return true;
+    } catch (error) {
+      console.warn('[Vizora] Could not persist the command dedupe ring to IndexedDB:', error);
+      reportEvent('command_dedupe_idb_persist_failed', { error: String(error) });
+      return false;
+    }
   }
 
   /** Persist the ring through the bridge. Never rejects; reports what it returns. */
@@ -2951,11 +3159,30 @@ class VizoraAndroidTV {
    */
   private async recordCommandDurably(key: string, type: string): Promise<boolean> {
     const localAccepted = this.rememberCommandLocally(key);
-    // BOUNDED. A wedged Capacitor bridge leaves Preferences.set pending forever;
-    // without the bound the operator's command would never run at all, with `{ ok: true }`
-    // already sent and no rejection to report because the promise does not settle.
+    // BOUNDED, and the two asynchronous homes are raced TOGETHER against one bound
+    // rather than sequentially: a wedged Capacitor bridge must not spend the whole
+    // budget before IndexedDB is even tried. Without the bound the operator's command
+    // would never run at all, with `{ ok: true }` already sent and no rejection to
+    // report because the promise does not settle.
+    // FIRST ACCEPTANCE WINS, and neither home can hold up the other. `Promise.all` was
+    // wrong here: it waits for BOTH, so a wedged Capacitor bridge — the exact failure
+    // the bound exists for — would swallow the whole budget and mask an IndexedDB
+    // write that had already succeeded, refusing a command that was in fact durable.
+    // Resolve true the moment either lands; false only once both have failed.
+    const anyHomeAccepted = (a: Promise<boolean>, b: Promise<boolean>): Promise<boolean> =>
+      new Promise<boolean>((resolve) => {
+        let outstanding = 2;
+        const settle = (accepted: boolean) => {
+          if (accepted) resolve(true);
+          else if (--outstanding === 0) resolve(false);
+        };
+        void a.then(settle);
+        void b.then(settle);
+      });
+
     const persist = await Promise.race([
-      this.persistCommandRing().then((ok): 'persisted' | 'failed' => (ok ? 'persisted' : 'failed')),
+      anyHomeAccepted(this.persistCommandRing(), this.persistCommandRingToIdb())
+        .then((ok): 'persisted' | 'failed' => (ok ? 'persisted' : 'failed')),
       this.timeoutAfter(VizoraAndroidTV.COMMAND_DEDUPE_PERSIST_TIMEOUT_MS),
     ]);
     if (persist === 'timeout') {
@@ -3069,9 +3296,8 @@ class VizoraAndroidTV {
 
       const synthetic = VizoraAndroidTV.syntheticUnkeyedKey(command.type, now);
       // Same fail-closed rule as the keyed path above, for the same reason — and this
-      // path needs it more, since an unkeyable command has no exact key to fall back
-      // on. A key we could not even build counts as undurable.
-      const durable = synthetic !== null && await this.recordCommandDurably(synthetic, command.type);
+      // path needs it more, since an unkeyable command has no exact key to fall back on.
+      const durable = await this.recordCommandDurably(synthetic, command.type);
       if (!durable) {
         this.refuseUndurableCommand(command.type);
         return; // still acked by the caller
