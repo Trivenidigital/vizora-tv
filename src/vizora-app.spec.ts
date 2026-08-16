@@ -2541,6 +2541,20 @@ describe('VizoraAndroidTV', () => {
       // Push content commits after the 1500ms readiness wait
       await vi.advanceTimersByTimeAsync(1600);
       expect((domElements.get('content-container')!.appendChild as Mock).mock.calls.length).toBeGreaterThan(0);
+
+      // AND THE SCREEN ACTUALLY CHANGED. appendChild fires one line BEFORE the guarded
+      // transition('playing'), so asserting only the append leaves canPlay()'s
+      // `|| temporaryContent != null` arm unpinned — delete that arm and this test stays
+      // green while an emergency push renders INVISIBLY underneath "Waiting for
+      // content…", with the dashboard reporting success. There is no playlist in this
+      // test, so that arm is the ONLY thing making the transition legal.
+      //
+      // This is the pairing-guard defect's exact shape: an assertion that stopped one
+      // line short of the transition it was really about.
+      const visible = ['content-screen', 'holding-screen'].filter(
+        id => !domElements.get(id)!._classListSet.has('hidden'),
+      );
+      expect(visible).toEqual(['content-screen']);
     });
 
     it('sets resume timer for duration minutes', async () => {
@@ -7654,6 +7668,58 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     expect(ioFactory.mock.calls.length).toBeGreaterThan(0);
   });
 
+  it('G1x: the boot bound is not pinned by the wedge tests — a slow-but-healthy boot must survive it', async () => {
+    // The wedge tests use a bridge that never settles, so they stay green for ANY bound
+    // — 20s, 5s, 500ms. That leaves the VALUE unpinned in the direction that has blast
+    // radius: lowered under a healthy-but-slow boot, the timeout fires, the machine goes
+    // to `recovering`, and "Starting up — retrying…" lands over live content until the
+    // retry completes. So drive both sides of the bound with a boot that DOES settle.
+    //
+    // At bound − ε the boot must complete untouched.
+    secureStorageStore.clear();
+    const { SecureStorage } = await import('./secure-storage');
+    let slowed = false;
+    (SecureStorage.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      // ONE slow call, not every call: the boot makes several, so delaying each would
+      // exceed the bound cumulatively and test the wrong thing.
+      if (slowed) return { value: secureStorageStore.get(key) ?? null };
+      slowed = true;
+      await new Promise<void>(r => setTimeout(r, 15_000)); // slow, but inside 20s
+      return { value: secureStorageStore.get(key) ?? null };
+    });
+
+    await importFresh();
+    await vi.advanceTimersByTimeAsync(16_000);
+    await waitUntil(
+      'the slow-but-healthy boot to finish',
+      () => domElements.get('pairing-code')!.textContent === 'ABCD1234',
+      { tickMs: 1000 },
+    );
+
+    expect(await reportedEvents()).not.toContain('boot_timeout');
+    expect(visibleScreens()).toEqual(['pairing-screen']);
+  });
+
+  it('G1x NEGATIVE CONTROL: a boot slower than the bound DOES trip it', async () => {
+    // The other side of the same bound, so "not tripped" above cannot pass by the
+    // timeout being dead. Together these two pin the VALUE, not just the mechanism.
+    secureStorageStore.clear();
+    const { SecureStorage } = await import('./secure-storage');
+    let slowed = false;
+    (SecureStorage.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      if (slowed) return { value: secureStorageStore.get(key) ?? null };
+      slowed = true;
+      await new Promise<void>(r => setTimeout(r, 25_000)); // past 20s
+      return { value: secureStorageStore.get(key) ?? null };
+    });
+
+    await importFresh();
+    await vi.advanceTimersByTimeAsync(21_000);
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+
+    expect(await reportedEvents()).toContain('boot_timeout');
+  });
+
   it('G1x NEGATIVE CONTROL: a healthy bridge boots without ever arming the boot timeout', async () => {
     // Proves the bound is a bound and not a delay every device now pays, and that the
     // recovery above belongs to the retry rather than to something that would have
@@ -7696,6 +7762,76 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
       .filter((u: string) => u.includes('/pairing/request'));
     expect(posts.length).toBeGreaterThan(0);
     expect(posts.every((u: string) => u.startsWith('https://stored.example.com'))).toBe(true);
+  });
+
+  // ======================================================================
+  // R1. BOTH HEALTHY ROUTES OUT OF SUSPENSION
+  // ======================================================================
+  //
+  // What survived the latch revert is fail-closed on the entitlement boundary WITHOUT
+  // the stranding hazard: only a device ALREADY suspended revalidates at all, so a
+  // never-suspended device cannot be held by it, and the hold is in memory so a reboot
+  // clears it. That leaves exactly two ways a suspended tenant comes back, and both are
+  // healthy-path sequences that no test covered — the same gap that produced the
+  // stranding defects. A one-notch tightening of either would strand a resumed tenant
+  // silently, so both are pinned here.
+
+  const suspendWhileConnected = async () => {
+    triggerSocketEvent('tenant:suspended');
+    await waitUntil('the hold', () => visibleScreens().includes('holding-screen'), { tickMs: 100 });
+    expect(findCreatedElements('img').some(i => i.src.includes('c1.jpg'))).toBe(true); // it HAD content
+  };
+
+  it('R1: ROUTE ONE — an operator unsuspends while connected (tenant:resumed) and content returns', async () => {
+    await connectAndCommit();
+    await suspendWhileConnected();
+    const imagesWhileHeld = findCreatedElements('img').length;
+
+    triggerSocketEvent('tenant:resumed');
+    await waitUntil('playback to resume', () => visibleScreens().includes('content-screen'), { tickMs: 1000 });
+
+    expect(visibleScreens()).toEqual(['content-screen']);
+    expect(findCreatedElements('img').length).toBeGreaterThan(imagesWhileHeld); // it re-rendered
+    expect(await reportedEvents()).toContain('tenant_unsuspended');
+  });
+
+  it('R1: ROUTE TWO — a reconnect whose auth-check answers 200 releases the hold', async () => {
+    // The route that matters when the operator unsuspends while the device is OFFLINE:
+    // there is no live `tenant:resumed` to receive, so the reconnect revalidation is the
+    // only way back. It re-probes on EVERY reconnect, so a transient non-200 only holds
+    // until the next one.
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 403, data: {} }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    await connectAndCommit();
+    await suspendWhileConnected();
+
+    // The tenant is genuinely resumed server-side; the device only learns on reconnect.
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 200, data: {} }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    triggerSocketEvent('connect');
+    await waitUntil('playback to resume', () => visibleScreens().includes('content-screen'), { tickMs: 1000 });
+
+    expect(visibleScreens()).toEqual(['content-screen']);
+    expect(await reportedEvents()).toContain('tenant_unsuspended');
+  });
+
+  it('R1 NEGATIVE CONTROL: a reconnect whose auth-check still says 403 keeps the hold', async () => {
+    // The boundary this is fail-closed ON. If a reconnect released the hold without a
+    // 200, the whole revalidation would be the fail-open the wave started from.
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status: 403, data: {} }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    await connectAndCommit();
+    await suspendWhileConnected();
+
+    triggerSocketEvent('connect');
+    await vi.advanceTimersByTimeAsync(2000);
+
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    expect(await reportedEvents()).toContain('tenant_suspension_confirmed');
+    expect(await reportedEvents()).not.toContain('tenant_unsuspended');
   });
 
   // ======================================================================
