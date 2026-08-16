@@ -110,11 +110,27 @@ export function crashReportingOptions(dsn: string): Sentry.BrowserOptions {
 }
 
 export function initCrashReporting(): void {
-  // TRIMMED, like the build side already does. A whitespace-only value is truthy, so
-  // `if (!dsn)` waved it through and Sentry then dropped every event.
-  const dsn = import.meta.env.VITE_SENTRY_DSN?.trim();
-  if (!dsn) {
+  // The raw read is DELIBERATELY on its own line and deliberately untransformed.
+  //
+  // Vite statically replaces `import.meta.env.VITE_SENTRY_DSN` with a literal, so with
+  // no DSN configured this reads `if (!undefined) return;` — everything below is dead
+  // code and the whole @sentry/browser SDK is tree-shaken out. Writing it as
+  // `VITE_SENTRY_DSN?.trim()` defeats that: the minifier can no longer prove the
+  // branch is dead, Sentry.init survives, and the SDK lands in every build. Measured,
+  // not guessed — 111.05 kB to 201.49 kB, +90.4 kB uncompressed (~29 kB gzip) on a
+  // build that cannot send a single event, for TV devices with frozen engines.
+  //
+  // So: static read first for the DCE, trim second for the semantics. A whitespace-only
+  // DSN is truthy and used to sail past `if (!dsn)` into an init that silently discards
+  // everything, which is the bug the trim exists for — both properties, no trade.
+  const rawDsn = import.meta.env.VITE_SENTRY_DSN;
+  if (!rawDsn) {
     console.log('[Vizora] Crash reporting disabled (no VITE_SENTRY_DSN)');
+    return;
+  }
+  const dsn = rawDsn.trim();
+  if (!dsn) {
+    console.log('[Vizora] Crash reporting disabled (VITE_SENTRY_DSN is blank)');
     return;
   }
 

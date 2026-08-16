@@ -173,6 +173,27 @@ describe('ScreenStateMachine', () => {
     expect(seen.map(r => `${r.from}->${r.to}`)).toEqual(['pairing->holding']);
   });
 
+  it('C6c: RECOVERING is the same door as HOLDING and is guarded the same way', () => {
+    // `recovering` and `holding` render the SAME div (STATE_SCREEN above), so guarding
+    // only one leaves the other able to replace a live pairing code with "Starting up
+    // — retrying…". startInit's catch transitions to `recovering` on every failed init
+    // attempt, so this is a real door, not a theoretical one.
+    let unpaired = true;
+    const m = new ScreenStateMachine({ canPair: () => unpaired, canPlay: () => false });
+    m.transition('pairing', 'pairing_requested');
+
+    // Unpaired: nothing to recover FOR, the pairing code keeps the screen.
+    expect(m.transition('recovering', 'init_failure')).toBe(false);
+    expect(m.state).toBe('pairing');
+    expect(visible()).toEqual(['pairing-screen']);
+
+    // Paired: the same transition is allowed, exactly as for holding.
+    unpaired = false;
+    expect(m.transition('recovering', 'init_failure')).toBe(true);
+    expect(m.state).toBe('recovering');
+    expect(visible()).toEqual(['holding-screen']);
+  });
+
   it('C6 NEGATIVE CONTROL: holding is still reachable from every other state', () => {
     // Same layer. Proves the guard is scoped to the pairing screen and did not turn
     // the never-black terminal into an unreachable state.
