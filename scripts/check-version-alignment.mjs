@@ -49,12 +49,38 @@ for (const c of failures) {
   console.error(`MISMATCH ${c.where}: found ${c.found ?? '<none>'}, expected ${expected} (from package.json)`);
 }
 
-// versionCode is not derived from the version string, but it must move when the
+// versionCode is not derived from the version string, but it must MOVE when the
 // version does, or Play rejects the upload and a sideloaded install-over becomes
 // two distinct binaries claiming one identity.
+//
+// Checking only that a versionCode EXISTS was the defect this comment already
+// described: `versionName "1.3.16"` alongside `versionCode 10145` passed green,
+// which is precisely the two-binaries-one-identity case. The series is derivable
+// from the version — 1.3.14 -> 10144, 1.3.15 -> 10145 — so derive it and compare.
 const versionCode = gradle.match(/versionCode\s+(\d+)/)?.[1];
 if (!versionCode) {
   console.error('android/app/build.gradle has no versionCode.');
+  process.exit(1);
+}
+
+// Deliberately a MONOTONICITY check against the last published code, not a formula
+// derived from the version string. The historical series (1.3.14 -> 10144,
+// 1.3.15 -> 10145) has only ever varied in the patch digit, so any formula inferred
+// from it is a guess that happens to fit two points — and asserting an inferred
+// formula is how you get a check that is confidently wrong. Monotonicity is the
+// property Play actually enforces and the one install-over ordering depends on.
+//
+// Bump LAST_PUBLISHED_VERSION_CODE when a release is actually published, not when
+// it is prepared.
+const LAST_PUBLISHED_VERSION_CODE = 10145; // 1.3.15, live on customer devices
+
+if (Number(versionCode) <= LAST_PUBLISHED_VERSION_CODE) {
+  console.error(
+    `MISMATCH android/app/build.gradle versionCode: found ${versionCode}, which is not greater ` +
+      `than the last published ${LAST_PUBLISHED_VERSION_CODE}. Play rejects a non-increasing ` +
+      `versionCode, and a sideloaded install-over would produce two distinct binaries claiming ` +
+      `one identity.`,
+  );
   process.exit(1);
 }
 
