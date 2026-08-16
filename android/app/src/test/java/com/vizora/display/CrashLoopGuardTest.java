@@ -118,71 +118,157 @@ public class CrashLoopGuardTest {
         assertFalse(CrashLoopGuard.isLadderExhausted(new long[0]));
     }
 
-    // ---- window / decay --------------------------------------------------------------------
+    // ---- decay ------------------------------------------------------------------------------
 
     @Test
-    public void crashInsideWindowCompounds() {
+    public void crashBeforeTheAppCouldStayUpCompounds() {
         long[] first = CrashLoopGuard.recordCrash(new long[0], T0);
-        long[] second = CrashLoopGuard.recordCrash(first, T0 + CrashLoopGuard.WINDOW_MS - 1);
+        // 3s rung + almost all of the grace: the app never really came back.
+        long[] second = CrashLoopGuard.recordCrash(
+            first, T0 + 3_000L + CrashLoopGuard.GRACE_MS - 1);
         assertEquals(2, second.length);
         assertEquals(30_000L, CrashLoopGuard.decide(second));
     }
 
     @Test
-    public void crashOutsideWindowDoesNotCompound() {
+    public void crashAfterTheAppStayedUpDoesNotCompound() {
         long[] first = CrashLoopGuard.recordCrash(new long[0], T0);
-        long[] second = CrashLoopGuard.recordCrash(first, T0 + CrashLoopGuard.WINDOW_MS);
-        assertArrayEquals("stale entry pruned", new long[] { T0 + CrashLoopGuard.WINDOW_MS }, second);
+        long later = T0 + 3_000L + CrashLoopGuard.GRACE_MS;
+        long[] second = CrashLoopGuard.recordCrash(first, later);
+        assertArrayEquals("stale entry pruned", new long[] { later }, second);
         assertEquals("back to the first rung", 3_000L, CrashLoopGuard.decide(second));
     }
 
     @Test
-    public void crashAfterWindowClearsAnExhaustedHistory() {
+    public void aCrashAfterTheAppStayedUpClearsAnExhaustedHistory() {
         // Decay rule = prune on read. Note precisely what this does and does not say: nothing
         // clears the history during a clean run — the pruning happens when the NEXT crash
-        // reads it. So this asserts that a crash occurring after the window sees an empty
-        // history and drops back to the first rung, NOT that surviving the window resets
-        // anything by itself.
+        // reads it. So this asserts that a crash occurring after a healthy run sees an empty
+        // history and drops back to the first rung, NOT that surviving resets anything by
+        // itself.
         long[] h = new long[0];
         for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
             h = CrashLoopGuard.recordCrash(h, T0 + i * 1_000L);
         }
         assertEquals(CrashLoopGuard.CAPPED_RETRY_MS, CrashLoopGuard.decide(h));
 
-        long later = T0 + CrashLoopGuard.WINDOW_MS + 60_000L;
-        assertEquals(0, CrashLoopGuard.pruneToWindow(h, later).length);
+        long later = T0 + CrashLoopGuard.CAPPED_RETRY_MS + CrashLoopGuard.GRACE_MS + 60_000L;
+        assertEquals(0, CrashLoopGuard.pruneChain(h, later).length);
         assertEquals(3_000L, CrashLoopGuard.decide(CrashLoopGuard.recordCrash(h, later)));
     }
 
     @Test
-    public void pruneKeepsTheWholeChainWhileCrashesKeepArriving() {
-        // The window is measured from the PREVIOUS crash, not from each entry independently:
-        // as long as the chain is unbroken the older entries stay, however long the chain has
-        // been running. Measuring each entry against now is what made the cap unreachable —
-        // see theCappedRungIsAReachableSteadyState.
-        long now = T0 + CrashLoopGuard.WINDOW_MS;
+    public void pruneKeepsTheWholeChainWhileTheAppKeepsFailingToStayUp() {
+        // The chain is kept or dropped as a whole, measured from its most recent entry: as long
+        // as the app cannot stay up, the older entries stay, however long the chain has been
+        // running. Measuring each entry against now independently is what made the cap
+        // unreachable — see theCappedRungIsAReachableSteadyState.
+        long now = T0 + 3_000L;
         long[] history = { T0 - 1, T0, T0 + 1, now };
-        assertArrayEquals(history, CrashLoopGuard.pruneToWindow(history, now));
+        assertArrayEquals(history, CrashLoopGuard.pruneChain(history, now));
     }
 
     @Test
-    public void pruneDropsTheChainOnceTheDeviceHasBeenQuietForAWindow() {
+    public void pruneDropsTheChainOnceTheAppHasStayedUp() {
         long[] history = { T0, T0 + 1_000L, T0 + 2_000L };
-        long now = T0 + 2_000L + CrashLoopGuard.WINDOW_MS;
-        assertEquals(0, CrashLoopGuard.pruneToWindow(history, now).length);
+        long now = T0 + 2_000L + CrashLoopGuard.CAPPED_RETRY_MS + CrashLoopGuard.GRACE_MS;
+        assertEquals(0, CrashLoopGuard.pruneChain(history, now).length);
     }
 
-    // ---- N2: the cap has to be a steady state, not a place the ladder passes through -------
+    // ---- N2/F1: the cap must be sticky at ~0 uptime AND released by real uptime -------------
 
     @Test
-    public void windowIsLongerThanTheCappedRetryInterval() {
-        // Not a style constraint. If the quiet window is shorter than the capped retry
-        // interval, a device sitting on the capped rung prunes its own chain between attempts
-        // and drops straight back to the fast rung — the ladder restarts from the bottom
-        // forever and the cap is decorative.
-        assertTrue("WINDOW_MS (" + CrashLoopGuard.WINDOW_MS + ") must exceed CAPPED_RETRY_MS ("
-                + CrashLoopGuard.CAPPED_RETRY_MS + ")",
-            CrashLoopGuard.WINDOW_MS > CrashLoopGuard.CAPPED_RETRY_MS);
+    public void theResetThresholdAlwaysExceedsTheDelayItJustImposed() {
+        // Replaces an earlier "WINDOW_MS > CAPPED_RETRY_MS" constraint, which was the same idea
+        // stated for one rung only. This is the general invariant, and it is what makes the cap
+        // reachable: if the chain could expire in less time than the device was told to wait,
+        // a device that came back exactly on schedule would prune its own history and restart
+        // the ladder from the bottom forever.
+        long[] h = new long[0];
+        for (int i = 0; i < CrashLoopGuard.BACKOFF_MS.length + 3; i++) {
+            h = CrashLoopGuard.recordCrash(h, T0 + i);
+            long imposed = CrashLoopGuard.decide(h);
+            // A crash arriving exactly when the restart was due must still be on the chain.
+            long[] onSchedule = CrashLoopGuard.pruneChain(h, T0 + i + imposed);
+            assertEquals("a crash " + imposed + "ms later — exactly when we told the device to "
+                    + "come back — must not look like a healthy run", h.length, onSchedule.length);
+        }
+    }
+
+    @Test
+    public void aDeviceThatStaysUpBetweenCrashesIsNeverPinnedOnTheSlowRung() {
+        // F1. THE regression test for the fixed-window rule. A box that OOMs on one oversized
+        // playlist asset ~25 minutes after each start is the TRANSIENT cause this class's
+        // javadoc cites as the reason for capping rather than giving up — it must recover fast
+        // every time, not climb to the hourly rung.
+        //
+        // Under the fixed 90-minute chain window this failed on the 4th crash: the gaps (25min,
+        // then 25min+delay) all sat inside the window, so the ladder escalated to the cap and
+        // then PINNED there, because 60min of darkness plus 25min of uptime is still under 90
+        // minutes. Uptime went from ~100% to ~29% for a device that was working perfectly
+        // between crashes.
+        long uptime = 25 * 60 * 1000L;
+        long[] h = new long[0];
+        long t = T0;
+        for (int crash = 1; crash <= 8; crash++) {
+            h = CrashLoopGuard.recordCrash(h, t);
+            long delay = CrashLoopGuard.decide(h);
+            assertEquals("crash " + crash + " (t+" + (t - T0) / 60000 + "min) escalated even "
+                    + "though the app had been up for " + uptime / 60000 + " minutes",
+                CrashLoopGuard.BACKOFF_MS[0], delay);
+            assertFalse("a device that keeps coming back is not a degraded device",
+                CrashLoopGuard.isLadderExhausted(h));
+            t += delay + uptime;
+        }
+    }
+
+    @Test
+    public void theLadderResetsOnUptimeAlone_whateverRungItIsOn() {
+        // The one-sentence statement of the rule: what clears the chain is the app STAYING UP
+        // for GRACE_MS, and that is true from every rung, not just the fast ones. Walk the
+        // ladder to the cap, then hand it a crash that arrives one grace period after the
+        // restart was due.
+        long[] h = new long[0];
+        long t = T0;
+        for (int crash = 1; crash <= CrashLoopGuard.BACKOFF_MS.length + 1; crash++) {
+            h = CrashLoopGuard.recordCrash(h, t);
+            t += CrashLoopGuard.decide(h);
+        }
+        assertEquals(CrashLoopGuard.CAPPED_RETRY_MS, CrashLoopGuard.decide(h));
+
+        long[] afterAHealthyRun = CrashLoopGuard.recordCrash(h, t + CrashLoopGuard.GRACE_MS);
+        assertEquals("the app stayed up for a full grace period; the ladder must forget",
+            1, afterAHealthyRun.length);
+        assertEquals(CrashLoopGuard.BACKOFF_MS[0], CrashLoopGuard.decide(afterAHealthyRun));
+    }
+
+    // ---- the report-only recovery chain decays differently ----------------------------------
+
+    @Test
+    public void theRecoveryChainDecaysOnQuietAloneNotOnAPenalty() {
+        // Recoveries schedule nothing, so there is no darkness to subtract: the chain must
+        // decay on plain quiet. Borrowing the ladder's penalty term would keep an ended storm
+        // alive for over an hour and silently merge the next episode into it — which, with a
+        // transition-only marker, means the next episode is never reported at all.
+        long[] h = new long[0];
+        for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
+            h = CrashLoopGuard.recordRecovery(h, T0 + i * 1_000L);
+        }
+        assertTrue("four flickers in four seconds is a storm", CrashLoopGuard.isLadderExhausted(h));
+
+        long[] next = CrashLoopGuard.recordRecovery(h, T0 + CrashLoopGuard.GRACE_MS + 4_000L);
+        assertEquals("a lone flicker after a quiet period starts a new episode", 1, next.length);
+    }
+
+    @Test
+    public void theRecoveryChainStillCompoundsWhileFlickersKeepArriving() {
+        long[] h = new long[0];
+        long t = T0;
+        for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
+            h = CrashLoopGuard.recordRecovery(h, t);
+            t += CrashLoopGuard.GRACE_MS - 1_000L; // just inside the quiet threshold
+        }
+        assertTrue(CrashLoopGuard.isLadderExhausted(h));
     }
 
     @Test
@@ -238,7 +324,8 @@ public class CrashLoopGuardTest {
         }
         assertEquals(CrashLoopGuard.CAPPED_RETRY_MS, CrashLoopGuard.decide(h));
 
-        long afterAQuietWindow = T0 + CrashLoopGuard.WINDOW_MS + 60_000L;
+        long afterAQuietWindow =
+            T0 + CrashLoopGuard.CAPPED_RETRY_MS + CrashLoopGuard.GRACE_MS + 60_000L;
         assertEquals(3_000L,
             CrashLoopGuard.decide(CrashLoopGuard.recordCrash(h, afterAQuietWindow)));
     }
@@ -246,9 +333,9 @@ public class CrashLoopGuardTest {
     @Test
     public void futureEntriesArePrunedSoAClockJumpCannotPinUsOnTheSlowRung() {
         // Wall clock can jump years on a TV box that boots without a network. A stored
-        // timestamp in the future would otherwise stay "inside the window" forever.
+        // timestamp in the future would otherwise keep the chain alive forever.
         long[] history = { T0 + 5L * 365 * 24 * 60 * 60 * 1000L, T0 + 1_000L };
-        assertEquals(0, CrashLoopGuard.pruneToWindow(history, T0).length);
+        assertEquals(0, CrashLoopGuard.pruneChain(history, T0).length);
         assertEquals(3_000L, CrashLoopGuard.decide(CrashLoopGuard.recordCrash(history, T0)));
     }
 

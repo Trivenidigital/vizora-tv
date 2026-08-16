@@ -21,6 +21,7 @@ import com.getcapacitor.WebViewListener;
 import java.time.Duration;
 import java.util.List;
 
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -55,6 +56,7 @@ public class MainActivityRendererLossTest {
     private ShadowAlarmManager shadowAlarmManager;
     private MainActivity activity;
     private WebViewListener rendererListener;
+    private Thread.UncaughtExceptionHandler previousDefaultHandler;
 
     @Before
     public void setUp() {
@@ -70,10 +72,24 @@ public class MainActivityRendererLossTest {
             shadowOf((AlarmManager) context.getSystemService(Context.ALARM_SERVICE));
         ShadowAlarmManager.setCanScheduleExactAlarms(true);
 
-        // The in-process recovery clock is a static that deliberately survives an activity
-        // relaunch; Robolectric shares one classloader across these methods, so it must be
-        // reset or test order decides which branch the first death takes.
-        MainActivity.resetRendererRecoveryClockForTests();
+        // MainActivity's statics deliberately survive an activity relaunch, and Robolectric
+        // shares one classloader across these methods, so they must be reset or test order
+        // decides which branch the first death takes — and, for the crash handler, whether the
+        // activity re-installs it at all.
+        MainActivity.resetProcessStaticsForTests();
+
+        // Robolectric does not reset Thread's default-handler slot between methods either, so
+        // without this the "MainActivity installs the crash handler" assertion below would pass
+        // on the handler left behind by the previous method.
+        previousDefaultHandler = Thread.getDefaultUncaughtExceptionHandler();
+        Thread.setDefaultUncaughtExceptionHandler(null);
+    }
+
+    @After
+    public void tearDown() {
+        // Leave the JVM as we found it: the handler installed by MainActivity has a null
+        // delegate here, and its production fallback is System.exit(1).
+        Thread.setDefaultUncaughtExceptionHandler(previousDefaultHandler);
     }
 
     private void launchActivity() {

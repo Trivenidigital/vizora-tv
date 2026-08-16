@@ -14,25 +14,33 @@ package com.vizora.display;
  * System.currentTimeMillis()). On each crash it calls {@link #recordCrash} to get the new
  * history to persist, then {@link #decide} to get the restart delay.
  *
- * Decay rule: PRUNE ON READ, and the window is measured from the PREVIOUS CRASH, not from
- * each entry independently. A crash within {@link #WINDOW_MS} of the last one extends the
- * chain; a crash after {@link #WINDOW_MS} of quiet clears it and starts again at the first
- * rung. Pruning happens only when the history is next touched — and the only thing that
- * touches it is the NEXT crash. Nothing clears the history during a successful run.
+ * Decay rule: PRUNE ON READ, against UPTIME rather than against elapsed time. The chain
+ * survives while the app came back and died again faster than the delay it was told to wait,
+ * plus {@link #GRACE_MS}; it is cleared entirely once the app managed to stay up for about
+ * {@link #GRACE_MS}. Pruning happens only when the history is next touched — and the only
+ * thing that touches it is the NEXT crash. Nothing clears the history during a successful run,
+ * so "the history decays" describes what the next crash sees, not a background reset.
  *
- * N2 — why the window is measured against the previous crash rather than against each entry.
- * The obvious rule (drop every entry older than WINDOW_MS) made the cap UNREACHABLE as a
- * steady state, which is not a tuning detail but a silent defeat of the whole class. Trace a
- * deterministic startup crash under the old 10-minute absolute window: 3s, 30s, 5min, then the
- * capped rung at ~5m35s. The next crash lands ~65 minutes later — by which point every earlier
- * entry is older than 10 minutes and is pruned, so the guard sees a history of length 1 and
- * hands back the 3s rung. The ladder restarted from the bottom forever: the real steady state
- * was ~4 crashes per ~65min (~88/day), not the ~24/day the cap advertises, and the marker
- * always reported exactly 4 crashes, so a device looping for a week was indistinguishable from
- * one that looped once. With a chain window (and {@link #WINDOW_MS} &gt;
- * {@link #CAPPED_RETRY_MS}, which is a real constraint, not a coincidence) the cap is sticky:
- * a device retrying hourly stays on the hourly rung, which is the ~24 restarts/day figure
- * below, and the marker's count keeps climbing to {@link #MAX_HISTORY}.
+ * N2/F1 — why the threshold is the penalty and not a fixed window. This has been wrong twice
+ * in opposite directions, and both failures were invisible to every pure test of {@link #decide}:
+ *
+ *  - A fixed 10-minute ABSOLUTE window (drop every entry older than the window) made the cap
+ *    UNREACHABLE. A deterministic startup crash escalated 3s → 30s → 5min → capped at ~5m35s,
+ *    and the next crash landed ~65 minutes later, by which point every earlier entry was
+ *    pruned: history length 1, back to the 3s rung, forever. Real steady state was ~4 crashes
+ *    per ~65min (~88/day) rather than the advertised ~24/day, and the marker always reported
+ *    exactly 4 crashes, so a week-long loop looked identical to a single episode.
+ *  - Fixing that with a fixed 90-minute CHAIN window (gap measured from the previous crash)
+ *    made the cap sticky but broke the opposite case, because a chain window has to outlast
+ *    the 60-minute capped rung and therefore also compounds crashes 45 minutes apart. A box
+ *    OOMing on one oversized playlist asset ~25 minutes after each start — the exact TRANSIENT
+ *    cause cited below as the reason for capping rather than giving up — climbed to the hourly
+ *    rung and PINNED there: ~29% uptime where the absolute window gave ~100%.
+ *
+ * Both fixed thresholds fail because a raw gap conflates the delay we imposed with the time
+ * the app actually survived. Comparing the gap to {@code decide(history) + GRACE_MS} subtracts
+ * the penalty back out, so the rule is simply "reset if the app stayed up for GRACE_MS" —
+ * sticky at ~0 uptime (the loop), and fast-rung at any uptime that resembles working.
  *
  * Escalation ladder: crash N in the chain takes rung N of {@link #BACKOFF_MS}
  * (3s → 30s → 5min). The ladder is CAPPED, NOT TERMINAL — once it is exhausted every further
@@ -61,14 +69,25 @@ package com.vizora.display;
 final class CrashLoopGuard {
 
     /**
-     * Quiet period that clears the chain: a crash more than this long after the PREVIOUS crash
-     * is unrelated and does not compound.
+     * How long the app must stay UP for the ladder to forget the chain, over and above the
+     * delay it was just told to wait. The chain survives while
+     * {@code gap < decide(history) + GRACE_MS}; since {@code gap} is the delay we imposed plus
+     * however long the app then ran, that reduces to one sentence:
      *
-     * MUST stay greater than {@link #CAPPED_RETRY_MS}, or a device sitting on the capped rung
-     * would prune its own chain between attempts and fall back to the 3s rung forever — see the
-     * N2 note above. {@code windowIsLongerThanTheCappedRetryInterval} pins this.
+     *     THE LADDER RESETS IF THE APP STAYED UP FOR ROUGHLY GRACE_MS.
+     *
+     * That is the property worth having, and it is why the threshold is measured against the
+     * penalty rather than being a fixed quiet window — see the N2/F1 note on the class.
+     *
+     * Value: it must exceed the worst-case LATENESS of our own restart alarm, or a
+     * startup-crash loop whose alarm was merely delivered late would look like an app that
+     * stayed up and would reset its own ladder. On API 33+ the relaunch is an inexact
+     * {@code setAndAllowWhileIdle} alarm whose per-app quota is ~9 minutes (see
+     * {@link CrashRecoveryHandler}), so 10 minutes is the smallest honest value. Residual, and
+     * it is real: an alarm delivered MORE than ~10 minutes late is indistinguishable from a
+     * healthy run and does reset the ladder.
      */
-    static final long WINDOW_MS = 90 * 60 * 1000L; // 90 minutes
+    static final long GRACE_MS = 10 * 60 * 1000L; // 10 minutes
 
     /**
      * Restart delay by crash-count-inside-window: 1st → 3s (unchanged from the previous
@@ -96,12 +115,32 @@ final class CrashLoopGuard {
     private CrashLoopGuard() {}
 
     /**
+     * Record a RESTART-LADDER event (an uncaught exception, or a renderer loop that gave the
+     * process up). Decays against the penalty already imposed — see {@link #pruneChain}.
+     *
      * @param historyMs persisted crash timestamps, oldest first (may be empty/null)
      * @param nowMs     System.currentTimeMillis() of the crash being recorded
-     * @return the history to persist: the surviving chain (see {@link #pruneToWindow}) plus nowMs
+     * @return the history to persist: the surviving chain plus nowMs
      */
     static long[] recordCrash(long[] historyMs, long nowMs) {
-        long[] kept = pruneToWindow(historyMs, nowMs);
+        return append(pruneChain(historyMs, nowMs), nowMs);
+    }
+
+    /**
+     * Record a REPORT-ONLY event (a renderer death that recovered in-process). Decays against a
+     * plain {@link #GRACE_MS} of quiet, NOT against a restart penalty: this chain never
+     * schedules anything, so there is no darkness to compare the uptime to, and borrowing the
+     * ladder's penalty term would keep a storm chain alive for over an hour after it ended —
+     * which would silently merge two separate episodes into one and suppress the report for the
+     * second (the marker fires only on the transition; see
+     * {@link CrashRecoveryHandler#recordRendererRecovery}).
+     */
+    static long[] recordRecovery(long[] historyMs, long nowMs) {
+        return append(pruneQuiet(historyMs, nowMs, GRACE_MS), nowMs);
+    }
+
+    /** Append nowMs, dropping the OLDEST entries if that would exceed {@link #MAX_HISTORY}. */
+    private static long[] append(long[] kept, long nowMs) {
         int keptCount = Math.min(kept.length, MAX_HISTORY - 1);
         int dropped = kept.length - keptCount; // drop OLDEST first when capped
         long[] updated = new long[keptCount + 1];
@@ -143,11 +182,24 @@ final class CrashLoopGuard {
     }
 
     /**
-     * Prune the chain. The whole chain is kept while crashes keep arriving inside
-     * {@link #WINDOW_MS} of each other, and dropped entirely once {@link #WINDOW_MS} of quiet
-     * has passed since the most recent one. Measuring the gap against the LAST entry rather
-     * than against every entry independently is what makes the capped rung a reachable steady
-     * state — see the N2 note on the class.
+     * Prune the restart-ladder chain: keep it while the app came back and died again FASTER
+     * than the penalty it was given, drop it once the app managed to stay up.
+     *
+     * F1 — why this is measured against the penalty and not against a fixed quiet window. A
+     * fixed window compares an interval to a constant, which cannot distinguish "died instantly,
+     * four times" from "ran fine for 25 minutes, four times"; the window has to be long enough
+     * to outlast the 60-minute capped rung (or the cap is not a reachable steady state), and a
+     * window that long then compounds crashes that are three quarters of an hour apart. That was
+     * a real regression and in the worst direction: with a 90-minute window, a box that OOMs on
+     * one oversized playlist asset ~25 minutes after each start — the exact TRANSIENT cause this
+     * class's javadoc cites as the reason for capping rather than giving up — climbed to the
+     * hourly rung and stayed there, going from ~100% uptime to ~29%.
+     *
+     * Subtracting the penalty removes the coupling. {@code gap} is always
+     * {@code (the delay we imposed) + (how long the app then ran)}, so the surviving condition
+     * {@code gap < decide(history) + GRACE_MS} reduces to {@code uptime < GRACE_MS} on every
+     * rung: a device that cannot stay up for ten minutes keeps escalating and stays capped, and
+     * a device that CAN gets the fast rung back, whatever rung it was on before.
      *
      * Entries in the FUTURE relative to nowMs are dropped: the timestamps are wall clock, and a
      * TV box that boots without a network can jump its clock by years when NTP lands. A future
@@ -155,13 +207,22 @@ final class CrashLoopGuard {
      * {@link #CAPPED_RETRY_MS} rung. Dropping fails open — the device restarts fast — which is
      * the right bias for signage.
      */
-    static long[] pruneToWindow(long[] historyMs, long nowMs) {
+    static long[] pruneChain(long[] historyMs, long nowMs) {
+        return pruneQuiet(historyMs, nowMs, decide(historyMs) + GRACE_MS);
+    }
+
+    /**
+     * Drop the whole chain once {@code quietMs} has passed since its most recent entry (or the
+     * clock jumped backwards past it); otherwise keep every entry that is not itself in the
+     * future. Shared by both chains, which differ only in how {@code quietMs} is derived.
+     */
+    static long[] pruneQuiet(long[] historyMs, long nowMs, long quietMs) {
         if (historyMs == null || historyMs.length == 0) {
             return new long[0];
         }
         long newest = historyMs[historyMs.length - 1];
-        if (newest > nowMs || nowMs - newest >= WINDOW_MS) {
-            // Clock jumped backwards, or the chain is broken by a quiet window. Start over.
+        if (newest > nowMs || nowMs - newest >= quietMs) {
+            // Clock jumped backwards, or the app stayed up long enough. Start over.
             return new long[0];
         }
         long[] scratch = new long[historyMs.length];

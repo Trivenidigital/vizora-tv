@@ -231,7 +231,11 @@ public class CrashRecoveryHandlerWiringTest {
     // ---- N1: the fallback branch must survive Doze ------------------------------------------
 
     @Test
-    public void theInexactFallbackIsNotDozeDeferrable() {
+    public void theInexactFallbackAsksForTheIdleExemption() {
+        // NOTE the name: this observes that the exemption was REQUESTED, which is all a shadow
+        // AlarmManager can show. It is deliberately not called "...IsNotDozeDeferrable", because
+        // that would be false — setAndAllowWhileIdle is still deferrable, boundedly, by its
+        // ~9-minute per-app quota. What is pinned here is the flag, not a delivery guarantee.
         // N1, and this is not an edge case: SCHEDULE_EXACT_ALARM is capped at
         // maxSdkVersion=32 and USE_EXACT_ALARM is deliberately not declared, so
         // canScheduleExactAlarms() is false on EVERY API 33+ box and this is the only branch
@@ -248,7 +252,7 @@ public class CrashRecoveryHandlerWiringTest {
     }
 
     @Test
-    public void theExactPathIsAlsoNotDozeDeferrable() {
+    public void theExactPathAlsoAsksForTheIdleExemption() {
         // The pre-33 branch already used setExactAndAllowWhileIdle; pinned so the two branches
         // cannot drift apart on the property that actually matters here.
         CrashRecoveryHandler.recordAndScheduleRelaunch(
@@ -458,6 +462,166 @@ public class CrashRecoveryHandlerWiringTest {
         CrashRecoveryHandler.recordRendererRecovery(context);
 
         assertNull(CapacitorPreferencesReader.get(context, "crash_loop_capped"));
+    }
+
+    @Test
+    public void aStormIsReportedOncePerEpisodeNotOncePerFlicker() {
+        // F2. This path is the ONLY marker writer that nothing rate-limits — the device is up
+        // and flickering, so there is no restart delay between events. main.ts reads AND
+        // removes the marker on every page load, and the in-process relaunch causes a page load
+        // on every flicker, so a marker written per flicker becomes a telemetry event per
+        // flicker: ~7.8k/device/day at the shape this path exists for. Clearing the marker
+        // between calls is exactly what main.ts does, so a re-write here is a re-report.
+        for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
+            CrashRecoveryHandler.recordRendererRecovery(context);
+        }
+        assertNotNull("the storm must be reported at least once",
+            CapacitorPreferencesReader.get(context, "crash_loop_capped"));
+        consumeMarkerAsTheWebLayerWould();
+
+        for (int i = 0; i < 20; i++) {
+            CrashRecoveryHandler.recordRendererRecovery(context);
+        }
+
+        assertNull("the same storm was re-reported on every flicker; an alert that fires "
+                + "thousands of times a day is not an alert",
+            CapacitorPreferencesReader.get(context, "crash_loop_capped"));
+    }
+
+    @Test
+    public void aLaterStormEpisodeIsReportedAgain() {
+        // The other half of "once per episode": reporting once must not mean reporting once
+        // ever. A device that flickers, recovers for the day, then flickers again next week is
+        // two episodes and must produce two reports — which is why the recovery chain decays on
+        // quiet rather than borrowing the restart ladder's much longer penalty term.
+        // The chain is keyed on wall clock, and Robolectric's shadow clock moves
+        // elapsedRealtime only, so the quiet period is expressed by seeding a STALE chain
+        // through the same prefs the handler reads rather than by moving time.
+        seedRecoveryChain(CrashLoopGuard.BACKOFF_MS.length + 1,
+            System.currentTimeMillis() - CrashLoopGuard.GRACE_MS - 60_000L);
+        assertNull("precondition: nothing reported yet",
+            CapacitorPreferencesReader.get(context, "crash_loop_capped"));
+
+        for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
+            CrashRecoveryHandler.recordRendererRecovery(context);
+        }
+
+        assertNotNull("a fresh episode after a quiet period must be reported again; a chain "
+                + "that never decays reports the first storm and then goes silent forever",
+            CapacitorPreferencesReader.get(context, "crash_loop_capped"));
+    }
+
+    /** Write an already-exhausted recovery chain, all of it {@code atMs}, as prefs state. */
+    private void seedRecoveryChain(int entries, long atMs) {
+        long[] stale = new long[entries];
+        for (int i = 0; i < entries; i++) {
+            stale[i] = atMs + i;
+        }
+        context.getSharedPreferences("vizora_crash_recovery", Context.MODE_PRIVATE)
+            .edit()
+            .putString("renderer_recovery_ms", CrashLoopGuard.serializeHistory(stale))
+            .commit();
+    }
+
+    /** What src/main.ts does with the marker on every page load: report it, then remove it. */
+    private void consumeMarkerAsTheWebLayerWould() {
+        capacitorPrefs().edit().remove(CrashRecoveryHandler.KEY_CAPPED_MARKER).commit();
+    }
+
+    // ---- one key, shared by both causes: a write must not downgrade the record --------------
+
+    private String markerReason() {
+        String marker = CapacitorPreferencesReader.get(context, "crash_loop_capped");
+        assertNotNull("no marker at all", marker);
+        return marker.split(":")[2];
+    }
+
+    private void degradeOnTheRestartLadder() {
+        for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
+            CrashRecoveryHandler.recordAndScheduleRelaunch(
+                context, CrashRecoveryHandler.REASON_UNCAUGHT_EXCEPTION);
+        }
+    }
+
+    private void flickerIntoAStorm() {
+        for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
+            CrashRecoveryHandler.recordRendererRecovery(context);
+        }
+    }
+
+    @Test
+    public void aStormMustNotOverwriteAnUnreportedRestartLadderMarker() {
+        // Both causes write the SAME key, because it is the only key main.ts reads. That makes
+        // the ordering matter: a device dark on the 60-minute rung whose record is replaced by
+        // a flicker report tells the operator the opposite of the truth. And the record really
+        // does sit there — main.ts keeps the marker when crash reporting is disabled rather
+        // than deleting it on the strength of a reportEvent that sent nothing, so on a build
+        // with no Sentry DSN "unreported" is the normal state, not a race.
+        degradeOnTheRestartLadder();
+        assertEquals(CrashRecoveryHandler.REASON_UNCAUGHT_EXCEPTION, markerReason());
+
+        flickerIntoAStorm();
+
+        assertEquals("the storm overwrote a record of the device being DARK",
+            CrashRecoveryHandler.REASON_UNCAUGHT_EXCEPTION, markerReason());
+    }
+
+    @Test
+    public void aRestartLadderMarkerMayReplaceAStormMarker() {
+        // The rule is severity, not first-writer-wins: being dark outranks flickering, so this
+        // direction must still overwrite or a device that degrades from flickering to dark
+        // would report the milder state forever.
+        flickerIntoAStorm();
+        assertEquals(CrashRecoveryHandler.REASON_RENDERER_RECOVERY_STORM, markerReason());
+
+        degradeOnTheRestartLadder();
+
+        assertEquals(CrashRecoveryHandler.REASON_UNCAUGHT_EXCEPTION, markerReason());
+    }
+
+    @Test
+    public void aWorseningRestartLadderRecordKeepsBeingRefreshed() {
+        // The no-clobber rule is about SEVERITY, and it must not freeze the record it protects.
+        // CrashLoopGuard's javadoc claims the marker's count keeps climbing so that a device
+        // looping for a week is distinguishable from one that looped four times and recovered —
+        // that claim lives here, at the write, and nothing pinned it: a guard that refused every
+        // overwrite kept the suite green while pinning the count at 4 forever, which is exactly
+        // the defect the count was widened to fix.
+        degradeOnTheRestartLadder();
+        int atTransition = Integer.parseInt(
+            CapacitorPreferencesReader.get(context, "crash_loop_capped").split(":")[1]);
+
+        for (int i = 0; i < 5; i++) {
+            CrashRecoveryHandler.recordAndScheduleRelaunch(
+                context, CrashRecoveryHandler.REASON_UNCAUGHT_EXCEPTION);
+        }
+
+        int afterMoreCrashes = Integer.parseInt(
+            CapacitorPreferencesReader.get(context, "crash_loop_capped").split(":")[1]);
+        assertTrue("the marker froze at " + atTransition + " crashes, so a week-long loop looks "
+                + "identical to a single episode", afterMoreCrashes > atTransition);
+    }
+
+    @Test
+    public void aStormIsStillRecordedWhenNothingWorseIsPending() {
+        // Negative control: the no-clobber rule must not turn into "storms are never reported".
+        flickerIntoAStorm();
+
+        assertEquals(CrashRecoveryHandler.REASON_RENDERER_RECOVERY_STORM, markerReason());
+    }
+
+    @Test
+    public void aStormYieldsToATruncatedMarkerRatherThanDestroyingIt() {
+        // Markers are written by processes that may be mid-death, so a half-written value is
+        // expected. main.ts still reports a truncated marker, so it is a real record; a flicker
+        // must not be what destroys it.
+        capacitorPrefs().edit()
+            .putString(CrashRecoveryHandler.KEY_CAPPED_MARKER, "1700000000000").commit();
+
+        flickerIntoAStorm();
+
+        assertEquals("a truncated record is still a record",
+            "1700000000000", CapacitorPreferencesReader.get(context, "crash_loop_capped"));
     }
 
     // ---- persistence -----------------------------------------------------------------------

@@ -138,7 +138,7 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
      */
     static void recordAndScheduleRelaunch(Context context, String reason) {
         long now = System.currentTimeMillis();
-        long[] updated = evaluate(context, KEY_CRASH_HISTORY, now);
+        long[] updated = evaluate(context, KEY_CRASH_HISTORY, now, CrashLoopGuard::recordCrash);
 
         // SAFETY ACTION FIRST — see the N4 note above.
         scheduleRestart(context, CrashLoopGuard.decide(updated));
@@ -166,6 +166,19 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
      * {@link #REASON_RENDERER_RECOVERY_STORM}. src/main.ts reports it on the next boot, and on
      * this path there IS a next boot — the in-process relaunch reloads the web app every time.
      *
+     * F2 — the marker is written ONCE, on the transition onto the exhausted rung, and that is
+     * load-bearing rather than tidy. Every other marker writer is rate-limited by the delay it
+     * just imposed (at worst one per hour on the capped rung); this one is not rate-limited by
+     * anything, because the device is up and flickering. Writing it on every recovery past the
+     * threshold, at the storm shape this method exists for (deaths just outside the ~10s guard
+     * interval), is ~7.8k markers/day — and since main.ts reads AND removes the marker on every
+     * page load, and the in-process relaunch triggers a page load on every flicker, each one
+     * becomes a distinct telemetry event. An alert that fires thousands of times a day is not
+     * an alert, and it would burn the reporting quota that the rest of this class's §12b
+     * argument depends on. Once per episode is the whole signal: "this device is flickering".
+     * A genuinely new episode re-arms it, because the recovery chain decays after
+     * {@link CrashLoopGuard#GRACE_MS} of quiet (see {@link CrashLoopGuard#recordRecovery}).
+     *
      * Why a SEPARATE history rather than the restart ladder: entries on the restart ladder
      * lengthen the next restart delay. A recovery is a SUCCESS — the screen came back in under
      * a second — and counting four of them would mean the next unrelated Java crash waited an
@@ -179,10 +192,12 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
      */
     static void recordRendererRecovery(Context context) {
         long now = System.currentTimeMillis();
-        long[] updated = evaluate(context, KEY_RECOVERY_HISTORY, now);
+        long[] updated =
+            evaluate(context, KEY_RECOVERY_HISTORY, now, CrashLoopGuard::recordRecovery);
         persist(context, KEY_RECOVERY_HISTORY, updated, false);
-        Log.w(TAG, "Renderer recovered in-process (" + updated.length + " in the window)");
-        if (CrashLoopGuard.isLadderExhausted(updated)) {
+        Log.w(TAG, "Renderer recovered in-process (" + updated.length + " in this chain)");
+        if (updated.length == CrashLoopGuard.BACKOFF_MS.length + 1) {
+            // Exactly the transition, not every event past it — see F2 above.
             writeCappedMarker(context, now, updated.length, REASON_RENDERER_RECOVERY_STORM, false);
         }
     }
@@ -220,6 +235,15 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
     }
 
     /**
+     * Which decay rule this history follows. The two chains are NOT interchangeable — the
+     * restart ladder decays against the penalty it imposed, the report-only recovery chain
+     * against plain quiet — so the choice is passed in rather than inferred from the key.
+     */
+    private interface Recorder {
+        long[] record(long[] historyMs, long nowMs);
+    }
+
+    /**
      * Read the persisted history for {@code key} and fold in this event. NO WRITES — the caller
      * schedules first and persists afterwards (see the N4 note on
      * {@link #recordAndScheduleRelaunch}).
@@ -230,12 +254,12 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
      * Letting it escape would mean a bookkeeping failure suppressed the restart entirely —
      * strictly worse than the unconditional 3s restart this replaced.
      */
-    private static long[] evaluate(Context context, String key, long nowMs) {
+    private static long[] evaluate(Context context, String key, long nowMs, Recorder recorder) {
         try {
             SharedPreferences prefs =
                 context.getSharedPreferences(CRASH_PREFS_NAME, Context.MODE_PRIVATE);
             long[] history = CrashLoopGuard.parseHistory(prefs.getString(key, null));
-            return CrashLoopGuard.recordCrash(history, nowMs);
+            return recorder.record(history, nowMs);
         } catch (Throwable t) {
             // Throwable, not Exception — same OOM argument as uncaughtException. A secondary
             // OOM raised by the allocation/parse above must not cost us the restart.
@@ -293,13 +317,37 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
      * renderer_recovery_storm, where the screen keeps coming back on its own and no restart
      * delay has changed.
      *
+     * ONE KEY, AND A NO-CLOBBER RULE. Both causes write this single key, because it is the only
+     * key src/main.ts reads — a second key would be written here and read by nobody, which is
+     * the silent failure this marker exists to remove, and it would stay silent until a
+     * coordinated change landed on the JS side. The cost of sharing the key is that a
+     * renderer_recovery_storm could overwrite an UNREPORTED restart-ladder record, and the web
+     * layer would then tell the operator "the screen keeps coming back on its own" about a
+     * device that is actually sitting dark on the 60-minute rung. That is not a narrow window:
+     * main.ts deliberately KEEPS the marker when crash reporting is disabled (it refuses to
+     * delete the only record of a crash loop on the strength of a reportEvent that sent
+     * nothing), so on any build without a Sentry DSN an unreported marker persists indefinitely.
+     *
+     * So a write never downgrades an unreported record: the storm reason yields to a
+     * restart-ladder reason that is still sitting there. The reverse is allowed — being dark
+     * outranks flickering — and same-severity writes refresh the count and timestamp as before.
+     * An existing marker we cannot parse is treated as the more severe case, because the one
+     * thing worse than an imprecise breadcrumb is destroying one.
+     *
      * Best effort and non-fatal: never let telemetry bookkeeping cost us the restart.
      */
     private static void writeCappedMarker(
             Context context, long nowMs, int events, String reason, boolean durable) {
         try {
-            SharedPreferences.Editor editor =
-                context.getSharedPreferences(CAPACITOR_PREFS_NAME, Context.MODE_PRIVATE)
+            SharedPreferences markerPrefs =
+                context.getSharedPreferences(CAPACITOR_PREFS_NAME, Context.MODE_PRIVATE);
+            if (!isRestartLadderReason(reason)
+                    && wouldDowngradeAnUnreportedMarker(markerPrefs)) {
+                Log.w(TAG, "Keeping the existing unreported degradation marker; a " + reason
+                    + " must not overwrite a record of the device being dark");
+                return;
+            }
+            SharedPreferences.Editor editor = markerPrefs
                     .edit()
                     .putString(KEY_CAPPED_MARKER, nowMs + ":" + events + ":" + reason);
             if (durable) {
@@ -312,6 +360,30 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
         } catch (Throwable t) {
             Log.e(TAG, "Failed to persist crash-loop marker", t);
         }
+    }
+
+    /**
+     * True for the reasons that mean the device is on the slow restart rung — i.e. DARK between
+     * attempts. {@link #REASON_RENDERER_RECOVERY_STORM} is not one of them: there the screen
+     * keeps coming back by itself and no restart delay has changed.
+     */
+    private static boolean isRestartLadderReason(String reason) {
+        return REASON_UNCAUGHT_EXCEPTION.equals(reason) || REASON_RENDERER_LOOP.equals(reason);
+    }
+
+    /**
+     * True when a marker is already sitting there unreported AND it records something worse
+     * than a storm. An existing marker whose reason cannot be read counts as worse: markers are
+     * written by processes that may be mid-death, so a truncated value is expected, and losing
+     * a real degradation record to a flicker report is the worse of the two errors.
+     */
+    private static boolean wouldDowngradeAnUnreportedMarker(SharedPreferences markerPrefs) {
+        String existing = markerPrefs.getString(KEY_CAPPED_MARKER, null);
+        if (existing == null || existing.isEmpty()) {
+            return false;
+        }
+        String[] parts = existing.split(":");
+        return parts.length < 3 || isRestartLadderReason(parts[2]);
     }
 
     /** The relaunch intent. Shared so {@link #cancelPendingRelaunch} cannot drift from it. */

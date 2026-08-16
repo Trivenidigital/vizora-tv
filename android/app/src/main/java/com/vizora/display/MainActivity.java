@@ -28,7 +28,7 @@ public class MainActivity extends BridgeActivity {
     private static long lastRendererRecoveryAt = RendererRecoveryGuard.SENTINEL;
 
     // F48: install the uncaught-exception handler exactly once per process. onCreate runs
-    // again on every in-process renderer-recovery relaunch (recoverFromRendererGone); each
+    // again on every in-process renderer-recovery relaunch (handleRendererGone); each
     // CrashRecoveryHandler captures the prior default as its delegate, so re-installing per
     // onCreate grows an unbounded handler chain across relaunches. static → survives the
     // relaunch in the same process.
@@ -49,6 +49,16 @@ public class MainActivity extends BridgeActivity {
         // launcher, an operator, or MY_PACKAGE_REPLACED); left armed it would fire
         // FLAG_ACTIVITY_NEW_TASK | FLAG_ACTIVITY_CLEAR_TASK into a healthy display and tear
         // down playback for no reason.
+        //
+        // COST, stated rather than left implicit: this discards the only ARMED backstop against
+        // a later process death that raises no Java exception — LMK, native SIGSEGV/SIGABRT, an
+        // ANR kill, an operator force-stop. None of those reach CrashRecoveryHandler, so after
+        // this line the next such death has nothing scheduled and waits for the next boot. That
+        // is consistent with the model already documented on CrashRecoveryHandler (those causes
+        // were never on the ladder to begin with) and it is the right trade: a pending alarm is
+        // a stale relaunch of a HEALTHY app with certainty, versus a speculative rescue of a
+        // future death that may never happen and whose activity start is subject to the same
+        // unverified background-activity-launch restriction anyway.
         CrashRecoveryHandler.cancelPendingRelaunch(getApplicationContext());
 
         // C5: Register crash recovery handler for auto-restart. F48: install once per
@@ -184,13 +194,21 @@ public class MainActivity extends BridgeActivity {
     }
 
     /**
-     * Test seam. Robolectric shares one instrumented classloader across the test methods of a
-     * class, so {@link #lastRendererRecoveryAt} — which exists precisely to survive an
-     * in-process relaunch — would otherwise leak from one test into the next. Not called in
-     * production; the production seed is the field initialiser.
+     * Test seam covering EVERY static in this class.
+     *
+     * Both fields exist to survive an in-process relaunch, which means neither is reset by
+     * building a new Activity — and Robolectric shares one instrumented classloader across the
+     * test methods of a class, so both leak from one test into the next. That is not a
+     * theoretical tidiness point: {@link #crashHandlerInstalled} leaking meant an assertion that
+     * MainActivity installs the crash handler passed on state left by the FIRST test method
+     * while methods 2..n never re-installed anything. A seam that resets one static and not the
+     * other is worse than none, because it looks like the leak was handled.
+     *
+     * Not called in production; the production seeds are the field initialisers.
      */
-    static void resetRendererRecoveryClockForTests() {
+    static void resetProcessStaticsForTests() {
         lastRendererRecoveryAt = RendererRecoveryGuard.SENTINEL;
+        crashHandlerInstalled = false;
     }
 
     /**
@@ -209,7 +227,7 @@ public class MainActivity extends BridgeActivity {
      * It also suppresses the daydream/screensaver, not just the display timeout.
      *
      * Set after super.onCreate() alongside the other window setup. onCreate runs
-     * again on the in-process renderer-recovery relaunch (recoverFromRendererGone),
+     * again on the in-process renderer-recovery relaunch (handleRendererGone),
      * so the flag is re-applied on the fresh Activity rather than being inherited —
      * there is a sub-second gap during the relaunch, which is far below any
      * screen-off timeout.
