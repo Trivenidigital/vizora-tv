@@ -3923,53 +3923,13 @@ describe('Whole-tree seam review fixes (F41–F52)', () => {
     expect(await reportedEvents()).toContain('tenant_unsuspended');
   });
 
-  it('C1: the suspension latch is DURABLE — a reboot re-enters holding, it does not resume', async () => {
-    // last_playlist is still written while suspended, so with an in-memory-only latch
-    // a power cycle put the suspended tenant's cached loop straight back on customer
-    // glass with no probe running. Nothing else stops that.
-    await connectAndCommit();
-    expect(preferencesStore.has('last_playlist')).toBe(true);
-    triggerSocketEvent('tenant:suspended');
-    await vi.advanceTimersByTimeAsync(100);
-    expect(preferencesStore.get('tenant_suspended')).toBe('1');
-
-    // Reboot: fresh module, same disk. auth-check stays 404 (this block's default),
-    // so nothing clears the latch.
-    currentMockSocket = createMockSocket();
-    ioFactory.mockReturnValue(currentMockSocket);
-    const { reportEvent } = await import('./crash-reporting');
-    (reportEvent as Mock).mockClear();
-    // findCreatedElements reads the createElement mock's accumulated results, and the
-    // pre-reboot phase above already rendered c1.jpg. Without this the "not rendered"
-    // assertion below would read the PREVIOUS boot's element and fail on a correct fix.
-    (document.createElement as Mock).mockClear();
-    await importFresh();
-    await vi.advanceTimersByTimeAsync(2000);
-
-    expect(visibleScreens()).toEqual(['holding-screen']);
-    expect(findCreatedElements('img').some(i => i.src.includes('c1.jpg'))).toBe(false);
-    const suspendCalls = (reportEvent as Mock).mock.calls.filter(c => c[0] === 'tenant_suspended');
-    expect(suspendCalls.length).toBeGreaterThan(0);
-    expect((suspendCalls[0][1] as { source?: string }).source).toBe('restored_latch');
-  });
-
-  it('C1 NEGATIVE CONTROL: with no latch on disk a reboot resumes the cached playlist', async () => {
-    // Same seam, same reboot. Proves the hold above belongs to the persisted latch and
-    // not to the reboot path having stopped rendering.
-    await connectAndCommit();
-    expect(preferencesStore.has('tenant_suspended')).toBe(false);
-
-    currentMockSocket = createMockSocket();
-    ioFactory.mockReturnValue(currentMockSocket);
-    (document.createElement as Mock).mockClear(); // same window as the test above
-    await importFresh();
-    await vi.advanceTimersByTimeAsync(2000);
-
-    expect(visibleScreens()).toEqual(['content-screen']);
-    expect(findCreatedElements('img').some(i => i.src.includes('c1.jpg'))).toBe(true);
-  });
-
-  // -------- F42: unguarded tenant_id read --------
+  // (REMOVED) C1 — the durable-suspension-latch reboot tests.
+  //
+  // The latch they pinned is gone: three client-side attempts each produced a defect
+  // at least as bad as the gap (see enterTenantSuspended). 1.3.15's in-memory
+  // behaviour stands as a KNOWN GAP — a reboot DOES resume a suspended tenant's cached
+  // content — pending a suspension check in the gateway handshake. Deleted rather than
+  // skipped, because a skipped test for a deleted feature reads as coverage.
 
   it('F42: a rejecting tenant_id read is non-fatal — boots to holding, not an infinite RECOVERING loop', async () => {
     const { SecureStorage } = await import('./secure-storage');
@@ -7240,13 +7200,12 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     expect(findCreatedElements('img').some(i => i.src.includes('c1.jpg'))).toBe(true);
   });
 
-  it('C2: a purge removes the crash-loop marker and the suspension latch', async () => {
+  it('C2: a purge removes the crash-loop marker', async () => {
     // Device-lifecycle state that was surviving a purge which claims to be complete.
+    // (The suspension half of this test went with the durable latch — see C1.)
     await connectAndCommit();
     preferencesStore.set('crash_loop_capped', '1700000000000:4:uncaught_exception');
-    triggerSocketEvent('tenant:suspended');
-    await vi.advanceTimersByTimeAsync(100);
-    expect(preferencesStore.get('tenant_suspended')).toBe('1'); // baseline
+    expect(preferencesStore.get('crash_loop_capped')).toBeTruthy(); // baseline
 
     httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
       ? { status: 410, data: { code: 'DEVICE_REVOKED' } }
@@ -7255,7 +7214,6 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     await waitUntil('purge', () => !secureStorageStore.has('device_token'), { tickMs: 100 });
 
     expect(preferencesStore.has('crash_loop_capped')).toBe(false);
-    expect(preferencesStore.has('tenant_suspended')).toBe(false);
   });
 
   it('C2 NEGATIVE CONTROL: an UNCONFIRMED revocation removes neither', async () => {
@@ -7634,6 +7592,68 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     expect(visibleScreens()).toEqual(['pairing-screen']);
   });
 
+  it('G1x: an ABANDONED boot that unwedges mid-backoff does not pair or connect', async () => {
+    // The checkpoint, pinned. Deleting it entirely left all 600 tests green, and
+    // `boot_attempt_superseded` appeared in no spec — the one new concurrency primitive
+    // in the commit was unpinned, which is the "verifier that cannot fail" shape again.
+    //
+    // The reason no existing test could see it: they wedge with a promise that NEVER
+    // resolves, so the abandoned attempt can never resume and the guard is never
+    // reached. A wedge has to UNWEDGE to observe this at all.
+    secureStorageStore.set('device_token', 'tok-123');
+    secureStorageStore.set('device_id', 'dev-123');
+    const { SecureStorage } = await import('./secure-storage');
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let gated = true;
+    (SecureStorage.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      // Hang the FIRST credential read only: the attempt clears loadConfig and then
+      // strands here, which is precisely "cleared one checkpoint, then hung".
+      if (key === 'device_token' && gated) { gated = false; await gate; }
+      return { value: secureStorageStore.get(key) ?? null };
+    });
+
+    await importFresh();
+    await vi.advanceTimersByTimeAsync(20_500); // the boot bound elapses → abandoned
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+    expect(await reportedEvents()).toContain('boot_timeout');
+
+    // The bridge comes back DURING the backoff, before the retry has started.
+    const connectionsBefore = ioFactory.mock.calls.length;
+    release();
+    for (let i = 0; i < 60; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(100);
+
+    // The abandoned attempt resumed and was discarded — it did NOT open a socket.
+    expect(await reportedEvents()).toContain('boot_attempt_superseded');
+    expect(ioFactory.mock.calls.length).toBe(connectionsBefore);
+  });
+
+  it('G1x NEGATIVE CONTROL: a boot that was never abandoned DOES connect', async () => {
+    // Same seam, same gate, released INSIDE the boot bound. Proves the discard above
+    // belongs to the abandonment and not to the gate — a checkpoint that rejected every
+    // boot would brick the device far more thoroughly than the hang it replaced.
+    secureStorageStore.set('device_token', 'tok-123');
+    secureStorageStore.set('device_id', 'dev-123');
+    const { SecureStorage } = await import('./secure-storage');
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    let gated = true;
+    (SecureStorage.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      if (key === 'device_token' && gated) { gated = false; await gate; }
+      return { value: secureStorageStore.get(key) ?? null };
+    });
+
+    await importFresh();
+    await vi.advanceTimersByTimeAsync(1000); // well inside the 20s bound
+    release();
+    for (let i = 0; i < 60; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(await reportedEvents()).not.toContain('boot_attempt_superseded');
+    expect(ioFactory.mock.calls.length).toBeGreaterThan(0);
+  });
+
   it('G1x NEGATIVE CONTROL: a healthy bridge boots without ever arming the boot timeout', async () => {
     // Proves the bound is a bound and not a delay every device now pays, and that the
     // recovery above belongs to the retry rather than to something that would have
@@ -7679,174 +7699,15 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
   });
 
   // ======================================================================
-  // G3x. AN UNREADABLE SUSPENSION LATCH FAILS CLOSED
+  // (REMOVED) G3x — the unreadable-suspension-latch tests
   // ======================================================================
   //
-  // Nothing re-checks suspension on a boot that read the latch as absent: the
-  // reconnect revalidation is gated on tenantSuspended ALREADY being true, and the
-  // gateway handshake has no suspension check at all. So treating an unreadable latch
-  // as "not suspended" resumed a suspended tenant's cached content on customer glass,
-  // permanently. Suspended-provisionally is recoverable — revalidateTenantSuspension's
-  // 200 is the normal exit — while the reverse mistake is not.
-
-  it('G3x: a WEDGED latch read holds the device instead of resuming cached content', async () => {
-    secureStorageStore.set('device_token', 'tok-123');
-    secureStorageStore.set('device_id', 'dev-123');
-    preferencesStore.set('last_playlist', JSON.stringify({
-      tenantId: undefined, deviceId: 'dev-123', savedAt: Date.now(),
-      playlist: { id: 'pl-cached', name: 'cached', loopPlaylist: true,
-        items: [{ id: 'i1', contentId: 'cached1', duration: 10, order: 0,
-          content: { id: 'cached1', name: 'cached1', type: 'image', url: '/cached1.jpg' } }] },
-    }));
-    const { Preferences } = await import('@capacitor/preferences');
-    (Preferences.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
-      if (key === 'tenant_suspended') return NEVER();
-      return { value: preferencesStore.get(key) ?? null };
-    });
-
-    await importFresh();
-    await vi.advanceTimersByTimeAsync(2500);
-    for (let i = 0; i < 40; i++) await Promise.resolve();
-    await vi.advanceTimersByTimeAsync(1600);
-
-    expect(findCreatedElements('img').some(i => i.src.includes('cached1.jpg'))).toBe(false);
-    expect(visibleScreens()).toEqual(['holding-screen']);
-    expect(await reportedEvents()).toContain('tenant_suspended_provisional');
-  });
-
-  /** Boot with credentials + a cached playlist and an unreadable suspension latch. */
-  const bootWithUnreadableLatch = async () => {
-    secureStorageStore.set('device_token', 'tok-123');
-    secureStorageStore.set('device_id', 'dev-123');
-    preferencesStore.set('last_playlist', JSON.stringify({
-      tenantId: undefined, deviceId: 'dev-123', savedAt: Date.now(),
-      playlist: { id: 'pl-cached', name: 'cached', loopPlaylist: true,
-        items: [{ id: 'i1', contentId: 'cached1', duration: 10, order: 0,
-          content: { id: 'cached1', name: 'cached1', type: 'image', url: '/cached1.jpg' } }] },
-    }));
-    const { Preferences } = await import('@capacitor/preferences');
-    (Preferences.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
-      if (key === 'tenant_suspended') return NEVER();
-      return { value: preferencesStore.get(key) ?? null };
-    });
-    await importFresh();
-    await vi.advanceTimersByTimeAsync(2500);
-    for (let i = 0; i < 40; i++) await Promise.resolve();
-  };
-
-  it('G3x RECOVERY: an EXPIRED TOKEN device released from a provisional hold resumes cached content', async () => {
-    // THE failure the fail-closed change created. Every non-purge exit needs a 200 from
-    // auth-check, and an expired token never gets one: the gateway rejects the
-    // handshake so `connect` never fires and the probe only ever sees 401. Most of the
-    // fleet is already past the 90-day expiry, so "hold until a 200" meant those
-    // devices go dark permanently, on a 2-second storage timeout, with an
-    // operator-directed message. They played cached content before this change.
-    //
-    // This asserts the RECOVERY, which is the whole point: held first, then PLAYING.
-    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
-      ? { status: 401, data: {} }
-      : { status: 200, data: { data: { status: 'pending' } } };
-    await bootWithUnreadableLatch();
-
-    // Held, and not rendering the cached playlist.
-    expect(visibleScreens()).toEqual(['holding-screen']);
-    expect(findCreatedElements('img').some(i => i.src.includes('cached1.jpg'))).toBe(false);
-
-    // …then the bounded probe releases it and the cached content comes back.
-    // Wait for the SCREEN, not for an <img>. The element is created during the
-    // off-screen prepare(); the transition to PLAYING only happens later at
-    // commitItem(). Waiting on the element and then asserting the screen is a race that
-    // passes on an idle machine and fails under load — it did, 2 runs in 4. Wait for
-    // the property being claimed, not a proxy that precedes it.
-    await waitUntil(
-      'the provisional hold to be released and playback to resume',
-      () => visibleScreens().includes('content-screen'),
-      { tickMs: 20_000, budgetMs: 30_000 },
-    );
-
-    expect(visibleScreens()).toEqual(['content-screen']);
-    expect(findCreatedElements('img').some(i => i.src.includes('cached1.jpg'))).toBe(true);
-    const released = (await reportedEventCalls()).find(c => c[0] === 'tenant_provisional_released');
-    expect(released).toBeDefined();
-    expect((released![1] as { lastStatus?: number }).lastStatus).toBe(401);
-  });
-
-  it('G3x RECOVERY: a LEGACY BACKEND releases the provisional hold immediately', async () => {
-    // 404 stops the probe loop, so a hold left standing here would never be revisited —
-    // and a backend with no auth-check endpoint can never produce the 403 that would
-    // justify it. Released on the first answer rather than after the retry budget.
-    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
-      ? { status: 404, data: {} }
-      : { status: 200, data: { data: { status: 'pending' } } };
-    await bootWithUnreadableLatch();
-    expect(visibleScreens()).toEqual(['holding-screen']);
-
-    await waitUntil(
-      'the legacy release',
-      () => findCreatedElements('img').some(i => i.src.includes('cached1.jpg')),
-      { tickMs: 20_000, budgetMs: 30_000 },
-    );
-
-    const released = (await reportedEventCalls()).find(c => c[0] === 'tenant_provisional_released');
-    expect((released![1] as { reason?: string }).reason).toBe('legacy_backend');
-  });
-
-  it('G3x: a PROVISIONAL hold is never persisted — a transient read cannot become durable state', async () => {
-    // N2. Persisting the guess is what made it permanent: every later boot read back
-    // '1' and treated a 2-second timeout as a legitimate suspension, clearable only by
-    // a 200 that the sequences above show may never come.
-    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
-      ? { status: 401, data: {} }
-      : { status: 200, data: { data: { status: 'pending' } } };
-    await bootWithUnreadableLatch();
-
-    expect(visibleScreens()).toEqual(['holding-screen']); // it really is held
-    expect(preferencesStore.has('tenant_suspended')).toBe(false);
-    expect(domElements.get('holding-message')!.textContent).toContain('Verifying');
-    expect(domElements.get('holding-message')!.textContent).not.toContain('contact your administrator');
-  });
-
-  it('G3x NEGATIVE CONTROL: a real 403 PROMOTES the hold — confirmed, persisted, and it stays', async () => {
-    // The entitlement fix must survive the false-positive bound. A genuinely suspended
-    // tenant answers 403: the hold is promoted to confirmed, persisted so a power cycle
-    // cannot resume it, and the release budget no longer applies.
-    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
-      ? { status: 403, data: {} }
-      : { status: 200, data: { data: { status: 'pending' } } };
-    await bootWithUnreadableLatch();
-
-    await waitUntil(
-      'the promotion to a confirmed suspension',
-      () => preferencesStore.get('tenant_suspended') === '1',
-      { tickMs: 20_000, budgetMs: 30_000 },
-    );
-
-    // Well past the provisional release budget: a confirmed hold does not time out.
-    await vi.advanceTimersByTimeAsync(300_000);
-    expect(visibleScreens()).toEqual(['holding-screen']);
-    expect(findCreatedElements('img').some(i => i.src.includes('cached1.jpg'))).toBe(false);
-    expect(await reportedEvents()).not.toContain('tenant_provisional_released');
-  });
-
-  it('G3x NEGATIVE CONTROL: a readable, absent latch resumes cached content normally', async () => {
-    // Same boot, same cached playlist, working store. Proves the hold above belongs to
-    // the unreadable latch and not to the cached-playlist path having gone dark — a
-    // fail-closed that fired on every boot would be its own outage.
-    secureStorageStore.set('device_token', 'tok-123');
-    secureStorageStore.set('device_id', 'dev-123');
-    preferencesStore.set('last_playlist', JSON.stringify({
-      tenantId: undefined, deviceId: 'dev-123', savedAt: Date.now(),
-      playlist: { id: 'pl-cached', name: 'cached', loopPlaylist: true,
-        items: [{ id: 'i1', contentId: 'cached1', duration: 10, order: 0,
-          content: { id: 'cached1', name: 'cached1', type: 'image', url: '/cached1.jpg' } }] },
-    }));
-
-    await importFresh();
-    await vi.advanceTimersByTimeAsync(1600);
-
-    expect(findCreatedElements('img').some(i => i.src.includes('cached1.jpg'))).toBe(true);
-    expect(await reportedEvents()).not.toContain('tenant_suspended_provisional');
-  });
+  // Deleted with the feature they covered. Three client-side attempts at deciding
+  // entitlement from a local latch each produced a defect at least as bad as the gap
+  // (see enterTenantSuspended for the full account), so the latch is gone and 1.3.15's
+  // in-memory behaviour stands as a KNOWN GAP pending a suspension check in the
+  // gateway handshake. These tests are not left behind as a skipped shell: tests for a
+  // deleted feature are a claim of coverage nobody can act on.
 
   // ======================================================================
   // G9x. A HALF IDENTITY IS A FAILED PAIR
@@ -8120,53 +7981,6 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     expect(frames).toHaveLength(1);
     expect(frames[0].src).toBe('https://example.com/board');
     expect(await reportedEvents()).not.toContain('frame_url_refused');
-  });
-
-  // ======================================================================
-  // P3. THE SUSPENSION LATCH IS CLEARED ON BOTH EXITS
-  // ======================================================================
-  //
-  // The latch is durable so a power cycle cannot be used to resume a suspended tenant.
-  // That makes CLEARING it safety-critical in the other direction: the write and the
-  // boot read were pinned, both clears were not, and a stranded latch means a
-  // genuinely resumed tenant re-enters holding on every future boot, forever — a
-  // black-screen fleet event that no amount of server-side "resume" can fix.
-
-  const suspendAndSettle = async () => {
-    triggerSocketEvent('tenant:suspended');
-    await waitUntil('the latch', () => preferencesStore.get('tenant_suspended') === '1', { tickMs: 100 });
-  };
-
-  it('P3: tenant:resumed clears the DURABLE latch, not just the in-memory flag', async () => {
-    await connectAndCommit();
-    await suspendAndSettle();
-
-    triggerSocketEvent('tenant:resumed');
-    await waitUntil('the latch clear', () => !preferencesStore.has('tenant_suspended'), { tickMs: 100 });
-
-    expect(preferencesStore.has('tenant_suspended')).toBe(false);
-    expect(await reportedEvents()).toContain('tenant_unsuspended');
-  });
-
-  it('P3: a purge clears it too — the next pairing must not inherit a suspension', async () => {
-    await connectAndCommit();
-    await suspendAndSettle();
-    await revokeAndSettleHere();
-
-    expect(preferencesStore.has('tenant_suspended')).toBe(false);
-  });
-
-  it('P3 NEGATIVE CONTROL: while still suspended the latch STAYS — it is not cleared by any traffic', async () => {
-    // The clears must be bound to a real resume/purge. A latch that any event could
-    // clear would defeat the whole point of persisting it, which is that a power cycle
-    // cannot resume a suspended tenant.
-    await connectAndCommit();
-    await suspendAndSettle();
-
-    triggerSocketEvent('playlist:update', playlistV('v2', 'c2', '/c2.jpg', 'pl-shared'));
-    await vi.advanceTimersByTimeAsync(1000);
-
-    expect(preferencesStore.get('tenant_suspended')).toBe('1');
   });
 
   // ======================================================================

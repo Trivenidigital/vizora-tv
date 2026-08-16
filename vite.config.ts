@@ -168,12 +168,27 @@ function resolveReleaseOrigins(mode: string, env: Record<string, string>): Resol
  *
  * Both assertions THROW. A silent warning is what we already had — the build printed
  * nothing and CI was green.
+ *
+ * WHAT THIS DOES NOT CATCH, so nobody reads it as covering the class:
+ *  - A PARTIAL SDK regression. The token check keys on sentry_key/sentry_client, which
+ *    live in the DSN/envelope code. A regression that retained, say, captureMessage
+ *    while eliminating init() and its integrations would carry neither token and could
+ *    fit inside the size headroom. The two arms overlap for the whole-SDK case only.
+ *  - The TV budget under CI: `build:tv` is not run there, so only the modern budget is
+ *    exercised automatically. The TV numbers are checked when someone builds TV.
  */
 function artifactAssertions(opts: { isTvBuild: boolean; sentryConfigured: boolean }): Plugin {
   // Headroom over today's output (~148 kB modern, ~282 kB TV incl. polyfills), sized so
   // ordinary growth does not trip it but a whole vendored SDK does. Raise deliberately
   // and say why — a budget quietly raised to make a build pass is not a budget.
-  const budgetBytes = opts.isTvBuild ? 340_000 : 200_000;
+  //
+  // GATED ON THE DSN, because the SDK is ~90 kB and a build WITH a DSN is supposed to
+  // carry it. Ungated, this would have failed the first build that supplied one —
+  // punishing the exact action the telemetry argument asks for, with a message telling
+  // them to find what grew. The no-DSN budget is the one that catches the regression
+  // this instrument exists for; the with-DSN budget just keeps an upper bound.
+  const sdkAllowance = opts.sentryConfigured ? 120_000 : 0;
+  const budgetBytes = (opts.isTvBuild ? 340_000 : 200_000) + sdkAllowance;
   return {
     name: 'vizora-artifact-assertions',
     writeBundle(_options, bundle) {
