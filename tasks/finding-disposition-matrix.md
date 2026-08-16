@@ -338,6 +338,16 @@ work, found by a later round.
 | Guard-predicate audit | 11 | **1** — the frozen marker count, claim living only in a javadoc | 3 (incl. the stale audit verdict above) |
 | Convergence round | 4 | **2** — the suspension fail-closed stranding healthy devices; a 90 kB shipped-artifact regression that **passed CI** | 1 |
 
+### A fourth category: disclosed residual risk
+
+One item does not belong in any of the three columns, and flattening it into the
+defect count would misrepresent it — in the direction of harshness, which is as
+inaccurate as flattering it.
+
+| Item | Category | Why it is neither a defect nor a false alarm |
+|---|---|---|
+| `Process.getStartElapsedRealtime()` may be stubbed to `0` on an OEM build, turning measured uptime into time-since-boot and **silently disabling loop containment while every test stays green** | **DISCLOSED RESIDUAL RISK, introduced by this wave's own change** | It shipped in no artifact and reached no device. It was found by the implementer *while classifying its own work*, disclosed unprompted, deliberately left unguarded with the reasoning stated, and made cheap to settle — a one-line uptime log means a 30-second logcat check resolves it at the hardware sitting. "We added a risk, saw it, and made it cheap to settle" is a different outcome from both "we shipped a bug" and "nothing happened" |
+
 **Self-inflicted rate has NOT reached zero.** Four distinct defects have been
 introduced into this wave's own work: the pairing-stranding guard, the frozen
 marker count, the stale audit verdict, and the bundle regression. The last is the
