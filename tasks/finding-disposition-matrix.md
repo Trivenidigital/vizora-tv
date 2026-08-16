@@ -243,6 +243,38 @@ dedupe ring (17/19), ack behaviour (16/16), cache managers (28/31), pairing
 
 ---
 
+## Findings the final exact-tree review raised — unresolved at wave close
+
+Six reviewers examined the complete `v1.3.15 → 3ef1148` tree as one diff. Three
+said cut, three said do not. The dissents are recorded here because they are
+**open**, not because they were adjudicated away.
+
+| Finding | Disposition | Evidence |
+|---|---|---|
+| **`release/1.3.16` had forked from `c821fbb` — before all three merges** | **REAL_FIXED** (release-process) | Cutting from it would have been a **silent revert of PRs #39/#40/#41**, dropping `build-provenance.ts`, `command-ring-store.ts`, the crash-recovery wiring and ~1,400 lines of `main.ts` while looking like a version bump. Rebased; `merge-base --is-ancestor origin/master HEAD` now answers YES |
+| **The versionCode check asserted existence, not movement** | **REAL_FIXED** | `versionName "1.3.16"` with `versionCode 10145` passed green — the two-binaries-one-identity case its own comment described. Now a monotonicity check against the last *published* code |
+| The gap rule still resets the ladder for a device whose **measured** uptime is ~0 | **REAL — OPEN** | The measured branch can only *clear* the chain, never preserve it, so the gap rule runs unconditionally in the hot-loop case. Two documents assert otherwise, including the runbook's "retired question" |
+| `renderer_loop` severity is **inverted** across the process boundary | **REAL — OPEN** | Native groups it with `uncaught_exception` (device dark on the 60-min rung); the web layer groups it with the recovery storm and tells the operator the screen "keeps recovering on its own" |
+| **The +90 kB regression is reproducible and still green** | **REAL — OPEN** | `crash-reporting.ts` is 6-of-7 unpinned; the sole detector is a real CI build. `vi.stubEnv` behaves identically for raw and transformed env reads, so no unit test can see it |
+| ~50 production lines deletable with the suite green | **REAL — OPEN** | Clustered at "the seam between a decision and its effect" — the CSP is never observed on the element, the cached URI never observed on the element, 8 of ~14 generation checkpoints unobserved |
+| The token scan is **disabled** exactly when a DSN is configured | **REAL — OPEN** | A DSN build gets no `@sentry` verification at all while being stamped `true` — newly load-bearing for whichever release supplies a DSN |
+| Signing fails **open**, and the rename erases the tell | **REAL — OPEN** (out-of-band) | An absent `keystore.properties` yields an unsigned APK, and the unconditional rename overwrites `app-release-unsigned.apk`. `GOOGLE_PLAY_PUBLISHING.md` documents a stale path that gradle will not find |
+
+## Branches without a pull request — a wave-hygiene class
+
+Raised as a near-miss and recorded as a standing check. **This instance was
+clean** — every branch's content is captured in master (verified by content, not
+by commit identity, since squash-merges rewrite history: master's `main.spec.ts`
+carries the cardinality assertion the stale client branch lacks, and the 171
+"branch-only" lines are the *superseded* `CrashLoopGuard`).
+
+But the failure mode is real and this wave created the conditions for it: a
+three-way overlap on `vite.config.ts` produced a slice owned by no surviving
+branch. **Before declaring a wave complete, enumerate every branch, check for one
+without a PR, and verify capture by content rather than by "it looked merged."**
+
+---
+
 ## Deferred at the tail, deliberately — with the fix shape named
 
 Four items were declined **late in the wave, on purpose**. The wave's signature
