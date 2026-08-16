@@ -125,3 +125,26 @@ distinguishable, or the check is decoration.
 
 Same class as an assertion that passes because the code path never ran, and as a guard
 condition that can never evaluate true.
+
+### L5 worked instance — outside the test suite
+
+The same shape bit a *verification of a verification*. On this host MSYS can mangle
+`git show <rev>:<path>` when the path starts with a dot-directory:
+
+    git show "origin/work/fix-client:.github/workflows/ci.yml"
+      -> origin\work\fix-client;.github\workflows\ci.yml   (git errors, output empty)
+
+The reviewer's grep then returned nothing and read as "the claimed CI job is absent" —
+a real finding, except no check had run. The job was present all along.
+
+Two properties make this worse than an ordinary flake:
+
+- **It is selective.** Plain paths (`sha:src/main.ts`) are unaffected, so most uses work
+  and the failures cluster on exactly the paths you reach for when auditing config.
+- **The failure mode is a false ACCUSATION**, not a false pass — which is the direction
+  that wastes a colleague's time and damages trust in the record.
+
+Workaround: `MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*'`.
+
+General rule this instance supports: when a check returns "nothing found", establish that
+the check ran at all before reporting the absence as evidence.
