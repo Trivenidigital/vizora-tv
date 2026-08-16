@@ -152,7 +152,14 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
         // Bookkeeping second. commit(), not apply(): the uncaught-exception caller is on a
         // dying process and apply()'s background flush may never run.
         persist(context, KEY_CRASH_HISTORY, updated, true);
-        Log.w(TAG, "Crash " + updated.length + " (" + reason + ") on the ladder");
+        // Process uptime is logged because it is the one input to the decay rule that cannot be
+        // checked without hardware. If Process.getStartElapsedRealtime() is stubbed to 0 on an
+        // OEM build, this reads as time since BOOT rather than since process start, every crash
+        // on a box that has been on for ten minutes looks like a healthy run, and loop
+        // containment is silently disabled. One logcat line during the hardware sitting settles
+        // it: on a crash-looping device this must read in the low seconds, not in hours.
+        Log.w(TAG, "Crash " + updated.length + " (" + reason + ") on the ladder, process uptime "
+            + uptimeMs + "ms");
         if (CrashLoopGuard.isLadderExhausted(updated)) {
             writeCappedMarker(context, now, updated.length, reason, true);
         }
