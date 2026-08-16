@@ -110,15 +110,31 @@ export function crashReportingOptions(dsn: string): Sentry.BrowserOptions {
 }
 
 export function initCrashReporting(): void {
-  const dsn = import.meta.env.VITE_SENTRY_DSN;
+  // TRIMMED, like the build side already does. A whitespace-only value is truthy, so
+  // `if (!dsn)` waved it through and Sentry then dropped every event.
+  const dsn = import.meta.env.VITE_SENTRY_DSN?.trim();
   if (!dsn) {
     console.log('[Vizora] Crash reporting disabled (no VITE_SENTRY_DSN)');
     return;
   }
 
   Sentry.init(crashReportingOptions(dsn));
-  enabled = true;
-  console.log('[Vizora] Crash reporting initialized');
+  // ASK SENTRY whether it can actually send, rather than assuming init() succeeded.
+  // An invalid DSN makes makeDsn() return undefined; Sentry.init then constructs NO
+  // transport and silently discards every event — no throw, no warning. Setting
+  // `enabled = true` on the strength of having called init() therefore claimed working
+  // telemetry for a device that has none.
+  //
+  // That flag is not cosmetic: reportCrashLoopMarker DELETES the once-ever crash-loop
+  // marker only when this returns true, so a bad DSN meant the marker was destroyed
+  // without ever being reported — the one record of why a device is degrading, gone,
+  // and the wave's "it is reported, not merely logged" argument void.
+  enabled = Boolean(Sentry.getClient()?.getTransport());
+  console.log(
+    enabled
+      ? '[Vizora] Crash reporting initialized'
+      : '[Vizora] Crash reporting INERT — the DSN was rejected, events will be discarded',
+  );
 }
 
 /**

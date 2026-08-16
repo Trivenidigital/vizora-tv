@@ -3448,7 +3448,19 @@ describe('VizoraAndroidTV', () => {
 
     it('init failure enters RECOVERING and retries to a working state — the error screen is never shown', async () => {
       secureStorageStore.clear();
-      preferencesFailNext = true; // first Preferences.get throws inside init()
+      // Driven through a TRANSIENT KEYSTORE failure, not a throwing Preferences read.
+      // The config reads are now bounded AND caught (a throwing store must not brick
+      // init — see the F-wave test below), so they no longer reject out of init() and
+      // no longer reach this path. The credential read still rethrows for the first
+      // three attempts, which is the live route into RECOVERING.
+      // Targeted at the SECOND device_token read: the first one belongs to the
+      // credential migration, whose own try/catch would swallow it.
+      const { SecureStorage: SS } = await import('./secure-storage');
+      let tokenReads = 0;
+      (SS.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+        if (key === 'device_token' && ++tokenReads === 2) throw new Error('transient keystore failure');
+        return { value: secureStorageStore.get(key) ?? null };
+      });
       await importFresh();
       // RECOVERING renders on the branded holding screen
       expect(visibleScreens()).toEqual(['holding-screen']);
@@ -7554,6 +7566,217 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     const imgs = findCreatedElements('img');
     expect(imgs.length).toBeGreaterThan(0);
     expect(imgs[imgs.length - 1].src).toContain('token=tok-123');
+  });
+
+  // ======================================================================
+  // G1x. THE FIRST STORAGE TOUCH OF THE BOOT CANNOT BRICK THE DEVICE
+  // ======================================================================
+  //
+  // loadConfig's three Preferences reads are the FIRST storage touch of the whole
+  // boot, and they were unbounded and uncaught — upstream of every bounded read the
+  // wave added, so none of those ever ran. Two brick shapes from one cause: a WEDGED
+  // bridge leaves init() pending forever (never settles, never rejects, so the
+  // startInit retry never fires — splash forever), and a THROWING store rejects out of
+  // init() into a permanent `recovering`. The second is live on the TV runtimes, where
+  // Preferences IS localStorage and one fault takes out every read identically.
+  //
+  // Stored config is an OVERRIDE of a compiled-in default, so booting without it is
+  // always safe. Proving the DEGRADED path, not the happy one: these guards exist for
+  // exactly the states below.
+
+  it('G1x: a WEDGED config read does not hang the boot — the device still reaches pairing', async () => {
+    secureStorageStore.clear();
+    const { Preferences } = await import('@capacitor/preferences');
+    (Preferences.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      if (key.startsWith('config_')) return NEVER();
+      return { value: preferencesStore.get(key) ?? null };
+    });
+
+    await importFresh();
+    await vi.advanceTimersByTimeAsync(2500); // past the 2000ms bound
+    await waitUntil(
+      'the pairing code',
+      () => domElements.get('pairing-code')!.textContent === 'ABCD1234',
+      { tickMs: 300 },
+    );
+
+    expect(visibleScreens()).toEqual(['pairing-screen']);
+    const timeouts = (await reportedEventCalls()).filter(c => c[0] === 'preferences_read_timeout');
+    expect(timeouts.length).toBeGreaterThan(0);
+  });
+
+  it('G1x: a THROWING config store does not strand the device in recovering', async () => {
+    // The TV shape: Preferences IS localStorage there, so this is every read failing
+    // at once, which is also every retry failing — a permanent "Starting up — retrying…".
+    secureStorageStore.clear();
+    const { Preferences } = await import('@capacitor/preferences');
+    (Preferences.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      if (key.startsWith('config_')) throw new Error('QuotaExceededError');
+      return { value: preferencesStore.get(key) ?? null };
+    });
+
+    await importFresh(() => domElements.get('pairing-code')!.textContent === 'ABCD1234');
+
+    expect(visibleScreens()).toEqual(['pairing-screen']);
+    expect(domElements.get('holding-message')!.textContent).not.toContain('retrying');
+  });
+
+  it('G1x NEGATIVE CONTROL: a healthy store still APPLIES the stored config override', async () => {
+    // The bound and the catch must not turn into "ignore stored config" — these values
+    // are how a paired device is pointed at a different backend.
+    secureStorageStore.clear();
+    preferencesStore.set('config_api_url', 'https://stored.example.com');
+
+    await importFresh(() => domElements.get('pairing-code')!.textContent === 'ABCD1234');
+
+    const { CapacitorHttp } = await import('@capacitor/core');
+    const posts = (CapacitorHttp.post as Mock).mock.calls
+      .map((c: unknown[]) => (c[0] as { url: string }).url)
+      .filter((u: string) => u.includes('/pairing/request'));
+    expect(posts.length).toBeGreaterThan(0);
+    expect(posts.every((u: string) => u.startsWith('https://stored.example.com'))).toBe(true);
+  });
+
+  // ======================================================================
+  // G3x. AN UNREADABLE SUSPENSION LATCH FAILS CLOSED
+  // ======================================================================
+  //
+  // Nothing re-checks suspension on a boot that read the latch as absent: the
+  // reconnect revalidation is gated on tenantSuspended ALREADY being true, and the
+  // gateway handshake has no suspension check at all. So treating an unreadable latch
+  // as "not suspended" resumed a suspended tenant's cached content on customer glass,
+  // permanently. Suspended-provisionally is recoverable — revalidateTenantSuspension's
+  // 200 is the normal exit — while the reverse mistake is not.
+
+  it('G3x: a WEDGED latch read holds the device instead of resuming cached content', async () => {
+    secureStorageStore.set('device_token', 'tok-123');
+    secureStorageStore.set('device_id', 'dev-123');
+    preferencesStore.set('last_playlist', JSON.stringify({
+      tenantId: undefined, deviceId: 'dev-123', savedAt: Date.now(),
+      playlist: { id: 'pl-cached', name: 'cached', loopPlaylist: true,
+        items: [{ id: 'i1', contentId: 'cached1', duration: 10, order: 0,
+          content: { id: 'cached1', name: 'cached1', type: 'image', url: '/cached1.jpg' } }] },
+    }));
+    const { Preferences } = await import('@capacitor/preferences');
+    (Preferences.get as Mock).mockImplementation(async ({ key }: { key: string }) => {
+      if (key === 'tenant_suspended') return NEVER();
+      return { value: preferencesStore.get(key) ?? null };
+    });
+
+    await importFresh();
+    await vi.advanceTimersByTimeAsync(2500);
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(findCreatedElements('img').some(i => i.src.includes('cached1.jpg'))).toBe(false);
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    expect(await reportedEvents()).toContain('tenant_suspended_provisional');
+  });
+
+  it('G3x NEGATIVE CONTROL: a readable, absent latch resumes cached content normally', async () => {
+    // Same boot, same cached playlist, working store. Proves the hold above belongs to
+    // the unreadable latch and not to the cached-playlist path having gone dark — a
+    // fail-closed that fired on every boot would be its own outage.
+    secureStorageStore.set('device_token', 'tok-123');
+    secureStorageStore.set('device_id', 'dev-123');
+    preferencesStore.set('last_playlist', JSON.stringify({
+      tenantId: undefined, deviceId: 'dev-123', savedAt: Date.now(),
+      playlist: { id: 'pl-cached', name: 'cached', loopPlaylist: true,
+        items: [{ id: 'i1', contentId: 'cached1', duration: 10, order: 0,
+          content: { id: 'cached1', name: 'cached1', type: 'image', url: '/cached1.jpg' } }] },
+    }));
+
+    await importFresh();
+    await vi.advanceTimersByTimeAsync(1600);
+
+    expect(findCreatedElements('img').some(i => i.src.includes('cached1.jpg'))).toBe(true);
+    expect(await reportedEvents()).not.toContain('tenant_suspended_provisional');
+  });
+
+  // ======================================================================
+  // G9x. A HALF IDENTITY IS A FAILED PAIR
+  // ======================================================================
+  //
+  // Verified at deployed d323434e (middleware pairing.service.ts:503-511): the paired
+  // response returns deviceToken from Redis but deviceId/tenantId from a SEPARATE DB
+  // lookup, optional-chained. A Display row deleted or re-created between
+  // completePairing and the next poll therefore yields `paired` + a valid token + no
+  // ids. Committing that leaves canPair() true — token AND deviceId are required — so
+  // the holding refusal fires and the device strands on a dead code: the F1 bug again,
+  // through the one input F1's own comment assumed.
+
+  it('G9x: a paired response with NO deviceId does not commit, and does not strand', async () => {
+    secureStorageStore.clear();
+    // NEITHER source carries an id. The pairing REQUEST response normally does, and
+    // the commit legitimately falls back to it — that fallback is kept, so it has to
+    // be removed here too or this would be testing the fallback working, not the hole.
+    httpPostHandler = () => ({ status: 200, data: { data: { code: 'ABCD1234', expiresInSeconds: 300 } } });
+    httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
+      ? { status: 200, data: { data: { status: 'paired', deviceToken: 'tok-half' } } } // no deviceId
+      : { status: 200, data: { data: { status: 'pending' } } };
+
+    await importFresh(() => domElements.get('pairing-code')!.textContent === 'ABCD1234');
+    await vi.advanceTimersByTimeAsync(6000); // several poll rounds
+
+    // Nothing committed — a half identity is not a pairing.
+    expect(secureStorageStore.has('device_token')).toBe(false);
+    expect(secureStorageStore.has('device_id')).toBe(false);
+    expect(await reportedEvents()).toContain('pairing_persist_failed');
+    // …and the device is still pairable, showing a LIVE code rather than stranded.
+    expect(visibleScreens()).toEqual(['pairing-screen']);
+    expect(domElements.get('pairing-code')!.textContent).toBe('ABCD1234');
+  });
+
+  it('G9x: the retry does not spin hot — it stays on the 2s poll cadence', async () => {
+    // The recoverable branch retries by leaving the poller running. That must not
+    // become a busy loop against a backend that is already in trouble.
+    secureStorageStore.clear();
+    httpPostHandler = () => ({ status: 200, data: { data: { code: 'ABCD1234', expiresInSeconds: 300 } } });
+    httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
+      ? { status: 200, data: { data: { status: 'paired', deviceToken: 'tok-half' } } }
+      : { status: 200, data: { data: { status: 'pending' } } };
+    const { CapacitorHttp } = await import('@capacitor/core');
+    await importFresh(() => domElements.get('pairing-code')!.textContent === 'ABCD1234');
+
+    (CapacitorHttp.get as Mock).mockClear();
+    await vi.advanceTimersByTimeAsync(10_000); // five poll periods
+
+    const polls = (CapacitorHttp.get as Mock).mock.calls
+      .filter((c: unknown[]) => (c[0] as { url: string }).url.includes('/pairing/status/'));
+    expect(polls.length).toBeLessThanOrEqual(6);
+  });
+
+  it('G9x: a missing tenantId is REPORTED but still pairs — the legacy backend must stay pairable', async () => {
+    // Deliberately NOT fatal, unlike deviceId: the legacy backend never sends tenantId
+    // (init() has a documented grace path for it), so refusing here would make this
+    // client unpairable against it forever. What was wrong was the SILENCE — the device
+    // is now permanently on the no-binding grace path, which weakens cache isolation.
+    secureStorageStore.clear();
+    httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
+      ? { status: 200, data: { data: { status: 'paired', deviceToken: 'tok-legacy', deviceId: 'dev-legacy' } } }
+      : { status: 200, data: { data: { status: 'pending' } } };
+
+    await importFresh(() => domElements.get('pairing-code')!.textContent === 'ABCD1234');
+    await waitUntil('the pair to commit', () => secureStorageStore.get('device_token') === 'tok-legacy', { tickMs: 2100 });
+
+    expect(secureStorageStore.get('device_id')).toBe('dev-legacy');
+    expect(secureStorageStore.has('tenant_id')).toBe(false);
+    expect(await reportedEvents()).toContain('pairing_without_tenant');
+  });
+
+  it('G9x NEGATIVE CONTROL: a COMPLETE paired response still commits everything', async () => {
+    secureStorageStore.clear();
+    httpGetHandler = (opts) => opts.url.includes('/pairing/status/')
+      ? { status: 200, data: { data: { status: 'paired', deviceToken: 'tok-full', deviceId: 'dev-full', tenantId: 'tenant-full' } } }
+      : { status: 200, data: { data: { status: 'pending' } } };
+
+    await importFresh(() => domElements.get('pairing-code')!.textContent === 'ABCD1234');
+    await waitUntil('the pair to commit', () => secureStorageStore.get('device_token') === 'tok-full', { tickMs: 2100 });
+
+    expect(secureStorageStore.get('device_id')).toBe('dev-full');
+    expect(secureStorageStore.get('tenant_id')).toBe('tenant-full');
+    expect(await reportedEvents()).not.toContain('pairing_persist_failed');
+    expect(await reportedEvents()).not.toContain('pairing_without_tenant');
   });
 
   // ======================================================================

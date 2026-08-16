@@ -641,8 +641,31 @@ class VizoraAndroidTV {
       // content: last_playlist is still on disk and would otherwise render straight
       // away. Only a 200 from auth/check clears it — on connect (see the `connect`
       // handler) or via the probe loop — so this is a hold, not a dead end.
-      const suspendedLatch = await this.boundedPrefsGet(VizoraAndroidTV.TENANT_SUSPENDED_PREF_KEY);
-      if (suspendedLatch !== 'timeout' && suspendedLatch.value === '1') {
+      // FAIL CLOSED on an unreadable latch. Treating 'timeout' as "not suspended" was
+      // an entitlement fail-open: nothing else re-checks. The reconnect revalidation is
+      // gated on tenantSuspended ALREADY being true, and the gateway handshake has no
+      // suspension check at all (verified against deployed d323434e) — so on a
+      // degraded-storage reboot a suspended tenant's cached content resumed on customer
+      // glass and stayed there.
+      //
+      // Suspended-provisionally is recoverable and cheap: revalidateTenantSuspension's
+      // 200 is the normal exit and it runs on connect, so a device that is NOT actually
+      // suspended clears the hold as soon as it reaches the network. The reverse
+      // mistake — rendering a suspended tenant's content — is not recoverable, because
+      // nothing would ever ask again.
+      let suspendedLatch: { value: string | null } | 'timeout';
+      try {
+        suspendedLatch = await this.boundedPrefsGet(VizoraAndroidTV.TENANT_SUSPENDED_PREF_KEY);
+      } catch (error) {
+        console.warn('[Vizora] Suspension latch read threw — holding provisionally:', error);
+        reportEvent('tenant_latch_read_failed', { error: String(error) });
+        suspendedLatch = 'timeout';
+      }
+      if (suspendedLatch === 'timeout') {
+        console.warn('[Vizora] Suspension latch unreadable — entering suspension PROVISIONALLY (fail closed)');
+        reportEvent('tenant_suspended_provisional', {});
+        this.enterTenantSuspended('latch_unreadable');
+      } else if (suspendedLatch.value === '1') {
         this.enterTenantSuspended('restored_latch');
       }
 
@@ -683,13 +706,33 @@ class VizoraAndroidTV {
     if (dashboardUrl) this.config.dashboardUrl = dashboardUrl;
 
     // Try to load from stored preferences
-    const storedApiUrl = await Preferences.get({ key: 'config_api_url' });
-    const storedRealtimeUrl = await Preferences.get({ key: 'config_realtime_url' });
-    const storedDashboardUrl = await Preferences.get({ key: 'config_dashboard_url' });
+    // BOUNDED and CAUGHT — this is the FIRST storage touch of the whole boot, which
+    // makes it the one place a bound was missing most. Two brick shapes, one cause:
+    //
+    //  - A WEDGED bridge leaves Preferences.get pending forever. init() then never
+    //    settles, so it never rejects, so startInit()'s retry never fires: the splash
+    //    screen stays up permanently with no error and no telemetry. Every other
+    //    bounded read in init() is downstream of this one, so none of them ever ran.
+    //  - A THROWING store rejects out of init() into startInit()'s catch, which lands
+    //    the device in `recovering` ("Starting up — retrying…") on every attempt,
+    //    forever. Live on the TV runtimes specifically: Preferences there IS
+    //    localStorage, so one storage fault takes out every read identically.
+    //
+    // This is the F37 brick shape the wave already closed for SecureStorage one call
+    // later. Stored config is an OVERRIDE of a compiled-in default, so continuing
+    // without it is always safe — the device boots against its build-time origins.
+    const stored = await Promise.all([
+      this.boundedPrefsGet('config_api_url').catch(() => 'timeout' as const),
+      this.boundedPrefsGet('config_realtime_url').catch(() => 'timeout' as const),
+      this.boundedPrefsGet('config_dashboard_url').catch(() => 'timeout' as const),
+    ]);
+    const [storedApiUrl, storedRealtimeUrl, storedDashboardUrl] = stored.map(
+      r => (r === 'timeout' ? null : r.value),
+    );
 
-    if (storedApiUrl.value && !apiUrl) this.config.apiUrl = storedApiUrl.value;
-    if (storedRealtimeUrl.value && !realtimeUrl) this.config.realtimeUrl = storedRealtimeUrl.value;
-    if (storedDashboardUrl.value && !dashboardUrl) this.config.dashboardUrl = storedDashboardUrl.value;
+    if (storedApiUrl && !apiUrl) this.config.apiUrl = storedApiUrl;
+    if (storedRealtimeUrl && !realtimeUrl) this.config.realtimeUrl = storedRealtimeUrl;
+    if (storedDashboardUrl && !dashboardUrl) this.config.dashboardUrl = storedDashboardUrl;
 
     console.log('[Vizora] Config loaded:', this.config);
   }
@@ -994,6 +1037,10 @@ class VizoraAndroidTV {
   private static crashLoopDegradation(reason: string | null): string {
     switch (reason) {
       case 'renderer_recovery_storm':
+      // The native handler writes `renderer_loop` for the same condition under a
+      // different code path; without its own case it fell to the generic default and
+      // an operator was told 'the native handler capped it' with no idea what broke.
+      case 'renderer_loop':
         return 'the WebView renderer was dying and being recovered repeatedly';
       case 'uncaught_exception':
         return 'the device had degraded to the slow restart rung';
@@ -1344,10 +1391,42 @@ class VizoraAndroidTV {
           // downgrading cross-tenant cache isolation.
           this.pairingCommitInFlight = true;
           try {
+            // A HALF IDENTITY IS A FAILED PAIR, not a pair. Verified at deployed
+            // d323434e (middleware pairing.service.ts:503-511): the paired response
+            // returns `deviceToken: request.plaintextToken` from Redis, but
+            // `deviceId: display?.id` and `tenantId: display?.organizationId` from a
+            // SEPARATE DB lookup — optional-chained. Delete or re-create the Display
+            // row between completePairing and the device's next poll (an ordinary
+            // admin action during an install) and the wire says `paired`, hands over a
+            // VALID TOKEN, and omits the ids.
+            //
+            // Committing that is the stranded-device bug again, by a different door:
+            // canPair() requires token AND deviceId, so an empty id leaves it true and
+            // the holding refusal fires on a device that is, as far as the server is
+            // concerned, paired. `deviceId || ''` wrote exactly that empty string.
+            //
+            // Note the fallback above is legitimate and is kept: the pairing REQUEST
+            // response also carries a deviceId, so `this.deviceId` may already hold it.
+            // What is refused is having NEITHER.
+            if (!deviceId) {
+              throw new Error('paired response carried no deviceId');
+            }
             await SecureStorage.set({ key: 'device_token', value: data.deviceToken });
-            await SecureStorage.set({ key: 'device_id', value: deviceId || '' });
+            await SecureStorage.set({ key: 'device_id', value: deviceId });
             if (tenantId) {
               await SecureStorage.set({ key: 'tenant_id', value: tenantId });
+            } else {
+              // NOT fatal, deliberately — and this is a considered disagreement with
+              // the review, which suggested treating it like a missing deviceId. The
+              // legacy backend genuinely never sends tenantId (see the grace path in
+              // init()), so refusing here would make this client unpairable against it
+              // forever — the exact "so strict it strands a legitimate device" failure
+              // the same review warned about. What was wrong was that the degradation
+              // was SILENT: this device is now permanently on the legacy no-binding
+              // grace path, which weakens cross-tenant cache isolation, so it is
+              // reported rather than refused.
+              console.warn('[Vizora] Paired without a tenantId — cache/playlist binding degrades to legacy grace');
+              reportEvent('pairing_without_tenant', { hasDeviceId: true });
             }
           } catch (error) {
             // Fail RECOVERABLE: nothing is committed and the poller is untouched, so
@@ -2904,7 +2983,16 @@ class VizoraAndroidTV {
     let key: string;
     if (typeof commandId === 'string' && commandId) {
       key = `${type}#${commandId}`;
-    } else if (typeof timestamp === 'string' || typeof timestamp === 'number') {
+    } else if (
+      (typeof timestamp === 'string' || typeof timestamp === 'number') &&
+      // `timestamp` is unvalidated wire data and the synthetic-record family is keyed
+      // `type@~unkeyed:<ms>`. A server timestamp beginning with `~` would land in that
+      // namespace and could be read back as a synthetic record — letting a crafted
+      // stamp suppress a later unkeyable reload, or be aged out by its window. No real
+      // timestamp (ISO string or epoch number) starts with `~`, so refusing costs
+      // nothing and returning null already means "execute, do not suppress".
+      !String(timestamp).startsWith('~')
+    ) {
       key = `${type}@${timestamp}`;
     } else {
       return null;
@@ -3738,8 +3826,12 @@ class VizoraAndroidTV {
    *    the app origin, granted allow-same-origin, can read the device JWT straight
    *    out of SecureStorage through `parent`.
    *
-   * Relative URLs resolve against the app document, which is the same resolution the
-   * iframe would do — so `/whatever` is correctly judged app-origin and refused.
+   * The base is the app document, matching the resolution an iframe would do. Note
+   * what this does NOT buy in practice: every caller passes transformContentUrl's
+   * output, which has already resolved a root-relative `/x` against the API origin,
+   * so such a URL never reaches here still relative and is never judged app-origin.
+   * The base is kept as defence in depth for a future caller that passes a raw URL —
+   * it is not the mechanism that closes the same-origin hole.
    */
   private static isRenderableFrameUrl(candidate: string): boolean {
     const here = (window as unknown as { location?: { href?: string; origin?: string } }).location;
