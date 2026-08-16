@@ -243,6 +243,41 @@ dedupe ring (17/19), ack behaviour (16/16), cache managers (28/31), pairing
 
 ---
 
+## Deliberate deferrals whose fix lives in another repository
+
+| Finding | Disposition | Owner / evidence |
+|---|---|---|
+| **A TV reboot still fail-opens on tenant suspension** | **NOT_WORTH_CHANGING client-side — deliberate deferral, not an oversight.** Filed as `Trivenidigital/Vizora#362` | The realtime gateway handshake at deployed `d323434e` has **no** suspension check — only the outbound emitter. `403 TENANT_SUSPENDED` is produced solely by the REST `auth/check`, and an expired token returns **401 before that check is reached**. Since 14 of 24 production devices are past the 90-day expiry, the client's only authority cannot answer for most of the fleet. **Three client-side attempts, all reverted** (see below). The client now carries the in-memory latch plus revalidate-on-reconnect, with the durable fix named at `enterTenantSuspended` |
+
+### Why there is no fourth client-side attempt
+
+Recorded because the reasoning is the deliverable, and because a future reader
+will otherwise see an obvious-looking gap and re-add the latch.
+
+1. **In-memory latch** (shipped in 1.3.15) — cleared on any reconnect, lost on
+   reboot. A suspended tenant resumes.
+2. **Durable latch, fail-closed** — stranded **healthy** devices permanently on
+   "Display paused — contact your administrator". Every exit demanded HTTP 200
+   and three ordinary states cannot produce one: expired token → 401, legacy
+   backend → 404 which *stops* the probe loop, outage → null. The trigger
+   population was strictly larger than the fail-open it replaced.
+3. **Provisional/confirmed split** — worse, and the most serious defect this wave
+   produced in its own work. The release path called `exitTenantSuspended`, which
+   unconditionally removes the persisted key — so a hold entered *because the
+   latch could not be read* went on to **delete** it. On a genuinely suspended
+   tenant with an expired token, two probes erase the latch and no later boot can
+   re-latch: **the tenant becomes permanently unsuspendable on that device.** An
+   entitlement bypass produced by a fix intended to close a fail-open.
+
+The implementer's own diagnosis is the clearest statement of the class: *"I wrote
+the release path and never followed it into the function it calls."*
+
+All three were reverted in full rather than partially, and the nine associated
+tests were **deleted rather than skipped** — a skipped test is a claim left in
+suspension.
+
+---
+
 ## Corrections to this wave's own durable records
 
 Claims this wave asserted and later disproved. Recorded with the retraction
