@@ -164,6 +164,29 @@ version drift in `tizen/config.xml` and `webos/appinfo.json` (see the release cu
 
 ---
 
+## The CI failure that was not a flake
+
+Recorded separately because of how it was found, not only what it was.
+
+`#39` and `#40` both went red on one assertion — `Pairing — Request > starts
+polling for pairing status`. Master was green at all three merged commits, so it
+was introduced or exposed by that work. It would have been cheap to call it a
+flake and re-run. This repo has already been burned by exactly that (PR #30, "the
+'pre-existing flake' was a real product defect"), so it was treated as evidence.
+
+| Finding | Disposition | Consuming-path evidence |
+|---|---|---|
+| **A cosmetic QR render gated the functional pairing poll** | **REAL_FIXED — customer-visible, unattended-device bricking** | `main.ts` — `startPairingCheck()` was sequenced *after* `await this.generateQRCode()`, which awaits a real dynamic `import('qrcode')`. A **rejecting** import was always survivable: `generateQRCode` catches both the import and `toCanvas` and does not rethrow. An import that never **settles** was not — the await never returns, the poll is never armed, and because the **only** thing that replaces an expired pairing code is that poll's own 404 branch (`main.ts:1245-1248`), the device sits forever displaying a dead code. Unattended, that is a truck roll. Fixed by arming the poll ahead of the QR block, so a hung render costs a missing QR image and nothing else. Verified it cannot double-arm (`startPairingCheck` clears any existing interval) and cannot poll before a code exists. |
+| The same CI failure, considered as a **product race** | **FALSE_ALARM** | `main.ts:1212-1221` — polling starting a few hundred ms later is meaningless against a 2s cadence and a five-minute code |
+| The same CI failure, considered as a **harness defect** | **REAL_FIXED** | `vizora-app.spec.ts` — a fixed 2000ms advance against a real dynamic import; reproduced two ways (starve the settle budget; settle the gate partway through the advance so the interval arms with under one period left), both yielding CI's exact `expected false to be true` |
+| The same fixed-budget shape elsewhere | **REAL_FIXED** | 7 further instances, found by a **discriminating probe** — inject latency at each `import('qrcode')` await site and see which tests fail — rather than by grep. That named exactly 8 tests across 2 gate sites and proved the other 531 insensitive; grep would have found the shape but not which instances depended on it |
+
+**The process point:** the product defect was reachable only through the failing
+test. Dismissing it as flaky would have shipped 1.3.16 with an unattended-device
+bricking path intact. This finding alone plausibly justifies the release.
+
+---
+
 ## Final review wave (six reviewers + mutation audit)
 
 | Finding | Disposition | Evidence |
@@ -187,3 +210,33 @@ version drift in `tizen/config.xml` and `webos/appinfo.json` (see the release cu
 | `commit()`-vs-`apply()` durability unobservable | **HARDWARE_BLOCKED** | Robolectric applies both synchronously; held by code review only |
 | Install-over preserving pairing | **HARDWARE_BLOCKED** | Source proves format compatibility on every persisted store; only a device proves the update survives |
 | Downgrade 1.3.16 → 1.3.15 as rollback | **FALSE_ALARM** (as an available path) | Android refuses a lower versionCode on retail `user` builds; uninstall-to-downgrade destroys pairing. Rollback is **roll-forward to 1.3.17** |
+
+---
+
+## Independent mutation-integrity audit
+
+Commissioned because a coder's mutation-revert silently no-op'd mid-session (an
+ambiguous replacement string matched nothing), so the next mutation ran on a
+still-mutated tree. The trust boundary was every result after that point, not the
+one repaired result — so coverage was **re-derived from scratch** rather than
+replayed: 176 mutations, 176 restores, every restore verified clean, zero
+failures. 122 killed.
+
+Well pinned, and stated because it is evidence the wave's core work holds: the
+dedupe ring (17/19), ack behaviour (16/16), cache managers (28/31), pairing
+(7/8), crash-reporting scrubbers (6/6), screen-state (2/2).
+
+| Finding | Disposition | Evidence |
+|---|---|---|
+| `purgeDeviceState`'s in-memory half almost entirely unguarded | **REAL_FIXED** (verification) | Deleting `this.deviceToken = null` ships **green** — the credential survives revocation in memory. So does deleting the whole socket teardown, both `clearTimeout` blocks, and each of `deviceId`/`tenantId`/`temporaryContent`/`savedPlaylistState`. Only `deviceToken`+`deviceId` **as a pair** was caught. The revocation suites assert on mock stores and `visibleScreens()`, and the `pairing-screen` result comes from `startPairing()`, not from the field clears |
+| `vite.config.ts` had **zero** coverage | **REAL_FIXED** | No spec referenced it. Reverting `__APP_VERSION__` to `npm_package_version \|\| '1.0.0'` — **the exact bug this wave fixed** — left the suite green, as did stamping `__RELEASE_SENTRY_CONFIGURED__` `true` unconditionally, which would make every artifact assert a lie the publish-side verifier then confirms. Pure decision logic extracted to `src/build-provenance.ts` and unit-tested; the wiring is bound by calling the real vite factory and reading the `define` object it compiles in |
+| Whitespace-only DSN stamps "configured" | **REAL_FIXED** | `Boolean('   ')` is `true`. Same failure as the unconditional stamp, but reachable by a plausible typo rather than a code edit |
+| Suspension-latch **clears** unpinned on both paths | **REAL_FIXED** (verification) | A resumed tenant would re-enter `holding` on every future boot, forever. The write and the boot read were pinned; only the clears were not |
+| `isRenderableFrameUrl` failure semantics unpinned | **REAL_FIXED** (verification) | Flipping its `catch` to `return true` frames an unparseable URL; dropping the base-URL argument stops relative URLs resolving against the app document — together, a relative URL is framed **at app origin**, reopening the same-origin hole |
+| `if (!store) return false` → `true` | **REAL_FIXED** (verification) | On a runtime without `localStorage` this reports the record durable and **disarms the fail-closed refusal** |
+| PD-1 signature consumer never reached | **REAL_FIXED** (verification) | 8 tests against the exported pure function; nothing bound them to the single production line that consumes it. Deleting that consumer left 539 green — the negative-control blind spot exactly |
+| Vacuous assertion at `spec:4485` | **REAL_FIXED** | `expect(secureStorageStore.has('tenant_id')).toBe(false)` in a suite that never seeds `tenant_id`. Proven vacuous by replacing the production removal with `Promise.resolve()` and watching it pass |
+| Push-path purge-generation read | **REAL_FIXED** (verification) | Production correct; the pull equivalent was pinned and the push was not |
+| 1 non-deterministic full-suite failure in 33 runs | **REAL_FIXED** (headroom) | Unreproduced across 30 further runs, 6 loaded runs and 25 targeted runs; only correlate is duration (23.78s vs 16.51s). Prime suspect is real-time headroom — a 3000ms `waitFor` against a real Socket.IO server under vitest's 5s per-test timeout leaves ~2s of slack, and a slow run is the regime that eats it |
+| 41 fixed-count microtask drains in the spec | **NOT_WORTH_CHANGING** (this wave) | Deterministic today because I/O is mocked, but they encode an assumed promise-chain depth, and several are followed by `.not.toContain(...)` assertions that would go vacuous rather than red. Recorded as the next verification-hygiene unit of work |
+| `resolveReleaseOrigins()` zero coverage | **REAL_FIXED** | The load-bearing fail-closed provenance mechanism, exercised by the new wiring tests but asserted about not at all |
