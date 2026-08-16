@@ -14,6 +14,7 @@ import android.os.SystemClock;
 
 import com.capacitorjs.plugins.preferences.CapacitorPreferencesReader;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +26,7 @@ import org.junit.runner.RunWith;
 import org.robolectric.RobolectricTestRunner;
 import org.robolectric.RuntimeEnvironment;
 import org.robolectric.shadows.ShadowAlarmManager;
+import org.robolectric.shadows.ShadowSystemClock;
 
 /**
  * WIRING tests for {@link CrashRecoveryHandler}.
@@ -499,6 +501,7 @@ public class CrashRecoveryHandlerWiringTest {
         // through the same prefs the handler reads rather than by moving time.
         seedRecoveryChain(CrashLoopGuard.BACKOFF_MS.length + 1,
             System.currentTimeMillis() - CrashLoopGuard.GRACE_MS - 60_000L);
+        seedStormAlreadyReported();
         assertNull("precondition: nothing reported yet",
             CapacitorPreferencesReader.get(context, "crash_loop_capped"));
 
@@ -509,6 +512,12 @@ public class CrashRecoveryHandlerWiringTest {
         assertNotNull("a fresh episode after a quiet period must be reported again; a chain "
                 + "that never decays reports the first storm and then goes silent forever",
             CapacitorPreferencesReader.get(context, "crash_loop_capped"));
+    }
+
+    /** The previous episode was reported, so the latch is set. */
+    private void seedStormAlreadyReported() {
+        context.getSharedPreferences("vizora_crash_recovery", Context.MODE_PRIVATE)
+            .edit().putBoolean("renderer_storm_reported", true).commit();
     }
 
     /** Write an already-exhausted recovery chain, all of it {@code atMs}, as prefs state. */
@@ -526,6 +535,46 @@ public class CrashRecoveryHandlerWiringTest {
     /** What src/main.ts does with the marker on every page load: report it, then remove it. */
     private void consumeMarkerAsTheWebLayerWould() {
         capacitorPrefs().edit().remove(CrashRecoveryHandler.KEY_CAPPED_MARKER).commit();
+    }
+
+    // ---- the ladder decays on MEASURED uptime, at the call site -----------------------------
+
+    @Test
+    public void aCrashAfterALongHealthyRunGetsTheFastRungAgain() {
+        // Binds the measurement to the production call site, and isolates it: Robolectric's
+        // shadow clock moves elapsedRealtime (hence measured process uptime) WITHOUT moving
+        // wall clock, so the gap between crash timestamps stays ~0 here. The gap rule therefore
+        // still says "keep the chain"; only the uptime measurement can produce a reset.
+        //
+        // That is exactly the operator's case — a device brought back by something other than
+        // our alarm, which then ran fine for a long time — and before the measurement existed
+        // it took the 60-minute rung anyway.
+        for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
+            CrashRecoveryHandler.recordAndScheduleRelaunch(
+                context, CrashRecoveryHandler.REASON_UNCAUGHT_EXCEPTION);
+        }
+        assertEquals(CrashLoopGuard.CAPPED_RETRY_MS, scheduledDelayMs(lastAlarm()));
+
+        ShadowSystemClock.advanceBy(Duration.ofMillis(CrashLoopGuard.GRACE_MS + 60_000L));
+        CrashRecoveryHandler.recordAndScheduleRelaunch(
+            context, CrashRecoveryHandler.REASON_UNCAUGHT_EXCEPTION);
+
+        assertEquals("the app demonstrably stayed up for longer than the grace period, so the "
+                + "streak of failed starts is over and this is a first crash again",
+            CrashLoopGuard.BACKOFF_MS[0], scheduledDelayMs(lastAlarm()));
+    }
+
+    @Test
+    public void aCrashDuringStartupStillEscalates() {
+        // Negative control for the test above: without advancing the clock the process has been
+        // up for milliseconds, which must NOT be read as a healthy run — otherwise the
+        // measurement would un-stick the very loop the ladder exists to contain.
+        for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
+            CrashRecoveryHandler.recordAndScheduleRelaunch(
+                context, CrashRecoveryHandler.REASON_UNCAUGHT_EXCEPTION);
+        }
+
+        assertEquals(CrashLoopGuard.CAPPED_RETRY_MS, scheduledDelayMs(lastAlarm()));
     }
 
     // ---- one key, shared by both causes: a write must not downgrade the record --------------
@@ -600,6 +649,50 @@ public class CrashRecoveryHandlerWiringTest {
             CapacitorPreferencesReader.get(context, "crash_loop_capped").split(":")[1]);
         assertTrue("the marker froze at " + atTransition + " crashes, so a week-long loop looks "
                 + "identical to a single episode", afterMoreCrashes > atTransition);
+    }
+
+    @Test
+    public void aStormReportRefusedByTheNoClobberRuleIsRetriedNotLost() {
+        // The two rules interact badly if the storm report fires only on the exact transition:
+        // that single write can be refused, and the recovery chain does NOT decay during a
+        // continuous storm, so the length climbs past the transition and the episode is lost
+        // silently — the exact failure class this marker exists to remove.
+        //
+        // And it is not a race. main.ts keeps the ladder marker when crash reporting is
+        // disabled, which is the configuration this repo ships, so the refusal would persist
+        // for the life of the device: a box that ever hit the cap could never again report a
+        // flicker storm.
+        degradeOnTheRestartLadder();
+        flickerIntoAStorm();
+        assertEquals("precondition: the storm report is refused while the worse record stands",
+            CrashRecoveryHandler.REASON_UNCAUGHT_EXCEPTION, markerReason());
+
+        // The operator finally gets the ladder marker reported, freeing the slot.
+        consumeMarkerAsTheWebLayerWould();
+
+        // The storm is still going — one more flicker, well past the transition length.
+        CrashRecoveryHandler.recordRendererRecovery(context);
+
+        assertEquals("the storm report was dropped on the floor instead of retried",
+            CrashRecoveryHandler.REASON_RENDERER_RECOVERY_STORM, markerReason());
+    }
+
+    @Test
+    public void aRetriedStormReportStillOnlyLandsOnce() {
+        // The retry must not become the flood the transition check was preventing.
+        degradeOnTheRestartLadder();
+        flickerIntoAStorm();
+        consumeMarkerAsTheWebLayerWould();
+        CrashRecoveryHandler.recordRendererRecovery(context);
+        assertEquals(CrashRecoveryHandler.REASON_RENDERER_RECOVERY_STORM, markerReason());
+        consumeMarkerAsTheWebLayerWould();
+
+        for (int i = 0; i < 20; i++) {
+            CrashRecoveryHandler.recordRendererRecovery(context);
+        }
+
+        assertNull("once the episode is reported it must stay quiet until a new one",
+            CapacitorPreferencesReader.get(context, "crash_loop_capped"));
     }
 
     @Test

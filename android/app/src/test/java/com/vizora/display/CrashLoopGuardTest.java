@@ -22,12 +22,14 @@ import org.junit.Test;
 public class CrashLoopGuardTest {
 
     private static final long T0 = 1_700_000_000_000L; // arbitrary wall-clock base
+    private static final long UNKNOWN = CrashLoopGuard.UPTIME_UNKNOWN;
+    private static final long GRACE = CrashLoopGuard.GRACE_MS;
 
     // ---- escalation ladder -----------------------------------------------------------------
 
     @Test
     public void firstCrashUsesFirstRung() {
-        long[] h = CrashLoopGuard.recordCrash(new long[0], T0);
+        long[] h = CrashLoopGuard.recordCrash(new long[0], T0, 0L);
         assertArrayEquals(new long[] { T0 }, h);
         assertEquals(3_000L, CrashLoopGuard.decide(h));
     }
@@ -37,16 +39,16 @@ public class CrashLoopGuardTest {
         // Four crashes 1 minute apart — all inside the 10-minute window.
         long[] h = new long[0];
 
-        h = CrashLoopGuard.recordCrash(h, T0);
+        h = CrashLoopGuard.recordCrash(h, T0, 0L);
         assertEquals("1st crash -> 3s", 3_000L, CrashLoopGuard.decide(h));
 
-        h = CrashLoopGuard.recordCrash(h, T0 + 60_000L);
+        h = CrashLoopGuard.recordCrash(h, T0 + 60_000L, 0L);
         assertEquals("2nd crash -> 30s", 30_000L, CrashLoopGuard.decide(h));
 
-        h = CrashLoopGuard.recordCrash(h, T0 + 120_000L);
+        h = CrashLoopGuard.recordCrash(h, T0 + 120_000L, 0L);
         assertEquals("3rd crash -> 5min", 300_000L, CrashLoopGuard.decide(h));
 
-        h = CrashLoopGuard.recordCrash(h, T0 + 180_000L);
+        h = CrashLoopGuard.recordCrash(h, T0 + 180_000L, 0L);
         assertEquals("4th crash -> 60min, NOT a give-up",
             60L * 60 * 1000L, CrashLoopGuard.decide(h));
     }
@@ -58,7 +60,7 @@ public class CrashLoopGuardTest {
         // that stops trying to come back is a truck roll; ~24 restarts/day is not.
         long[] h = new long[0];
         for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length + 3; i++) {
-            h = CrashLoopGuard.recordCrash(h, T0 + i * 30_000L);
+            h = CrashLoopGuard.recordCrash(h, T0 + i * 30_000L, 0L);
         }
         assertTrue("ladder should be exhausted", CrashLoopGuard.isLadderExhausted(h));
         assertEquals(CrashLoopGuard.CAPPED_RETRY_MS, CrashLoopGuard.decide(h));
@@ -71,7 +73,7 @@ public class CrashLoopGuardTest {
         // which decide() returns a sentinel, a negative, or zero.
         long[] h = new long[0];
         for (int i = 0; i < CrashLoopGuard.MAX_HISTORY + 10; i++) {
-            h = CrashLoopGuard.recordCrash(h, T0 + i * 1_000L);
+            h = CrashLoopGuard.recordCrash(h, T0 + i * 1_000L, 0L);
             long delay = CrashLoopGuard.decide(h);
             assertTrue("crash " + (i + 1) + " produced a non-schedulable delay: " + delay,
                 delay > 0L);
@@ -91,7 +93,7 @@ public class CrashLoopGuardTest {
         assertEquals(CrashLoopGuard.BACKOFF_MS[CrashLoopGuard.BACKOFF_MS.length - 1],
             CrashLoopGuard.decide(atLadderEnd));
 
-        long[] oneMore = CrashLoopGuard.recordCrash(atLadderEnd, T0 + atLadderEnd.length);
+        long[] oneMore = CrashLoopGuard.recordCrash(atLadderEnd, T0 + atLadderEnd.length, 0L);
         assertTrue(CrashLoopGuard.isLadderExhausted(oneMore));
         assertEquals(CrashLoopGuard.CAPPED_RETRY_MS, CrashLoopGuard.decide(oneMore));
     }
@@ -110,7 +112,7 @@ public class CrashLoopGuardTest {
     public void ladderIsNotExhaustedBeforeItRunsOut() {
         long[] h = new long[0];
         for (int i = 0; i < CrashLoopGuard.BACKOFF_MS.length; i++) {
-            h = CrashLoopGuard.recordCrash(h, T0 + i * 1_000L);
+            h = CrashLoopGuard.recordCrash(h, T0 + i * 1_000L, 0L);
             assertFalse("crash " + (i + 1) + " is still on the ladder",
                 CrashLoopGuard.isLadderExhausted(h));
         }
@@ -122,19 +124,19 @@ public class CrashLoopGuardTest {
 
     @Test
     public void crashBeforeTheAppCouldStayUpCompounds() {
-        long[] first = CrashLoopGuard.recordCrash(new long[0], T0);
+        long[] first = CrashLoopGuard.recordCrash(new long[0], T0, 0L);
         // 3s rung + almost all of the grace: the app never really came back.
         long[] second = CrashLoopGuard.recordCrash(
-            first, T0 + 3_000L + CrashLoopGuard.GRACE_MS - 1);
+            first, T0 + 3_000L + GRACE - 1, GRACE - 1);
         assertEquals(2, second.length);
         assertEquals(30_000L, CrashLoopGuard.decide(second));
     }
 
     @Test
     public void crashAfterTheAppStayedUpDoesNotCompound() {
-        long[] first = CrashLoopGuard.recordCrash(new long[0], T0);
-        long later = T0 + 3_000L + CrashLoopGuard.GRACE_MS;
-        long[] second = CrashLoopGuard.recordCrash(first, later);
+        long[] first = CrashLoopGuard.recordCrash(new long[0], T0, 0L);
+        long later = T0 + 3_000L + GRACE;
+        long[] second = CrashLoopGuard.recordCrash(first, later, GRACE);
         assertArrayEquals("stale entry pruned", new long[] { later }, second);
         assertEquals("back to the first rung", 3_000L, CrashLoopGuard.decide(second));
     }
@@ -148,13 +150,13 @@ public class CrashLoopGuardTest {
         // itself.
         long[] h = new long[0];
         for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
-            h = CrashLoopGuard.recordCrash(h, T0 + i * 1_000L);
+            h = CrashLoopGuard.recordCrash(h, T0 + i * 1_000L, 0L);
         }
         assertEquals(CrashLoopGuard.CAPPED_RETRY_MS, CrashLoopGuard.decide(h));
 
         long later = T0 + CrashLoopGuard.CAPPED_RETRY_MS + CrashLoopGuard.GRACE_MS + 60_000L;
-        assertEquals(0, CrashLoopGuard.pruneChain(h, later).length);
-        assertEquals(3_000L, CrashLoopGuard.decide(CrashLoopGuard.recordCrash(h, later)));
+        assertEquals(0, CrashLoopGuard.pruneChain(h, later, UNKNOWN).length);
+        assertEquals(3_000L, CrashLoopGuard.decide(CrashLoopGuard.recordCrash(h, later, 0L)));
     }
 
     @Test
@@ -165,14 +167,14 @@ public class CrashLoopGuardTest {
         // unreachable — see theCappedRungIsAReachableSteadyState.
         long now = T0 + 3_000L;
         long[] history = { T0 - 1, T0, T0 + 1, now };
-        assertArrayEquals(history, CrashLoopGuard.pruneChain(history, now));
+        assertArrayEquals(history, CrashLoopGuard.pruneChain(history, now, UNKNOWN));
     }
 
     @Test
     public void pruneDropsTheChainOnceTheAppHasStayedUp() {
         long[] history = { T0, T0 + 1_000L, T0 + 2_000L };
         long now = T0 + 2_000L + CrashLoopGuard.CAPPED_RETRY_MS + CrashLoopGuard.GRACE_MS;
-        assertEquals(0, CrashLoopGuard.pruneChain(history, now).length);
+        assertEquals(0, CrashLoopGuard.pruneChain(history, now, UNKNOWN).length);
     }
 
     // ---- N2/F1: the cap must be sticky at ~0 uptime AND released by real uptime -------------
@@ -186,10 +188,10 @@ public class CrashLoopGuardTest {
         // the ladder from the bottom forever.
         long[] h = new long[0];
         for (int i = 0; i < CrashLoopGuard.BACKOFF_MS.length + 3; i++) {
-            h = CrashLoopGuard.recordCrash(h, T0 + i);
+            h = CrashLoopGuard.recordCrash(h, T0 + i, 0L);
             long imposed = CrashLoopGuard.decide(h);
             // A crash arriving exactly when the restart was due must still be on the chain.
-            long[] onSchedule = CrashLoopGuard.pruneChain(h, T0 + i + imposed);
+            long[] onSchedule = CrashLoopGuard.pruneChain(h, T0 + i + imposed, UNKNOWN);
             assertEquals("a crash " + imposed + "ms later — exactly when we told the device to "
                     + "come back — must not look like a healthy run", h.length, onSchedule.length);
         }
@@ -211,7 +213,7 @@ public class CrashLoopGuardTest {
         long[] h = new long[0];
         long t = T0;
         for (int crash = 1; crash <= 8; crash++) {
-            h = CrashLoopGuard.recordCrash(h, t);
+            h = CrashLoopGuard.recordCrash(h, t, uptime);
             long delay = CrashLoopGuard.decide(h);
             assertEquals("crash " + crash + " (t+" + (t - T0) / 60000 + "min) escalated even "
                     + "though the app had been up for " + uptime / 60000 + " minutes",
@@ -231,15 +233,103 @@ public class CrashLoopGuardTest {
         long[] h = new long[0];
         long t = T0;
         for (int crash = 1; crash <= CrashLoopGuard.BACKOFF_MS.length + 1; crash++) {
-            h = CrashLoopGuard.recordCrash(h, t);
+            h = CrashLoopGuard.recordCrash(h, t, 0L);
             t += CrashLoopGuard.decide(h);
         }
         assertEquals(CrashLoopGuard.CAPPED_RETRY_MS, CrashLoopGuard.decide(h));
 
-        long[] afterAHealthyRun = CrashLoopGuard.recordCrash(h, t + CrashLoopGuard.GRACE_MS);
+        long[] afterAHealthyRun = CrashLoopGuard.recordCrash(h, t + GRACE, GRACE);
         assertEquals("the app stayed up for a full grace period; the ladder must forget",
             1, afterAHealthyRun.length);
         assertEquals(CrashLoopGuard.BACKOFF_MS[0], CrashLoopGuard.decide(afterAHealthyRun));
+    }
+
+    // ---- measured uptime, not inferred ------------------------------------------------------
+
+    /** A chain sitting on the capped rung, most recent entry at T0. */
+    private long[] chainOnTheCappedRung() {
+        long[] h = new long[0];
+        for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
+            h = CrashLoopGuard.recordCrash(h, T0 - (CrashLoopGuard.BACKOFF_MS.length - i), 0L);
+        }
+        return h;
+    }
+
+    @Test
+    public void measuredUptimeClearsTheChainEvenWhenTheGapSaysOtherwise() {
+        // The operator case, and the reason the gap rule cannot be the primary signal. Device is
+        // dark on the 60-minute rung. A human power-cycles it two minutes in, watches it run
+        // happily for 40 minutes, and it hits the same transient again.
+        //
+        // The gap rule sees 42 minutes and demands 70, because it credits a 60-minute delay
+        // that was never served — our alarm did not bring this device back, a person did. So it
+        // keeps the chain and the operator watches the screen go dark for another hour, having
+        // just been shown 40 minutes of proof that it works. The measurement sees 40 minutes of
+        // uptime and resets.
+        long[] chain = chainOnTheCappedRung();
+        long gap = 42 * 60 * 1000L;
+        long demonstratedUptime = 40 * 60 * 1000L;
+
+        assertEquals("40 minutes of uptime must clear the streak",
+            0, CrashLoopGuard.pruneChain(chain, T0 + gap, demonstratedUptime).length);
+        assertEquals("first rung after a run that long",
+            CrashLoopGuard.BACKOFF_MS[0],
+            CrashLoopGuard.decide(CrashLoopGuard.recordCrash(chain, T0 + gap, demonstratedUptime)));
+
+        // Contrast, so this test names what it is actually fixing: the gap rule alone keeps it.
+        assertEquals("the gap heuristic on its own still pins this device — that is the defect "
+                + "the measurement removes, not a behaviour to preserve",
+            chain.length, CrashLoopGuard.pruneChain(chain, T0 + gap, UNKNOWN).length);
+    }
+
+    @Test
+    public void measuredUptimeDoesNotRescueADeviceThatIsStillHotLooping() {
+        // The other direction: a short run must NOT clear the streak, or the cap is unreachable
+        // again. This is the startup-crash loop — the process dies seconds in, every time.
+        long[] chain = chainOnTheCappedRung();
+
+        long[] kept = CrashLoopGuard.pruneChain(chain, T0 + 3_000L, 2_000L);
+
+        assertEquals("two seconds of uptime is not a recovery", chain.length, kept.length);
+        assertEquals(CrashLoopGuard.CAPPED_RETRY_MS,
+            CrashLoopGuard.decide(CrashLoopGuard.recordCrash(chain, T0 + 3_000L, 2_000L)));
+    }
+
+    @Test
+    public void uptimeIsMeasuredAtTheBoundaryNotApproximately() {
+        long[] chain = chainOnTheCappedRung();
+        assertEquals("just under the grace period is still a failed start",
+            chain.length, CrashLoopGuard.pruneChain(chain, T0 + 1_000L, GRACE - 1).length);
+        assertEquals("exactly the grace period counts as having stayed up",
+            0, CrashLoopGuard.pruneChain(chain, T0 + 1_000L, GRACE).length);
+    }
+
+    @Test
+    public void anUnmeasurableUptimeFallsBackToTheGapRule() {
+        // API < 24, or a platform that hands back something inconsistent. The fallback is the
+        // behaviour that shipped before the measurement existed, so it must stay intact rather
+        // than failing open to "always reset" or closed to "never reset".
+        long[] chain = chainOnTheCappedRung();
+
+        assertEquals("a crash that arrives on schedule still compounds",
+            chain.length,
+            CrashLoopGuard.pruneChain(chain, T0 + CrashLoopGuard.CAPPED_RETRY_MS, UNKNOWN).length);
+        assertEquals("and a stale chain still decays",
+            0,
+            CrashLoopGuard.pruneChain(
+                chain, T0 + CrashLoopGuard.CAPPED_RETRY_MS + GRACE, UNKNOWN).length);
+    }
+
+    @Test
+    public void aStaleChainDecaysEvenWhenTheAppKeepsDyingInstantly() {
+        // Why the gap rule is kept at all rather than replaced outright: measured uptime says
+        // nothing about how OLD the streak is. A device that crashed four times last week, was
+        // switched off, and now crashes two seconds after a cold start must not be sentenced to
+        // the hourly rung on the strength of week-old history.
+        long[] chain = chainOnTheCappedRung();
+        long aWeek = 7L * 24 * 60 * 60 * 1000L;
+
+        assertEquals(0, CrashLoopGuard.pruneChain(chain, T0 + aWeek, 2_000L).length);
     }
 
     // ---- the report-only recovery chain decays differently ----------------------------------
@@ -286,7 +376,7 @@ public class CrashLoopGuardTest {
         long delay = 0L;
         for (int crash = 1; crash <= 24; crash++) {
             t += delay;
-            h = CrashLoopGuard.recordCrash(h, t);
+            h = CrashLoopGuard.recordCrash(h, t, 0L);
             delay = CrashLoopGuard.decide(h);
             if (crash > CrashLoopGuard.BACKOFF_MS.length) {
                 assertEquals("crash " + crash + " (t+" + (t - T0) + "ms) fell off the capped "
@@ -305,7 +395,7 @@ public class CrashLoopGuardTest {
         long delay = 0L;
         for (int crash = 1; crash <= 24; crash++) {
             t += delay;
-            h = CrashLoopGuard.recordCrash(h, t);
+            h = CrashLoopGuard.recordCrash(h, t, 0L);
             delay = CrashLoopGuard.decide(h);
         }
         assertTrue("a day of crash-looping still reports only " + h.length + " events",
@@ -320,14 +410,14 @@ public class CrashLoopGuardTest {
         // (rather than giving up) depends on the device healing itself once the cause clears.
         long[] h = new long[0];
         for (int i = 0; i <= CrashLoopGuard.BACKOFF_MS.length; i++) {
-            h = CrashLoopGuard.recordCrash(h, T0 + i * 1_000L);
+            h = CrashLoopGuard.recordCrash(h, T0 + i * 1_000L, 0L);
         }
         assertEquals(CrashLoopGuard.CAPPED_RETRY_MS, CrashLoopGuard.decide(h));
 
         long afterAQuietWindow =
             T0 + CrashLoopGuard.CAPPED_RETRY_MS + CrashLoopGuard.GRACE_MS + 60_000L;
         assertEquals(3_000L,
-            CrashLoopGuard.decide(CrashLoopGuard.recordCrash(h, afterAQuietWindow)));
+            CrashLoopGuard.decide(CrashLoopGuard.recordCrash(h, afterAQuietWindow, 0L)));
     }
 
     @Test
@@ -335,15 +425,15 @@ public class CrashLoopGuardTest {
         // Wall clock can jump years on a TV box that boots without a network. A stored
         // timestamp in the future would otherwise keep the chain alive forever.
         long[] history = { T0 + 5L * 365 * 24 * 60 * 60 * 1000L, T0 + 1_000L };
-        assertEquals(0, CrashLoopGuard.pruneChain(history, T0).length);
-        assertEquals(3_000L, CrashLoopGuard.decide(CrashLoopGuard.recordCrash(history, T0)));
+        assertEquals(0, CrashLoopGuard.pruneChain(history, T0, UNKNOWN).length);
+        assertEquals(3_000L, CrashLoopGuard.decide(CrashLoopGuard.recordCrash(history, T0, 0L)));
     }
 
     @Test
     public void historyIsCappedAndKeepsTheMostRecent() {
         long[] h = new long[0];
         for (int i = 0; i < CrashLoopGuard.MAX_HISTORY + 5; i++) {
-            h = CrashLoopGuard.recordCrash(h, T0 + i);
+            h = CrashLoopGuard.recordCrash(h, T0 + i, 0L);
         }
         assertEquals(CrashLoopGuard.MAX_HISTORY, h.length);
         assertEquals(T0 + CrashLoopGuard.MAX_HISTORY + 4, h[h.length - 1]);
@@ -356,7 +446,7 @@ public class CrashLoopGuardTest {
     public void nullOrEmptyHistoryFailsOpenToARestart() {
         assertEquals(3_000L, CrashLoopGuard.decide(null));
         assertEquals(3_000L, CrashLoopGuard.decide(new long[0]));
-        assertArrayEquals(new long[] { T0 }, CrashLoopGuard.recordCrash(null, T0));
+        assertArrayEquals(new long[] { T0 }, CrashLoopGuard.recordCrash(null, T0, 0L));
     }
 
     // ---- persisted form --------------------------------------------------------------------

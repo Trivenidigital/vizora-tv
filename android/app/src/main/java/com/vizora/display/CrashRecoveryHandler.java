@@ -6,6 +6,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.os.Build;
+import android.os.Process;
 import android.os.SystemClock;
 import android.util.Log;
 
@@ -55,6 +56,9 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
      * successful recovery must not lengthen the restart backoff.
      */
     private static final String KEY_RECOVERY_HISTORY = "renderer_recovery_ms";
+
+    /** Per-episode latch so a storm is reported once, and RETRIED until it is. See F2. */
+    private static final String KEY_STORM_REPORTED = "renderer_storm_reported";
 
     /**
      * Capacitor's Preferences plugin stores everything in this SharedPreferences file under
@@ -138,7 +142,9 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
      */
     static void recordAndScheduleRelaunch(Context context, String reason) {
         long now = System.currentTimeMillis();
-        long[] updated = evaluate(context, KEY_CRASH_HISTORY, now, CrashLoopGuard::recordCrash);
+        long uptimeMs = processUptimeMs();
+        long[] updated = evaluate(context, KEY_CRASH_HISTORY, now,
+            (history, nowMs) -> CrashLoopGuard.recordCrash(history, nowMs, uptimeMs));
 
         // SAFETY ACTION FIRST — see the N4 note above.
         scheduleRestart(context, CrashLoopGuard.decide(updated));
@@ -166,18 +172,26 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
      * {@link #REASON_RENDERER_RECOVERY_STORM}. src/main.ts reports it on the next boot, and on
      * this path there IS a next boot — the in-process relaunch reloads the web app every time.
      *
-     * F2 — the marker is written ONCE, on the transition onto the exhausted rung, and that is
-     * load-bearing rather than tidy. Every other marker writer is rate-limited by the delay it
-     * just imposed (at worst one per hour on the capped rung); this one is not rate-limited by
-     * anything, because the device is up and flickering. Writing it on every recovery past the
-     * threshold, at the storm shape this method exists for (deaths just outside the ~10s guard
-     * interval), is ~7.8k markers/day — and since main.ts reads AND removes the marker on every
-     * page load, and the in-process relaunch triggers a page load on every flicker, each one
-     * becomes a distinct telemetry event. An alert that fires thousands of times a day is not
-     * an alert, and it would burn the reporting quota that the rest of this class's §12b
-     * argument depends on. Once per episode is the whole signal: "this device is flickering".
-     * A genuinely new episode re-arms it, because the recovery chain decays after
-     * {@link CrashLoopGuard#GRACE_MS} of quiet (see {@link CrashLoopGuard#recordRecovery}).
+     * F2 — the marker is reported ONCE PER EPISODE, and that is load-bearing rather than tidy.
+     * Every other marker writer is rate-limited by the delay it just imposed (at worst one per
+     * hour on the capped rung); this one is not rate-limited by anything, because the device is
+     * up and flickering. Writing it on every recovery past the threshold, at the storm shape
+     * this method exists for (deaths just outside the ~10s guard interval), is ~7.8k markers/day
+     * — and since main.ts reads AND removes the marker on every page load, and the in-process
+     * relaunch triggers a page load on every flicker, each one becomes a distinct telemetry
+     * event. An alert that fires thousands of times a day is not an alert, and it would burn the
+     * reporting quota that the rest of this class's §12b argument depends on.
+     *
+     * "Once per episode" is a PENDING FLAG, not the exact transition {@code length == 4}. Firing
+     * only on the exact transition looked equivalent and was not: that single write can be
+     * refused by the no-clobber rule in {@link #writeCappedMarker}, and nothing retried it. The
+     * chain does not decay during a continuous storm, so the length climbs past 4 and the
+     * episode is lost — silently, which is the failure class this marker exists to remove. On a
+     * build with no VITE_SENTRY_DSN (the configuration this repo ships) the web layer keeps the
+     * ladder marker indefinitely, so the refusal is not a transient race: it would mute the
+     * storm reason for the life of the device the moment it ever hit the cap. With the flag the
+     * write is retried on every subsequent flicker and lands as soon as the slot is free, and
+     * the flag clears when the chain decays, so a later episode reports again.
      *
      * Why a SEPARATE history rather than the restart ladder: entries on the restart ladder
      * lengthen the next restart delay. A recovery is a SUCCESS — the screen came back in under
@@ -196,9 +210,40 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
             evaluate(context, KEY_RECOVERY_HISTORY, now, CrashLoopGuard::recordRecovery);
         persist(context, KEY_RECOVERY_HISTORY, updated, false);
         Log.w(TAG, "Renderer recovered in-process (" + updated.length + " in this chain)");
-        if (updated.length == CrashLoopGuard.BACKOFF_MS.length + 1) {
-            // Exactly the transition, not every event past it — see F2 above.
-            writeCappedMarker(context, now, updated.length, REASON_RENDERER_RECOVERY_STORM, false);
+
+        if (updated.length == 1) {
+            // The chain decayed, so this is a new episode: re-arm the report.
+            setStormReported(context, false);
+            return;
+        }
+        if (!CrashLoopGuard.isLadderExhausted(updated) || stormReported(context)) {
+            return;
+        }
+        if (writeCappedMarker(context, now, updated.length, REASON_RENDERER_RECOVERY_STORM, false)) {
+            setStormReported(context, true);
+        }
+        // If the write was refused, the flag stays false and the next flicker retries it.
+    }
+
+    /** Whether the current storm episode has already left a marker. See F2 above. */
+    private static boolean stormReported(Context context) {
+        try {
+            return context.getSharedPreferences(CRASH_PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(KEY_STORM_REPORTED, false);
+        } catch (Throwable t) {
+            // Fail toward reporting: a duplicate report is recoverable, a lost one is not.
+            return false;
+        }
+    }
+
+    private static void setStormReported(Context context, boolean reported) {
+        try {
+            context.getSharedPreferences(CRASH_PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_STORM_REPORTED, reported)
+                .apply();
+        } catch (Throwable t) {
+            Log.e(TAG, "Failed to persist the storm-reported flag", t);
         }
     }
 
@@ -236,11 +281,44 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
 
     /**
      * Which decay rule this history follows. The two chains are NOT interchangeable — the
-     * restart ladder decays against the penalty it imposed, the report-only recovery chain
-     * against plain quiet — so the choice is passed in rather than inferred from the key.
+     * restart ladder decays on measured process uptime, the report-only recovery chain on plain
+     * quiet — so the choice is passed in rather than inferred from the key.
      */
     private interface Recorder {
         long[] record(long[] historyMs, long nowMs);
+    }
+
+    /**
+     * How long THIS process has been running, or {@link CrashLoopGuard#UPTIME_UNKNOWN}.
+     *
+     * This is the measurement that lets {@link CrashLoopGuard} stop inferring uptime from the
+     * gap between crashes. The inference was only valid when our own alarm served the delay it
+     * subtracts — i.e. exactly on the background-activity-launch premise this class refuses to
+     * assert. Measuring instead means the rule is correct however the app came back: an alarm,
+     * an operator power-cycling a dark screen, a nightly reboot, MY_PACKAGE_REPLACED, or the
+     * launcher.
+     *
+     * Both clocks are monotonic elapsed-realtime, so unlike the crash history this cannot be
+     * corrupted by an NTP jump. Deliberately NOT persisted: a stored start time is stale exactly
+     * when it matters most — a crash early in a new process, before the value is rewritten,
+     * would read the PREVIOUS process's start and report an uptime of hours, resetting the
+     * ladder on the one shape (a crash during startup) it exists to contain.
+     *
+     * API 24+. Below that the guard falls back to the gap heuristic, which is what shipped
+     * before this existed; minSdk is 23, so the fallback is reachable on exactly one API level.
+     */
+    private static long processUptimeMs() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            return CrashLoopGuard.UPTIME_UNKNOWN;
+        }
+        try {
+            long uptime = SystemClock.elapsedRealtime() - Process.getStartElapsedRealtime();
+            return uptime >= 0 ? uptime : CrashLoopGuard.UPTIME_UNKNOWN;
+        } catch (Throwable t) {
+            // Never let a telemetry-grade measurement cost us the restart.
+            Log.e(TAG, "Could not measure process uptime; falling back to the gap heuristic", t);
+            return CrashLoopGuard.UPTIME_UNKNOWN;
+        }
     }
 
     /**
@@ -336,7 +414,7 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
      *
      * Best effort and non-fatal: never let telemetry bookkeeping cost us the restart.
      */
-    private static void writeCappedMarker(
+    private static boolean writeCappedMarker(
             Context context, long nowMs, int events, String reason, boolean durable) {
         try {
             SharedPreferences markerPrefs =
@@ -345,7 +423,7 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
                     && wouldDowngradeAnUnreportedMarker(markerPrefs)) {
                 Log.w(TAG, "Keeping the existing unreported degradation marker; a " + reason
                     + " must not overwrite a record of the device being dark");
-                return;
+                return false;
             }
             SharedPreferences.Editor editor = markerPrefs
                     .edit()
@@ -357,8 +435,10 @@ public class CrashRecoveryHandler implements Thread.UncaughtExceptionHandler {
             }
             Log.e(TAG, "Degradation marker persisted (" + reason + ", " + events
                 + " events in the window) for operator telemetry");
+            return true;
         } catch (Throwable t) {
             Log.e(TAG, "Failed to persist crash-loop marker", t);
+            return false;
         }
     }
 

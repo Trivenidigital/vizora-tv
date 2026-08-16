@@ -151,9 +151,13 @@ public class MainActivityRendererLossTest {
     // ---- the loop branch (BLOCKER: this is the release's headline fix) ----------------------
 
     @Test
-    public void aRendererLoopSchedulesARestartInsteadOfGoingDark() {
+    public void aRendererLoopSchedulesARestartInsteadOfSchedulingNothing() {
         // THE regression test for the dark screen. Deleting the recordAndScheduleRelaunch call
         // from MainActivity's loop branch used to leave every Java test green.
+        //
+        // Named for scheduling, not for recovering: whether the alarm's activity start is
+        // permitted against a dead process is the unsettled BAL question. Scheduling nothing
+        // is certainly a dark screen; scheduling something is the most this can prove.
         launchActivity();
         rendererDies();               // recovered in-process
         shadowOf(activity).clearNextStartedActivities();

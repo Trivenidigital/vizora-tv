@@ -30,6 +30,12 @@ import org.robolectric.shadows.ShadowApplication;
  *
  * Each accepted action gets its own case rather than a loop, so a regression names the broadcast
  * it broke.
+ *
+ * NOTE WHAT THESE NAMES CLAIM. They assert that startActivity was CALLED, which is the whole of
+ * what a receiver can be held to here. Whether that call is permitted is a background-activity-
+ * launch question BootReceiver itself explicitly disclaims on Android 12+, and we have no
+ * hardware evidence either way — so nothing here is named "...RelaunchesTheApp". Same reason the
+ * alarm tests are named for asking for the idle exemption rather than for surviving Doze.
  */
 @RunWith(RobolectricTestRunner.class)
 public class BootReceiverTest {
@@ -51,9 +57,10 @@ public class BootReceiverTest {
         new BootReceiver().onReceive(application, new Intent(action));
     }
 
-    private void assertRelaunchedMainActivity(String action) {
+    private void assertAskedToStartMainActivity(String action) {
         Intent started = relaunchIntent();
-        assertNotNull(action + " must relaunch the app; nothing was started", started);
+        assertNotNull(action + " must ASK to start the app; startActivity was never called",
+            started);
         assertNotNull("relaunch intent has no component", started.getComponent());
         assertEquals(MainActivity.class.getName(), started.getComponent().getClassName());
         assertTrue("a relaunch from a receiver has no task to join, so it needs NEW_TASK",
@@ -61,29 +68,29 @@ public class BootReceiverTest {
     }
 
     @Test
-    public void bootCompletedRelaunchesTheApp() {
+    public void bootCompletedAsksToRelaunchTheApp() {
         deliver(Intent.ACTION_BOOT_COMPLETED);
-        assertRelaunchedMainActivity("BOOT_COMPLETED");
+        assertAskedToStartMainActivity("BOOT_COMPLETED");
     }
 
     @Test
-    public void packageReplacedRelaunchesTheApp() {
+    public void packageReplacedAsksToRelaunchTheApp() {
         // N3. A Play/sideload update kills our process and nothing else brings it back.
         deliver(Intent.ACTION_MY_PACKAGE_REPLACED);
-        assertRelaunchedMainActivity("MY_PACKAGE_REPLACED");
+        assertAskedToStartMainActivity("MY_PACKAGE_REPLACED");
     }
 
     @Test
-    public void aospQuickbootRelaunchesTheApp() {
+    public void aospQuickbootAsksToRelaunchTheApp() {
         // F55: some TV boxes send only the quick-boot broadcast, never BOOT_COMPLETED.
         deliver("android.intent.action.QUICKBOOT_POWERON");
-        assertRelaunchedMainActivity("QUICKBOOT_POWERON");
+        assertAskedToStartMainActivity("QUICKBOOT_POWERON");
     }
 
     @Test
-    public void htcQuickbootRelaunchesTheApp() {
+    public void htcQuickbootAsksToRelaunchTheApp() {
         deliver("com.htc.intent.action.QUICKBOOT_POWERON");
-        assertRelaunchedMainActivity("com.htc QUICKBOOT_POWERON");
+        assertAskedToStartMainActivity("com.htc QUICKBOOT_POWERON");
     }
 
     @Test
