@@ -209,6 +209,21 @@ const CLIENT_CAPABILITIES: readonly string[] = ['deliveryAck'];
 /** The callback the server attaches to a delivery-guaranteed emit. May be absent. */
 type DeliveryAck = ((response: { ok: boolean }) => void) | undefined;
 
+/**
+ * One auth-check answer, with the two facts the callers need to tell apart.
+ *
+ * `status` is the HTTP status, or null when the endpoint could not be reached at all
+ * (offline, DNS, TLS, timeout) — never confuse that with a server verdict.
+ * `code` is the contract's structured discriminator from the body (§3.3), or null when
+ * the body was absent, unparseable, or shaped differently than expected. Without it a
+ * 401 that means "this token is not valid" is indistinguishable from a 401 that means
+ * "this token expired", which have different remedies.
+ */
+interface AuthCheckResult {
+  status: number | null;
+  code: string | null;
+}
+
 interface PerformanceMemory {
   usedJSHeapSize: number;
   jsHeapSizeLimit: number;
@@ -270,6 +285,63 @@ class VizoraAndroidTV {
   private authProbeRetry = 0;
   private lastConfirmProbeAt = 0;
   private authDegradedSince = 0;
+  /**
+   * Consecutive auth-check probes that came back 401 AUTH_INVALID. Reset by ANY other
+   * outcome — a 200, a 403, a 404, a 5xx, an unreachable endpoint, or a 401 carrying
+   * AUTH_EXPIRED (different fault, different remedy) — so only an unbroken run counts.
+   */
+  private authInvalidStreak = 0;
+  /**
+   * Consecutive probes that did NOT confirm AUTH_INVALID while the verdict stands —
+   * unreachable ones included. This is what keeps the verdict CURRENTLY observed
+   * rather than latched: see noteUnconfirmedAuthProbe.
+   */
+  private nonInvalidProbeStreak = 0;
+  /**
+   * True while the server has confirmed, repeatedly and recently, that this device's
+   * stored credential is not valid. It changes what the screen SAYS and nothing else —
+   * it destroys nothing, unlocks nothing, and no purge path reads it.
+   */
+  private credentialRejected = false;
+  /**
+   * How many consecutive confirmed AUTH_INVALID probes before the screen changes what
+   * it says. Three, not one: a single probe can land in a deploy window, a gateway
+   * restart or a key-rotation gap. Across the expanding 30s -> 15min backoff, three in
+   * a row means the rejection outlived a transient server incident by a wide margin.
+   *
+   * The blast radius of getting this wrong is a wrong sentence on the glass and an
+   * unlockable manual re-pair — never data loss, because nothing on this path purges.
+   */
+  private static readonly CREDENTIAL_REJECTED_PROBES = 3;
+
+  /**
+   * How many consecutive probes that do NOT confirm AUTH_INVALID retire the verdict.
+   *
+   * A credential fault must be CURRENTLY observable to be asserted on customer glass.
+   * Without this the verdict latched: the site uplink drops, every probe comes back
+   * unreachable, and the screen keeps telling a viewer the display needs re-pairing
+   * when the actual fault is the network. Two rather than one, so the message does not
+   * flicker off on a single failed probe and back on at the next.
+   */
+  private static readonly CREDENTIAL_REJECTED_RETIRE_PROBES = 2;
+
+  /**
+   * What the display says once its credential is confirmed-rejected.
+   *
+   * It names the fault and the action that actually resolves it, and it deliberately
+   * offers NO in-app action. Re-pairing from the device mints a fresh device
+   * identifier, so the server takes its new-display path: the old row survives, still
+   * counts against the tenant screen quota, and a customer at their limit gets the
+   * pairing refused in the dashboard while the display loops expiring codes with its
+   * cached playback already gone — strictly worse than continuing to play. An in-app
+   * recovery needs a server-side re-pair-this-display-id path that does not exist yet.
+   */
+  private static readonly REPAIR_REQUIRED_MESSAGE =
+    "Re-pair required — this display's saved credential is no longer valid. " +
+    'Please contact your administrator.';
+
+  /** Status-line text that replaces "Connection failed" in the same state. */
+  private static readonly REPAIR_REQUIRED_STATUS = 'Re-pair required';
 
   // Temporary content push state
   private temporaryContent: PushContent | null = null;
@@ -917,6 +989,13 @@ class VizoraAndroidTV {
       console.log('[Vizora] Network status changed:', status);
       this.isOnline = status.connected;
 
+      // Losing the link ends any claim to be observing a credential fault, and it ends
+      // it NOW rather than two backoff intervals later. The verdict re-forms in three
+      // probes if the credential really is still rejected once the link is back.
+      if (!status.connected) {
+        this.clearCredentialRejected();
+      }
+
       if (status.connected && this.deviceToken && !this.socket?.connected) {
         console.log('[Vizora] Network restored, reconnecting...');
         this.connectToRealtime();
@@ -1523,6 +1602,8 @@ class VizoraAndroidTV {
           this.stopPairingCheck();
           this.stopPairingCountdown();
           this.pairingRetryCount = 0;
+          // A freshly issued credential retires any standing rejection verdict.
+          this.clearCredentialRejected();
 
           this.deviceToken = data.deviceToken;
           this.deviceId = deviceId;
@@ -2137,11 +2218,27 @@ class VizoraAndroidTV {
   // (§1.5/§3.4); anything unclassified is transport-layer (§1.5a); tenant
   // binding is verified at load time (§1.4/§2).
 
-  /** GET /devices/auth/check — returns HTTP status, or null if unreachable. */
-  private async runAuthCheck(): Promise<number | null> {
-    if (!this.deviceToken) return null;
+  /**
+   * GET /devices/auth/check — the status, plus the body's structured `code` (§3.3).
+   *
+   * Returning the status alone made every 401 look the same, so the two 401 codes the
+   * contract defines — AUTH_EXPIRED (identity fine, token stale) and AUTH_INVALID
+   * (this credential is not accepted) — were indistinguishable to every caller. The
+   * code is pure information: no caller's existing behaviour keys off it, and NOTHING
+   * on this path purges. A body we cannot read yields `code: null`, which every caller
+   * treats exactly as it treated a 401 before.
+   */
+  private async runAuthCheck(): Promise<AuthCheckResult> {
+    if (!this.deviceToken) return { status: null, code: null };
+
+    // ONLY the request is inside the try. Reading the body from in here would mean a
+    // throw while parsing reports the probe as UNREACHABLE — turning a real 410 into
+    // "no answer" and skipping a legitimate purge. readAuthCheckCode does not throw,
+    // so this is theoretical today; the coupling is free to remove and expensive to
+    // rediscover.
+    let response: HttpResponse;
     try {
-      const response: HttpResponse = await VizoraAndroidTV.httpWithTimeout(
+      response = await VizoraAndroidTV.httpWithTimeout(
         CapacitorHttp.get({
           url: `${this.config.apiUrl}/api/v1/devices/auth/check`,
           headers: { Authorization: `Bearer ${this.deviceToken}` },
@@ -2151,18 +2248,49 @@ class VizoraAndroidTV {
         20_000,
         'auth check',
       );
-      // Mechanical gate for the §7.1a carve-out: once this device has ever
-      // seen the auth-check endpoint respond (backend item §6.4 deployed),
-      // remember it — a later 404 can then only mean an anomaly, never
-      // "legacy backend", and the carve-out refuses to fire.
-      if (response.status === 200 || response.status === 401 || response.status === 403 || response.status === 410) {
-        Preferences.set({ key: 'auth_check_seen', value: '1' }).catch(() => {});
-      }
-      return response.status;
     } catch (err) {
       console.warn('[Vizora] Auth check unreachable:', err);
-      return null;
+      return { status: null, code: null };
     }
+
+    // Mechanical gate for the §7.1a carve-out: once this device has ever
+    // seen the auth-check endpoint respond (backend item §6.4 deployed),
+    // remember it — a later 404 can then only mean an anomaly, never
+    // "legacy backend", and the carve-out refuses to fire.
+    if (response.status === 200 || response.status === 401 || response.status === 403 || response.status === 410) {
+      Preferences.set({ key: 'auth_check_seen', value: '1' }).catch(() => {});
+    }
+    return { status: response.status, code: VizoraAndroidTV.readAuthCheckCode(response.data) };
+  }
+
+  /**
+   * Pull `code` out of an auth-check body without trusting its shape.
+   *
+   * The body may be missing, a string of non-JSON (a proxy's HTML error page is the
+   * common one), JSON that is not an object, or an object with no `code`. Every one of
+   * those is an absent code, not an error: this function never throws, because a parse
+   * failure must not be able to take down the probe loop that keeps a degraded screen
+   * playing. Both the bare `{code}` shape the contract specifies and the `{data:{code}}`
+   * response envelope the rest of this client unwraps are accepted.
+   */
+  private static readAuthCheckCode(raw: unknown): string | null {
+    let body: unknown = raw;
+    if (typeof body === 'string') {
+      try {
+        body = JSON.parse(body);
+      } catch {
+        return null;
+      }
+    }
+    if (!body || typeof body !== 'object') return null;
+    const outer = body as { code?: unknown; data?: unknown };
+    if (typeof outer.code === 'string' && outer.code) return outer.code;
+    const inner = outer.data;
+    if (inner && typeof inner === 'object') {
+      const nested = (inner as { code?: unknown }).code;
+      if (typeof nested === 'string' && nested) return nested;
+    }
+    return null;
   }
 
   /**
@@ -2180,7 +2308,7 @@ class VizoraAndroidTV {
     }
     this.lastConfirmProbeAt = now;
 
-    const status = await this.runAuthCheck();
+    const { status } = await this.runAuthCheck();
 
     if (status === 410) {
       // The de-pair transition is UNCONDITIONAL. Revocation is confirmed at this point;
@@ -2239,7 +2367,20 @@ class VizoraAndroidTV {
 
     this.authProbeTimer = setTimeout(async () => {
       this.authProbeTimer = null;
-      const status = await this.runAuthCheck();
+      const { status, code } = await this.runAuthCheck();
+
+      // A CONFIRMED credential rejection is a run of these, never a single one. Any
+      // other outcome — including a 401 that is merely AUTH_EXPIRED, and including an
+      // unreachable endpoint — breaks the run, so a server incident that clears itself
+      // never reaches the threshold. Nothing here purges or writes storage; the only
+      // consequences are what the screen says and whether OK opens a manual re-pair.
+      if (status === 401 && code === 'AUTH_INVALID') {
+        this.nonInvalidProbeStreak = 0;
+        this.noteConfirmedAuthInvalid();
+      } else {
+        this.authInvalidStreak = 0;
+        this.noteUnconfirmedAuthProbe();
+      }
 
       if (status === 200) {
         this.exitAuthDegraded();
@@ -2269,6 +2410,10 @@ class VizoraAndroidTV {
         // Legacy backend — the endpoint teaches us nothing; stop probing and
         // let the socket reconnection loop carry recovery.
         //
+        // Retire the verdict on the way out: this is the LAST observation this device
+        // will make, so the two-probe rule can never fire afterwards and the message
+        // would otherwise stay on the glass forever, unobserved and unfalsifiable.
+        this.clearCredentialRejected();
         console.log('[Vizora] Auth-check endpoint absent (legacy backend) — probe loop stopped');
         return;
       }
@@ -2309,6 +2454,116 @@ class VizoraAndroidTV {
       this.authDegradedSince = 0;
     }
     this.hideAuthDegradedBadge();
+    // A reachable, satisfied server is the one thing that can retire the verdict: the
+    // credential the screen was told to replace evidently works.
+    this.clearCredentialRejected();
+  }
+
+  /**
+   * Record one confirmed AUTH_INVALID probe, and cross into the credential-rejected
+   * state when the run is long enough to rule out a transient.
+   *
+   * Deliberately inert with respect to device state: no purge, no storage write, no
+   * socket teardown, no state-machine transition. It changes one sentence on the glass
+   * and arms exactly one manual affordance. A false positive here costs a wrong
+   * message; the fleet-wipe failure mode this file guards against (F3) is unreachable
+   * from this path because nothing on it deletes anything.
+   */
+  private noteConfirmedAuthInvalid() {
+    this.authInvalidStreak++;
+    if (this.credentialRejected) return;
+    if (this.authInvalidStreak < VizoraAndroidTV.CREDENTIAL_REJECTED_PROBES) return;
+
+    this.credentialRejected = true;
+    console.warn('[Vizora] Credential rejected by the server on consecutive probes — re-pair required');
+    reportEvent('credential_rejected_confirmed', {
+      probes: this.authInvalidStreak,
+      degradedForSeconds: this.authDegradedSince
+        ? Math.round((Date.now() - this.authDegradedSince) / 1000)
+        : 0,
+    });
+    this.showRepairRequiredNotice();
+    // Re-assert the status line so it stops saying "Connection failed" immediately,
+    // rather than waiting for the next connect_error to repaint it.
+    //
+    // Guarded on `isOnline` for the same reason updateStatus guards its override, and
+    // it has to be guarded HERE too: passing the re-pair text as the `text` argument
+    // would walk straight past that check and put it on screen during an outage.
+    if (this.isOnline) {
+      this.updateStatus('offline', VizoraAndroidTV.REPAIR_REQUIRED_STATUS);
+    }
+  }
+
+  /**
+   * Record one probe that did NOT confirm the rejection, and retire the verdict once
+   * the run is long enough that we can no longer claim to be observing the fault.
+   *
+   * The verdict is an assertion about RIGHT NOW, not a latch. Two consecutive
+   * unreachable probes mean the device cannot see the server at all — the honest
+   * message then is the ordinary connectivity one, not an instruction to call an
+   * administrator about a credential nobody is currently rejecting.
+   */
+  private noteUnconfirmedAuthProbe() {
+    if (!this.credentialRejected) return;
+
+    this.nonInvalidProbeStreak++;
+    if (this.nonInvalidProbeStreak < VizoraAndroidTV.CREDENTIAL_REJECTED_RETIRE_PROBES) return;
+
+    console.warn('[Vizora] Credential rejection no longer confirmed by the server — retiring the notice');
+    reportEvent('credential_rejected_unconfirmed', { probes: this.nonInvalidProbeStreak });
+    this.clearCredentialRejected();
+  }
+
+  /**
+   * Retire the credential-rejected verdict and everything it put on screen.
+   *
+   * The status-line repaint is part of retiring it: the override in updateStatus is
+   * gone the moment the flag clears, but the text it already wrote is still on the
+   * glass and nothing else is guaranteed to repaint it — the transport may sit quiet
+   * for minutes. So restate what is actually observable now.
+   */
+  private clearCredentialRejected() {
+    this.authInvalidStreak = 0;
+    this.nonInvalidProbeStreak = 0;
+    this.hideRepairRequiredNotice();
+    if (!this.credentialRejected) return;
+
+    this.credentialRejected = false;
+    reportEvent('credential_rejected_cleared', {});
+    if (this.socket?.connected) {
+      this.updateStatus('online', 'Connected');
+    } else if (this.isOnline) {
+      this.updateStatus('offline', 'Connection failed');
+    } else {
+      this.updateStatus('offline', 'No network connection');
+    }
+  }
+
+  /**
+   * The one message a stuck display shows that names both the problem and the action.
+   *
+   * NOT the 24h auth-degraded badge: that gate needs 24 hours of unbroken degraded
+   * uptime and `authDegradedSince` resets on every app start, so a TV that reboots —
+   * which is most of them — never reaches it. This one appears the moment the verdict
+   * is confirmed. Self-contained and absolutely positioned, like the badge and the
+   * offline overlay: no screen, no state-machine involvement, nothing to un-hide.
+   *
+   * Purely informational. It carries no affordance and the app binds no key to it —
+   * the device cannot fix this by itself (see REPAIR_REQUIRED_MESSAGE), so the message
+   * points at the person who can. Cached playback continues underneath it throughout.
+   */
+  private showRepairRequiredNotice() {
+    if (document.getElementById('repair-required-notice')) return;
+    const notice = document.createElement('div');
+    notice.id = 'repair-required-notice';
+    notice.style.cssText = 'position:fixed;left:50%;bottom:10%;transform:translateX(-50%);max-width:76%;background:rgba(0,0,0,0.88);color:#fff;border:2px solid #f5a623;padding:24px 32px;border-radius:12px;font-size:30px;line-height:1.4;text-align:center;z-index:10000;';
+    notice.textContent = VizoraAndroidTV.REPAIR_REQUIRED_MESSAGE;
+    document.body.appendChild(notice);
+  }
+
+  private hideRepairRequiredNotice() {
+    const notice = document.getElementById('repair-required-notice');
+    if (notice) notice.remove();
   }
 
   /**
@@ -2321,7 +2576,7 @@ class VizoraAndroidTV {
    * can still leave suspension without another reconnect when the tenant is resumed.
    */
   private async revalidateTenantSuspension(source: string): Promise<void> {
-    const status = await this.runAuthCheck();
+    const { status } = await this.runAuthCheck();
 
     if (status === 200) {
       this.exitTenantSuspended(`${source}_auth_check_200`);
@@ -4182,11 +4437,27 @@ class VizoraAndroidTV {
     const dot = document.getElementById('status-dot');
     const statusText = document.getElementById('status-text');
 
+    // A confirmed credential rejection outranks whatever the transport is reporting.
+    // "Connection failed" reads as a network fault and sends whoever notices it to the
+    // router; the credential is the actual fault and it has an actual remedy. Overridden
+    // centrally because every reconnect attempt repaints this line, so guarding one call
+    // site would just let the next one overwrite it seconds later.
+    //
+    // `isOnline` is the hard floor on that: when the device knows it has no network, the
+    // network IS the fault the viewer needs to hear about, and a credential verdict from
+    // before the link dropped must not be allowed to sit on top of it. The two-probe
+    // retirement above reaches the same conclusion from the probe side, but only after
+    // two backoff intervals — which is up to half an hour once the backoff has grown.
+    const effectiveText =
+      this.credentialRejected && this.isOnline && status !== 'online'
+        ? VizoraAndroidTV.REPAIR_REQUIRED_STATUS
+        : text;
+
     if (dot) {
       dot.className = 'status-dot ' + status;
     }
     if (statusText) {
-      statusText.textContent = text;
+      statusText.textContent = effectiveText;
     }
 
     // Signage runs unattended for months, so a permanent "Connected" badge is

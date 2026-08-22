@@ -9144,3 +9144,601 @@ describe('Release-review wave (B1, B2, C2–C7, S1, S3)', () => {
     expect(await reportedEvents()).not.toContain('content_discarded_after_purge');
   });
 });
+
+// ============================================================================
+// RE-PAIR REQUIRED — say the true thing when a credential is confirmed rejected
+// ============================================================================
+//
+// The stuck state this addresses: a device whose stored credential the server
+// will never accept again. The socket handshake fails with AUTH_INVALID,
+// auth/check answers 401 AUTH_INVALID, and — correctly, per
+// revocation-contract.md §1.5a — nothing purges. So the display loops cached
+// content forever behind a small "Connection failed" badge that names neither
+// the fault nor a remedy.
+//
+// This is MESSAGING ONLY. There is deliberately no in-app recovery action: a
+// device-initiated re-pair mints a fresh identifier, so the server takes its
+// new-display path, the old row still counts against the tenant screen quota,
+// and a customer at their limit ends up with a display looping expiring pairing
+// codes instead of playing content. That needs a server-side re-pair path first.
+//
+// What these tests hold down, in both directions:
+//   - the client can now TELL the two 401 codes apart (pure information gain);
+//   - three consecutive confirmed AUTH_INVALID probes — never one — change what
+//     the screen says;
+//   - the verdict is an assertion about NOW: it retires as soon as the fault
+//     stops being observable, so a network outage is never reported as a
+//     credential fault;
+//   - NOTHING on any of these paths deletes anything, at any point, ever;
+//   - the pairing guard is byte-identical to baseline.
+
+describe('Re-pair required (confirmed credential rejection)', () => {
+  beforeEach(async () => {
+    vi.useFakeTimers();
+    resetCapacitorFakes();
+    resetDOM();
+    (window.location as { search: string }).search = '';
+    (window.location.reload as Mock).mockReset();
+    ioFactory.mockClear();
+    currentMockSocket = createMockSocket();
+    ioFactory.mockReturnValue(currentMockSocket);
+    mockCacheManager.getCachedUri.mockReset().mockResolvedValue(null);
+    mockCacheManager.downloadContent.mockReset().mockResolvedValue(null);
+    mockCacheManager.clearCache.mockReset().mockResolvedValue(undefined);
+    qrToCanvasMock.mockReset().mockResolvedValue(undefined);
+
+    const { SecureStorage } = await import('./secure-storage');
+    (SecureStorage.get as Mock).mockClear();
+    (SecureStorage.set as Mock).mockClear();
+    (SecureStorage.remove as Mock).mockReset().mockImplementation(async ({ key }: { key: string }) => {
+      secureStorageStore.delete(key);
+    });
+    const { CapacitorHttp } = await import('@capacitor/core');
+    (CapacitorHttp.get as Mock).mockClear();
+    (CapacitorHttp.post as Mock).mockClear();
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+
+    secureStorageStore.set('device_token', 'tok-123');
+    secureStorageStore.set('device_id', 'dev-123');
+    secureStorageStore.set('tenant_id', 'tenant-A');
+
+    // The probe backoff jitters ±25% off Math.random. Pinned to the midpoint so the
+    // schedule is exactly 30s, 60s, 120s, 240s… and "advance to the Nth probe" is a
+    // fact rather than a guess — otherwise a −25% run slips an extra probe into the
+    // window and the counter assertions stop being deterministic.
+    vi.spyOn(Math, 'random').mockReturnValue(0.5);
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  // -------- observables --------
+
+  const visibleScreens = () =>
+    ['loading-screen', 'pairing-screen', 'content-screen', 'holding-screen', 'error-screen']
+      .filter(id => {
+        const el = domElements.get(id);
+        return el && !el._classListSet.has('hidden');
+      });
+
+  const reportedEvents = async () => {
+    const { reportEvent } = await import('./crash-reporting');
+    return ((reportEvent as Mock).mock.calls as unknown[][]).map(c => c[0]);
+  };
+
+  const authCheckCalls = async () => {
+    const { CapacitorHttp } = await import('@capacitor/core');
+    return (CapacitorHttp.get as Mock).mock.calls.filter(
+      (c: unknown[]) => String((c[0] as { url: string }).url).includes('/devices/auth/check'),
+    );
+  };
+
+  const pairingRequests = async () => {
+    const { CapacitorHttp } = await import('@capacitor/core');
+    return (CapacitorHttp.post as Mock).mock.calls.filter(
+      (c: unknown[]) => String((c[0] as { url: string }).url).includes('/devices/pairing/request'),
+    );
+  };
+
+  const notice = () => bodyChildren.find(c => c.id === 'repair-required-notice');
+  const statusText = () => domElements.get('status-text')!.textContent;
+
+  const REPAIR_TEXT =
+    "Re-pair required — this display's saved credential is no longer valid. " +
+    'Please contact your administrator.';
+
+  /** Answer auth/check with this status+body; everything else stays benign. */
+  const authCheckAnswers = (status: number, data: unknown) => {
+    httpGetHandler = (opts) => opts.url.includes('/devices/auth/check')
+      ? { status, data }
+      : { status: 200, data: { data: { status: 'pending' } } };
+  };
+
+  /** Make auth/check unreachable — the fault a network outage produces. */
+  const authCheckUnreachable = () => {
+    httpGetHandler = (opts) => {
+      if (opts.url.includes('/devices/auth/check')) throw new Error('ENOTFOUND');
+      return { status: 200, data: { data: { status: 'pending' } } };
+    };
+  };
+
+  const playlistPayload = {
+    playlist: {
+      id: 'pl', name: 'PL', loopPlaylist: true,
+      items: [{ id: 'it-1', contentId: 'c1', duration: 10, order: 0,
+        content: { id: 'c1', name: 'C', type: 'image', url: '/c1.jpg' } }],
+    },
+  };
+
+  const connectAndCommit = async () => {
+    await importFresh();
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    triggerSocketEvent('playlist:update', playlistPayload);
+    await vi.advanceTimersByTimeAsync(1600);
+    expect(visibleScreens()).toEqual(['content-screen']);
+  };
+
+  /**
+   * Put the device into auth-degraded mode so the probe loop is running. The socket
+   * is marked down first because that is what a rejected handshake actually leaves
+   * behind — and the status-line assertions depend on it.
+   */
+  const degrade = (code = 'AUTH_INVALID') => {
+    currentMockSocket.connected = false;
+    triggerSocketEvent('connect_error', { message: 'handshake rejected', data: { code } });
+  };
+
+  /**
+   * Advance exactly to the next `count` probe firings, asserting each one really
+   * happened. Backoff is 30s * 2^retry (capped at 15min) with jitter pinned to zero,
+   * so `startRetry` is how many probes have already been scheduled in this degraded
+   * episode — exitAuthDegraded() resets it to 0.
+   */
+  const runProbes = async (count: number, startRetry = 0) => {
+    for (let i = 0; i < count; i++) {
+      const before = (await authCheckCalls()).length;
+      const base = Math.min(30_000 * Math.pow(2, Math.min(startRetry + i, 5)), 900_000);
+      await vi.advanceTimersByTimeAsync(base + 500);
+      for (let k = 0; k < 40; k++) await Promise.resolve();
+      expect(await authCheckCalls()).toHaveLength(before + 1);
+    }
+  };
+
+  /**
+   * Everything purgeDeviceState() does that a test can see, asserted together.
+   *
+   * This is how "purgeDeviceState was never called" is checked: the class is not
+   * exported, so there is no instance to spy on. `device_purged` is the FIRST
+   * statement in the method, so its absence is equivalent, and the storage/cache
+   * assertions cover the case where someone adds a second destructive path that
+   * does not go through it.
+   */
+  const expectNothingWasDestroyed = async () => {
+    const { SecureStorage } = await import('./secure-storage');
+    expect(await reportedEvents()).not.toContain('device_purged');
+    expect(SecureStorage.remove as Mock).not.toHaveBeenCalled();
+    expect(mockCacheManager.clearCache).not.toHaveBeenCalled();
+    expect(secureStorageStore.get('device_token')).toBe('tok-123');
+    expect(secureStorageStore.get('device_id')).toBe('dev-123');
+    expect(secureStorageStore.get('tenant_id')).toBe('tenant-A');
+    expect(preferencesStore.has('last_playlist')).toBe(true);
+  };
+
+  /** Drive the device all the way to a standing, confirmed verdict. */
+  const trip = async () => {
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    await connectAndCommit();
+    degrade();
+    await runProbes(3);
+    expect(notice()).toBeDefined();
+    expect(statusText()).toBe('Re-pair required');
+  };
+
+  // ======================================================================
+  // A. THE CLIENT CAN SEE WHICH 401 IT GOT
+  // ======================================================================
+
+  it('A: a JSON body carrying AUTH_INVALID is read as AUTH_INVALID', async () => {
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    await connectAndCommit();
+    degrade();
+    await runProbes(3);
+    expect(await reportedEvents()).toContain('credential_rejected_confirmed');
+  });
+
+  it('A: the {data:{code}} response envelope is read too', async () => {
+    authCheckAnswers(401, { success: false, data: { code: 'AUTH_INVALID' } });
+    await connectAndCommit();
+    degrade();
+    await runProbes(3);
+    expect(await reportedEvents()).toContain('credential_rejected_confirmed');
+  });
+
+  it('A: a body delivered as a JSON STRING is parsed, not discarded', async () => {
+    authCheckAnswers(401, JSON.stringify({ code: 'AUTH_INVALID' }));
+    await connectAndCommit();
+    degrade();
+    await runProbes(3);
+    expect(await reportedEvents()).toContain('credential_rejected_confirmed');
+  });
+
+  it.each([
+    ['absent', undefined],
+    ['null', null],
+    ['empty object', {}],
+    ['non-JSON string', '<html>502 Bad Gateway</html>'],
+    ['JSON that is not an object', '[1,2,3]'],
+    ['code of the wrong type', { code: 42 }],
+    ['nested garbage', { data: { code: { nope: true } } }],
+  ])('A: a %s body yields no code — never throws, never trips the verdict', async (_label, body) => {
+    authCheckAnswers(401, body);
+    await connectAndCommit();
+    degrade();
+    // The probe loop keeps running (nothing threw) and the 401 fail-open path is
+    // still taken — proof the unreadable body was absorbed, not propagated.
+    await runProbes(4);
+    expect(await reportedEvents()).toContain('auth_check_401');
+    expect(await reportedEvents()).not.toContain('credential_rejected_confirmed');
+    expect(notice()).toBeUndefined();
+    expect(visibleScreens()).toEqual(['content-screen']);
+    await expectNothingWasDestroyed();
+  });
+
+  it('A: unreachable from the VERY FIRST probe never asserts a credential fault', async () => {
+    // The site uplink is down from the moment the socket fails. Every probe comes
+    // back status null, code null — which is exactly what a rejected credential does
+    // NOT look like, and the viewer must never be told otherwise.
+    authCheckUnreachable();
+    await connectAndCommit();
+    degrade();
+    await runProbes(4);
+    expect(await reportedEvents()).not.toContain('credential_rejected_confirmed');
+    expect(notice()).toBeUndefined();
+    expect(statusText()).not.toBe('Re-pair required');
+    expect(visibleScreens()).toEqual(['content-screen']);
+    await expectNothingWasDestroyed();
+  });
+
+  // ======================================================================
+  // B. THE RETURN-SHAPE CHANGE MOVED NOTHING ELSE
+  // ======================================================================
+
+  it('B: 410 on the probe still purges and shows pairing', async () => {
+    authCheckAnswers(410, { code: 'DEVICE_REVOKED' });
+    await connectAndCommit();
+    degrade();
+    await runProbes(1);
+    await waitUntil('purge', () => !secureStorageStore.has('device_token'), { tickMs: 100 });
+    expect(await reportedEvents()).toContain('device_purged');
+    expect(visibleScreens()).toEqual(['pairing-screen']);
+  });
+
+  it('B: 410 on the confirmRevocation path still purges', async () => {
+    authCheckAnswers(410, { code: 'DEVICE_REVOKED' });
+    await connectAndCommit();
+    triggerSocketEvent('device:revoked', { reason: 'operator' });
+    await waitUntil('purge', () => !secureStorageStore.has('device_token'), { tickMs: 100 });
+    expect(secureStorageStore.has('device_id')).toBe(false);
+    expect(mockCacheManager.clearCache).toHaveBeenCalled();
+    expect(visibleScreens()).toEqual(['pairing-screen']);
+  });
+
+  it('B: 403 on the probe still suspends the tenant', async () => {
+    authCheckAnswers(403, { code: 'TENANT_SUSPENDED' });
+    await connectAndCommit();
+    degrade();
+    await runProbes(1);
+    expect(await reportedEvents()).toContain('tenant_suspended');
+    expect(visibleScreens()).toEqual(['holding-screen']);
+    await expectNothingWasDestroyed();
+  });
+
+  it('B: 404 on the probe still stops the loop', async () => {
+    authCheckAnswers(404, {});
+    await connectAndCommit();
+    degrade();
+    await runProbes(1);
+    // Nothing further, no matter how long we wait — the legacy-backend stop still holds.
+    await vi.advanceTimersByTimeAsync(2_000_000);
+    expect(await authCheckCalls()).toHaveLength(1);
+  });
+
+  it('B: 200 on the probe still exits degraded mode', async () => {
+    authCheckAnswers(200, { status: 'ok' });
+    await connectAndCommit();
+    degrade();
+    await runProbes(1);
+    expect(await reportedEvents()).toContain('auth_degraded_exit');
+    expect(visibleScreens()).toEqual(['content-screen']);
+  });
+
+  // ======================================================================
+  // C. THREE CONSECUTIVE PROBES — NEVER ONE
+  // ======================================================================
+
+  it('C: ONE confirmed AUTH_INVALID does NOT change anything on screen', async () => {
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    await connectAndCommit();
+    degrade();
+    await runProbes(1);
+    expect(await reportedEvents()).not.toContain('credential_rejected_confirmed');
+    expect(notice()).toBeUndefined();
+    expect(statusText()).toBe('Connection failed');
+    await expectNothingWasDestroyed();
+  });
+
+  it('C: TWO is still not enough', async () => {
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    await connectAndCommit();
+    degrade();
+    await runProbes(2);
+    expect(await reportedEvents()).not.toContain('credential_rejected_confirmed');
+    expect(notice()).toBeUndefined();
+  });
+
+  it('C: THREE consecutive trips the verdict and says what is wrong and who fixes it', async () => {
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    await connectAndCommit();
+    degrade();
+    await runProbes(3);
+
+    expect(await reportedEvents()).toContain('credential_rejected_confirmed');
+    expect(notice()!.textContent).toBe(REPAIR_TEXT);
+    expect(statusText()).toBe('Re-pair required');
+    // Cached content is still on the glass throughout — the verdict is a message,
+    // not a state change.
+    expect(visibleScreens()).toEqual(['content-screen']);
+    await expectNothingWasDestroyed();
+  });
+
+  it('C: the message offers no in-app action and the app binds no key to one', async () => {
+    await trip();
+    // Telling a viewer to press a button that mints a fresh device identity is the
+    // thing this iteration deliberately does NOT do.
+    expect(notice()!.textContent).not.toMatch(/press|remote|OK button/i);
+    expect(notice()!.textContent).toContain('contact your administrator');
+
+    const event = { key: 'Enter', preventDefault: vi.fn() };
+    (documentEventListeners.get('keydown') || []).forEach(h => h(event));
+    await vi.advanceTimersByTimeAsync(1000);
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+    expect(await pairingRequests()).toHaveLength(0);
+    expect(visibleScreens()).toEqual(['content-screen']);
+  });
+
+  it('C: the confirmation telemetry carries the probe count', async () => {
+    const { reportEvent } = await import('./crash-reporting');
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    await connectAndCommit();
+    degrade();
+    await runProbes(3);
+    const call = ((reportEvent as Mock).mock.calls as unknown[][])
+      .find(c => c[0] === 'credential_rejected_confirmed');
+    expect(call).toBeDefined();
+    expect((call![1] as { probes: number }).probes).toBe(3);
+  });
+
+  it('C: the status line stays "Re-pair required" through later connect errors', async () => {
+    await trip();
+    // The socket keeps retrying; without the central override this repaints to
+    // "Connection failed" within seconds and the operator never sees the real fault.
+    degrade();
+    expect(statusText()).toBe('Re-pair required');
+    triggerSocketEvent('disconnect', 'transport close');
+    expect(statusText()).toBe('Re-pair required');
+  });
+
+  it('C: a non-AUTH_INVALID outcome in between RESETS the run', async () => {
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    await connectAndCommit();
+    degrade();
+    await runProbes(2);
+
+    // One 5xx — the loop keeps going, but the run is broken.
+    authCheckAnswers(503, {});
+    await runProbes(1, 2);
+
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    await runProbes(2, 3);
+    // FOUR AUTH_INVALID probes in total, never three in a row.
+    expect(await reportedEvents()).not.toContain('credential_rejected_confirmed');
+    expect(notice()).toBeUndefined();
+
+    // …and the run that does reach three still trips, so the reset is a reset and
+    // not a permanent disarm.
+    await runProbes(1, 5);
+    expect(await reportedEvents()).toContain('credential_rejected_confirmed');
+  });
+
+  it('C: AUTH_EXPIRED never trips the verdict, however many times it repeats', async () => {
+    authCheckAnswers(401, { code: 'AUTH_EXPIRED' });
+    await connectAndCommit();
+    degrade('AUTH_EXPIRED');
+    await runProbes(5);
+    expect(await reportedEvents()).toContain('auth_check_401');
+    expect(await reportedEvents()).not.toContain('credential_rejected_confirmed');
+    expect(notice()).toBeUndefined();
+    expect(statusText()).toBe('Connection failed');
+    await expectNothingWasDestroyed();
+  });
+
+  it('C: NOTHING is purged across the whole confirmed-rejection sequence', async () => {
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    await connectAndCommit();
+    degrade();
+    await runProbes(6);
+
+    // Non-vacuity: the probe path really ran, and really reached the verdict.
+    expect(await authCheckCalls()).toHaveLength(6);
+    expect(await reportedEvents()).toContain('credential_rejected_confirmed');
+    expect(notice()).toBeDefined();
+    // …and not one destructive thing happened on the way there.
+    await expectNothingWasDestroyed();
+    expect(visibleScreens()).toEqual(['content-screen']);
+  });
+
+  // ======================================================================
+  // D. THE VERDICT IS ABOUT NOW — IT NEVER OUTLIVES THE EVIDENCE (H3)
+  // ======================================================================
+
+  it('D: ONE unreachable probe does not retire the verdict', async () => {
+    await trip();
+    authCheckUnreachable();
+    await runProbes(1, 3);
+    expect(notice()!.remove).not.toHaveBeenCalled();
+    expect(statusText()).toBe('Re-pair required');
+  });
+
+  it('D: the retirement counter starts clean at the moment the verdict forms', async () => {
+    // Non-AUTH_INVALID probes seen BEFORE the verdict existed must not count towards
+    // retiring it. If they did, a display that had a rough hour before its credential
+    // was finally rejected would drop the message on the first unreachable probe.
+    authCheckAnswers(503, {});
+    await connectAndCommit();
+    degrade();
+    await runProbes(2);
+
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    await runProbes(3, 2);
+    expect(notice()).toBeDefined();
+
+    authCheckUnreachable();
+    await runProbes(1, 5);
+    expect(notice()!.remove).not.toHaveBeenCalled();
+    expect(statusText()).toBe('Re-pair required');
+
+    await runProbes(1, 5);
+    expect(notice()!.remove).toHaveBeenCalled();
+    expect(statusText()).toBe('Connection failed');
+  });
+
+  it('D: TWO consecutive unreachable probes retire it and restore connectivity messaging', async () => {
+    await trip();
+    const shown = notice()!;
+
+    authCheckUnreachable();
+    await runProbes(2, 3);
+
+    // The credential fault is no longer observable, so it is no longer asserted.
+    expect(shown.remove).toHaveBeenCalled();
+    expect(await reportedEvents()).toContain('credential_rejected_unconfirmed');
+    expect(statusText()).toBe('Connection failed');
+    // Still no purge — retiring a message destroys nothing either.
+    await expectNothingWasDestroyed();
+  });
+
+  it('D: the retired verdict re-forms if the credential really is still rejected', async () => {
+    await trip();
+    authCheckUnreachable();
+    await runProbes(2, 3);
+    expect(statusText()).toBe('Connection failed');
+
+    // The uplink comes back and the server is still refusing this credential.
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    await runProbes(2, 5);
+    expect(await reportedEvents()).not.toContain('credential_rejected_confirmed');
+    await runProbes(1, 5);
+    expect(await reportedEvents()).toContain('credential_rejected_confirmed');
+    expect(statusText()).toBe('Re-pair required');
+  });
+
+  it('D: losing the network retires it immediately — a viewer is never told to re-pair over an outage', async () => {
+    await trip();
+    const shown = notice()!;
+
+    triggerNetworkChange(false);
+
+    expect(shown.remove).toHaveBeenCalled();
+    expect(await reportedEvents()).toContain('credential_rejected_cleared');
+    expect(statusText()).toBe('No network connection');
+
+    // And the reconnect churn that follows reports the connectivity fault, never the
+    // credential one — the two-probe rule alone would take up to two backoff intervals
+    // to get here, which is half an hour once the backoff has grown.
+    degrade();
+    expect(statusText()).not.toBe('Re-pair required');
+    triggerSocketEvent('disconnect', 'transport close');
+    expect(statusText()).not.toBe('Re-pair required');
+  });
+
+  it('D: a 404 stop retires it too — the last observation cannot leave it unfalsifiable', async () => {
+    await trip();
+    const shown = notice()!;
+
+    // The probe loop stops dead on a 404, so no later probe can ever retire the
+    // message; it has to come off on the way out.
+    authCheckAnswers(404, {});
+    await runProbes(1, 3);
+
+    expect(shown.remove).toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(2_000_000);
+    expect(statusText()).not.toBe('Re-pair required');
+  });
+
+  // ======================================================================
+  // E. A 200 RETIRES THE VERDICT
+  // ======================================================================
+
+  it('E: a later 200 clears the flag, the counter and the on-screen message', async () => {
+    await trip();
+    const shown = notice()!;
+
+    authCheckAnswers(200, { status: 'ok' });
+    await runProbes(1, 3);
+
+    expect(shown.remove).toHaveBeenCalled();
+    expect(await reportedEvents()).toContain('credential_rejected_cleared');
+
+    // The COUNTER is really gone too: it takes three fresh ones to trip again, not
+    // one more on top of the old run.
+    const { reportEvent } = await import('./crash-reporting');
+    (reportEvent as Mock).mockClear();
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    degrade();
+    await runProbes(2);
+    expect(await reportedEvents()).not.toContain('credential_rejected_confirmed');
+    await runProbes(1, 2);
+    expect(await reportedEvents()).toContain('credential_rejected_confirmed');
+  });
+
+  it('E: a successful socket connect retires it too', async () => {
+    await trip();
+    const shown = notice()!;
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    await vi.advanceTimersByTimeAsync(100);
+    expect(shown.remove).toHaveBeenCalled();
+    expect(await reportedEvents()).toContain('credential_rejected_cleared');
+    expect(statusText()).toBe('Connected');
+  });
+
+  // ======================================================================
+  // F. THE PAIRING GUARD IS UNTOUCHED
+  // ======================================================================
+
+  it('F: canPair is byte-identical to baseline — the pairing gate was not widened', () => {
+    // Source-level, deliberately. The revocation contract §5 rule ("no pairing screen,
+    // ever, while credentials exist") is only as strong as this one expression, and no
+    // runtime path reaches it with credentials present, so a behavioural test cannot
+    // catch a widening. This can.
+    const src = readFileSync('src/main.ts', 'utf8');
+    const guards = src.match(/^ *canPair: .*$/gm) ?? [];
+    expect(guards).toEqual(['        canPair: () => !(this.deviceToken && this.deviceId),']);
+  });
+
+  it('F: no in-app re-pair affordance exists in the client at all', () => {
+    const src = readFileSync('src/main.ts', 'utf8');
+    expect(src).not.toMatch(/operatorRepairRequested|startOperatorRepair/);
+    // The OK/Enter handler is the baseline one: activate the focused element, nothing else.
+    expect(src).toContain('        case KEY_ENTER:\n          // Activate current element\n');
+  });
+});
