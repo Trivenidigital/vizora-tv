@@ -309,8 +309,10 @@ class VizoraAndroidTV {
    * restart or a key-rotation gap. Across the expanding 30s -> 15min backoff, three in
    * a row means the rejection outlived a transient server incident by a wide margin.
    *
-   * The blast radius of getting this wrong is a wrong sentence on the glass and an
-   * unlockable manual re-pair — never data loss, because nothing on this path purges.
+   * The blast radius of getting this wrong is a wrong sentence on the glass — never
+   * data loss, because nothing on this path purges. There is deliberately NO in-app
+   * re-pair action; see REPAIR_REQUIRED_MESSAGE's docblock for why adding one is unsafe
+   * until the server can rebind an existing display id.
    */
   private static readonly CREDENTIAL_REJECTED_PROBES = 3;
 
@@ -2260,7 +2262,18 @@ class VizoraAndroidTV {
     if (response.status === 200 || response.status === 401 || response.status === 403 || response.status === 410) {
       Preferences.set({ key: 'auth_check_seen', value: '1' }).catch(() => {});
     }
-    return { status: response.status, code: VizoraAndroidTV.readAuthCheckCode(response.data) };
+    // Own try: a throw here must not reject runAuthCheck. At the probe-loop call site
+    // `authProbeTimer` is already null, so a rejection would skip the tail
+    // scheduleAuthProbe() and kill the loop permanently (recoverable only via a later
+    // connect_error). readAuthCheckCode cannot throw today; this keeps that true by
+    // construction rather than by its continued correctness.
+    let code: string | null = null;
+    try {
+      code = VizoraAndroidTV.readAuthCheckCode(response.data);
+    } catch {
+      /* body unreadable is "no code", never fatal */
+    }
+    return { status: response.status, code };
   }
 
   /**
@@ -2373,7 +2386,8 @@ class VizoraAndroidTV {
       // other outcome — including a 401 that is merely AUTH_EXPIRED, and including an
       // unreachable endpoint — breaks the run, so a server incident that clears itself
       // never reaches the threshold. Nothing here purges or writes storage; the only
-      // consequences are what the screen says and whether OK opens a manual re-pair.
+      // consequence is what the screen says. There is no key binding and no in-app
+      // action here — see REPAIR_REQUIRED_MESSAGE's docblock before adding one.
       if (status === 401 && code === 'AUTH_INVALID') {
         this.nonInvalidProbeStreak = 0;
         this.noteConfirmedAuthInvalid();
@@ -2465,7 +2479,8 @@ class VizoraAndroidTV {
    *
    * Deliberately inert with respect to device state: no purge, no storage write, no
    * socket teardown, no state-machine transition. It changes one sentence on the glass
-   * and arms exactly one manual affordance. A false positive here costs a wrong
+   * and arms nothing — there is no in-app affordance, deliberately. A false positive
+   * here costs a wrong
    * message; the fleet-wipe failure mode this file guards against (F3) is unreachable
    * from this path because nothing on it deletes anything.
    */
@@ -2523,10 +2538,18 @@ class VizoraAndroidTV {
    * for minutes. So restate what is actually observable now.
    */
   private clearCredentialRejected() {
-    this.authInvalidStreak = 0;
     this.nonInvalidProbeStreak = 0;
     this.hideRepairRequiredNotice();
     if (!this.credentialRejected) return;
+
+    // Only discard PARTIAL evidence once a verdict actually stood. Zeroing this above
+    // the guard meant any link flap reset the run — and since authProbeRetry only
+    // resets in exitAuthDegraded, a long-degraded device sits at the 900s cap and needs
+    // ~45 minutes of unbroken link to gather three probes. A site that flaps more often
+    // than that would NEVER surface "Re-pair required" on a genuinely rejected
+    // credential: exactly the blindness this change exists to remove. A credential does
+    // not un-reject itself, and any non-AUTH_INVALID probe still resets the run.
+    this.authInvalidStreak = 0;
 
     this.credentialRejected = false;
     reportEvent('credential_rejected_cleared', {});
@@ -4448,6 +4471,13 @@ class VizoraAndroidTV {
     // before the link dropped must not be allowed to sit on top of it. The two-probe
     // retirement above reaches the same conclusion from the probe side, but only after
     // two backoff intervals — which is up to half an hour once the backoff has grown.
+    //
+    // This guard and the network-down listener's clearCredentialRejected() are
+    // DELIBERATELY REDUNDANT — do not delete either on the grounds the other covers it.
+    // The listener is the tested mechanism and handles a reported link loss. This guard
+    // is the backstop for the case the listener cannot see: a Wi-Fi association that
+    // stays up while the WAN dies emits no networkStatusChange, so isOnline stays true
+    // and the two-probe rule is the only retirement. Each covers the other's blind spot.
     const effectiveText =
       this.credentialRejected && this.isOnline && status !== 'online'
         ? VizoraAndroidTV.REPAIR_REQUIRED_STATUS
