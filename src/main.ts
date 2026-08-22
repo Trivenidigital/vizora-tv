@@ -992,8 +992,13 @@ class VizoraAndroidTV {
       this.isOnline = status.connected;
 
       // Losing the link ends any claim to be observing a credential fault, and it ends
-      // it NOW rather than two backoff intervals later. The verdict re-forms in three
-      // probes if the credential really is still rejected once the link is back.
+      // it NOW rather than two backoff intervals later.
+      //
+      // "It re-forms once the link is back" is true but NOT quick, which is why
+      // clearCredentialRejected deliberately keeps the partial run: rebuilding three
+      // confirmations from scratch takes three probe intervals, and once the backoff has
+      // grown to its 900s cap that is roughly 45 minutes of unbroken link. Preserving
+      // the evidence gathered before the drop is what lets a flapping site get there.
       if (!status.connected) {
         this.clearCredentialRejected();
       }
@@ -2461,6 +2466,18 @@ class VizoraAndroidTV {
       this.authProbeTimer = null;
     }
     this.authProbeRetry = 0;
+    // The partial run is discarded HERE and nowhere else, because these three callers —
+    // a 200 from auth/check, a handshake the server accepted, and purgeDeviceState —
+    // are the only POSITIVE evidence the device ever gets. Everything that merely loses
+    // sight of the fault (link down, the 404 stop, the two-probe retirement) keeps what
+    // it had, per clearCredentialRejected.
+    //
+    // Without this, two confirmations could survive a successful reconnect and let a
+    // single later probe trip the verdict — a one-probe verdict wearing a three-probe
+    // badge, which is the exact failure CREDENTIAL_REJECTED_PROBES exists to prevent.
+    // Note this costs the flapping-link case NOTHING: a genuinely rejected credential
+    // fails the handshake, so on that device none of these three callers ever fire.
+    this.authInvalidStreak = 0;
     if (this.authDegradedSince) {
       reportEvent('auth_degraded_exit', {
         degradedForSeconds: Math.round((Date.now() - this.authDegradedSince) / 1000),
@@ -2480,9 +2497,8 @@ class VizoraAndroidTV {
    * Deliberately inert with respect to device state: no purge, no storage write, no
    * socket teardown, no state-machine transition. It changes one sentence on the glass
    * and arms nothing — there is no in-app affordance, deliberately. A false positive
-   * here costs a wrong
-   * message; the fleet-wipe failure mode this file guards against (F3) is unreachable
-   * from this path because nothing on it deletes anything.
+   * here costs a wrong message; the fleet-wipe failure mode this file guards against
+   * (F3) is unreachable from this path because nothing on it deletes anything.
    */
   private noteConfirmedAuthInvalid() {
     this.authInvalidStreak++;

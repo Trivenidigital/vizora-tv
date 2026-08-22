@@ -9391,6 +9391,34 @@ describe('Re-pair required (confirmed credential rejection)', () => {
     await expectNothingWasDestroyed();
   });
 
+  it('A: a body that THROWS on access is a missing code, not a dead probe loop', async () => {
+    // The property FIX 2 is about, exercised for real: reading `data` blows up (a
+    // Capacitor bridge marshalling failure looks like this). If that throw escaped
+    // runAuthCheck, the probe callback has already nulled authProbeTimer, so the
+    // rejection would skip the tail scheduleAuthProbe() and the loop would be dead
+    // forever. runProbes asserts each probe actually fired, so probes 2 and 3 landing
+    // IS the liveness assertion.
+    httpGetHandler = (opts) => {
+      if (opts.url.includes('/devices/auth/check')) {
+        const res = { status: 401 } as { status: number; data: unknown };
+        Object.defineProperty(res, 'data', {
+          get() { throw new Error('bridge marshalling failure'); },
+        });
+        return res;
+      }
+      return { status: 200, data: { data: { status: 'pending' } } };
+    };
+    await connectAndCommit();
+    degrade();
+    await runProbes(3);
+
+    // Unreadable body → no code → the 401 stays the generic fail-open 401.
+    expect(await reportedEvents()).toContain('auth_check_401');
+    expect(await reportedEvents()).not.toContain('credential_rejected_confirmed');
+    expect(notice()).toBeUndefined();
+    await expectNothingWasDestroyed();
+  });
+
   it('A: unreachable from the VERY FIRST probe never asserts a credential fault', async () => {
     // The site uplink is down from the moment the socket fails. Every probe comes
     // back status null, code null — which is exactly what a rejected credential does
@@ -9617,6 +9645,52 @@ describe('Re-pair required (confirmed credential rejection)', () => {
     await runProbes(1, 5);
     expect(notice()!.remove).toHaveBeenCalled();
     expect(statusText()).toBe('Connection failed');
+  });
+
+  it('D: PARTIAL evidence survives a link flap — a flaky site can still reach the verdict', async () => {
+    // authProbeRetry only resets on positive evidence, so a long-degraded device sits
+    // at the 900s cap and needs ~45 minutes of unbroken link to gather three probes.
+    // If every link drop restarted the count, a site that flaps more often than that
+    // could never surface a genuinely rejected credential at all — it would show
+    // "Connection failed" forever, which is the blindness this whole change removes.
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    await connectAndCommit();
+    degrade();
+    await runProbes(2);
+    expect(notice()).toBeUndefined();
+
+    // The flap. clearCredentialRejected runs from the listener with
+    // credentialRejected === false — which is exactly the case that used to throw the
+    // partial run away.
+    triggerNetworkChange(false);
+    triggerNetworkChange(true);
+
+    // ONE further confirmation is enough, because the two before the flap still count.
+    await runProbes(1, 2);
+    expect(await reportedEvents()).toContain('credential_rejected_confirmed');
+    expect(notice()!.textContent).toBe(REPAIR_TEXT);
+    expect(statusText()).toBe('Re-pair required');
+  });
+
+  it('D: POSITIVE evidence does discard the partial run — a verdict is never one probe wearing a three-probe badge', async () => {
+    // The inverse of the test above, and the reason the reset lives in exitAuthDegraded
+    // rather than being deleted outright: a handshake the server ACCEPTED says the
+    // credential works, so the confirmations before it must not be carried forward into
+    // a later episode.
+    authCheckAnswers(401, { code: 'AUTH_INVALID' });
+    await connectAndCommit();
+    degrade();
+    await runProbes(2);
+
+    currentMockSocket.connected = true;
+    triggerSocketEvent('connect');
+    await vi.advanceTimersByTimeAsync(100);
+
+    degrade();
+    await runProbes(1);
+    expect(await reportedEvents()).not.toContain('credential_rejected_confirmed');
+    await runProbes(2, 1);
+    expect(await reportedEvents()).toContain('credential_rejected_confirmed');
   });
 
   it('D: TWO consecutive unreachable probes retire it and restore connectivity messaging', async () => {
