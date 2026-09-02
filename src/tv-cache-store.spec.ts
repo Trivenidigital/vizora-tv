@@ -15,7 +15,7 @@
  * for a test-only change.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { TvCacheManager } from './tv-cache-manager';
+import { TvCacheManager, isQuotaExceeded } from './tv-cache-manager';
 
 // ======================== IN-MEMORY IndexedDB DOUBLE ========================
 //
@@ -35,6 +35,15 @@ class FakeDisk {
   stores = new Map<string, { keyPath: string | null; data: Map<unknown, Rec> }>();
   /** Abort at COMMIT for readwrite transactions touching this store (quota shape). */
   abortWritesTo: string | null = null;
+  /**
+   * Abort only the NEXT readwrite transaction touching this store, then clear.
+   *
+   * Needed to model recoverable quota pressure. `abortWritesTo` fails every write,
+   * which also fails the eviction DELETEs — so the cache could never free space and
+   * the evict-then-retry path was untestable. A real quota rejection blocks the write
+   * that does not fit while deletes still work; this models that.
+   */
+  abortNextWriteTo: string | null = null;
   abortError: DOMException | Error = new Error('QuotaExceededError');
   /** Make the next read request fire onerror. */
   failNextGet = false;
@@ -112,7 +121,10 @@ class FakeTransaction {
     queueMicrotask(() => {
       if (this.finished || this.pending > 0) return;
       this.finished = true;
-      if (this.mode === 'readwrite' && this.disk.abortWritesTo && this.names.includes(this.disk.abortWritesTo)) {
+      const oneShot = !this.disk.abortWritesTo && this.disk.abortNextWriteTo;
+      const abortTarget = this.disk.abortWritesTo ?? this.disk.abortNextWriteTo;
+      if (this.mode === 'readwrite' && abortTarget && this.names.includes(abortTarget)) {
+        if (oneShot) this.disk.abortNextWriteTo = null;
         // Roll back, exactly like a real abort — the writes the requests
         // already reported as successful never reach the store.
         for (const [name, snapshot] of this.snapshots) {
@@ -398,22 +410,133 @@ describe('quota + failure degradation', () => {
     // bytes exist that do not, so eviction never reclaims them.
     disk.abortWritesTo = FILES_STORE;
     const m = manager();
-    expect(await m.downloadContent('c1', 'https://cdn/x.jpg', 'image/jpeg')).toBeNull();
+    // The bytes are in hand, so playback continues — but NOTHING may be recorded
+    // as cached. The accounting assertions are the point of this test: resolving
+    // on the request's onsuccess would leave the manager believing bytes exist
+    // that IndexedDB never kept, and eviction would then never reclaim them.
+    expect(await m.downloadContent('c1', 'https://cdn/x.jpg', 'image/jpeg')).not.toBeNull();
     expect(fileRows()).toHaveLength(0);
+    const stats = m.getCacheStats();
+    expect(stats.itemCount).toBe(0);
+    expect(stats.totalSizeMB).toBe(0);
   });
 
   it('a quota failure degrades that ONE asset, not the playlist', async () => {
-    // Documented contract: every failure degrades to null so the caller streams
-    // the original URL. It must not throw, and it must not poison later assets.
+    // Contract as of the quota-eviction fix: an asset that cannot be STORED is
+    // still PLAYED, from the blob already downloaded. Failing playback because
+    // storage is full would turn a capacity problem into a black screen. What
+    // must not happen is the failure poisoning later assets or latching the
+    // asset as permanently un-cacheable.
     disk.abortWritesTo = FILES_STORE;
     const m = manager();
-    expect(await m.downloadContent('c1', 'https://cdn/1.jpg', 'image/jpeg')).toBeNull();
+    expect(await m.downloadContent('c1', 'https://cdn/1.jpg', 'image/jpeg')).not.toBeNull();
+    expect(fileRows()).toHaveLength(0);
 
     disk.abortWritesTo = null;
     expect(await m.downloadContent('c2', 'https://cdn/2.jpg', 'image/jpeg')).not.toBeNull();
     // ...and the in-flight latch released, so the quota-failed asset is retried
-    // rather than being permanently un-cacheable for the life of the process.
+    // and now actually lands.
     expect(await m.downloadContent('c1', 'https://cdn/1.jpg', 'image/jpeg')).not.toBeNull();
+    expect(fileRows().map((r) => r.contentId).sort()).toEqual(['c1', 'c2']);
+  });
+
+  it('QUOTA ON A CACHE HIT: a freshness-write failure must not turn a hit into a miss', async () => {
+    // The regression this exists for. getCachedUri refreshes lastAccessed at most
+    // once a minute; that write used to be awaited un-guarded, so on a quota-full
+    // TV the rejection propagated and the caller streamed from the network — even
+    // though the blob was in hand and the row was still in IDB. Every asset older
+    // than the write interval silently stopped being served from cache, in exactly
+    // the situation (storage full, probably offline) the cache exists for.
+    const m = manager();
+    await m.downloadContent('c1', 'https://cdn/1.jpg', 'image/jpeg');
+    expect(fileRows()).toHaveLength(1);
+
+    // Age the stored row past ACCESS_WRITE_INTERVAL_MS so the refresh fires.
+    const row = fileRows()[0] as Rec & { lastAccessed: number };
+    row.lastAccessed = Date.now() - 10 * 60_000;
+
+    disk.abortWritesTo = FILES_STORE; // the refresh write will now fail
+    const uri = await m.getCachedUri('c1');
+
+    expect(uri).not.toBeNull();       // still a HIT
+    expect(fileRows()).toHaveLength(1); // and the row is untouched
+  });
+
+  it('QUOTA ON DOWNLOAD: evicts LRU first, retries once, and the asset lands', async () => {
+    // Real system time, not a hand-edited row: eviction orders on
+    // max(storedLastAccessed, lastAccessOverlay), and the overlay is written at
+    // download time. Ageing only the stored row leaves the overlay fresh, so both
+    // entries score equal and the ordering assertion cannot fail — which is how an
+    // earlier version of this test passed with the comparator reversed.
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+      const m = manager();
+      await m.downloadContent('old', 'https://cdn/old.jpg', 'image/jpeg');
+
+      vi.setSystemTime(new Date('2026-01-01T01:00:00Z'));
+      await m.downloadContent('recent', 'https://cdn/recent.jpg', 'image/jpeg');
+
+      // Fail only the first write of the new asset. Eviction's DELETE and the retry
+      // then succeed — the shape of a real quota rejection that eviction resolves.
+      vi.setSystemTime(new Date('2026-01-01T02:00:00Z'));
+      disk.abortNextWriteTo = FILES_STORE;
+      const uri = await m.downloadContent('new', 'https://cdn/new.jpg', 'image/jpeg');
+
+      expect(uri).not.toBeNull();
+      const ids = fileRows().map((r) => r.contentId);
+      expect(ids).toContain('new');       // stored on the retry
+      expect(ids).not.toContain('old');   // the LRU victim went first
+      expect(ids).toContain('recent');    // the newer entry survived
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('QUOTA ON DOWNLOAD: eviction never evicts the entry it is making room for', async () => {
+    // Exercised directly, because it is not reachable through downloadContent — an
+    // entry being downloaded is not yet in the store, so the guard is defensive.
+    // It is still load-bearing: evicting the target would free space and then
+    // immediately re-fail the retry. Asserting it through the public API would be
+    // vacuous, so this calls the internal and says so.
+    const m = manager();
+    await m.downloadContent('c1', 'https://cdn/1.jpg', 'image/jpeg');
+    await m.downloadContent('c2', 'https://cdn/2.jpg', 'image/jpeg');
+
+    const evict = (m as unknown as {
+      evictForQuota(needBytes: number, protectId: string): Promise<number>;
+    }).evictForQuota.bind(m);
+
+    // Ask for more than the cache holds, so it would evict everything it may.
+    await evict(10_000, 'c1');
+
+    const ids = fileRows().map((r) => r.contentId);
+    expect(ids).toContain('c1');     // protected
+    expect(ids).not.toContain('c2'); // everything else was fair game
+  });
+
+  it('QUOTA UNRESOLVABLE: playback continues uncached rather than failing', async () => {
+    // Eviction cannot always free enough. When it cannot, the downloaded blob is
+    // still played and accounting is NOT inflated — the alternative is a black
+    // screen caused by a storage problem.
+    disk.abortWritesTo = FILES_STORE; // every write fails, eviction cannot help
+    const m = manager();
+    const uri = await m.downloadContent('big', 'https://cdn/big.mp4', 'video/mp4');
+
+    expect(uri).not.toBeNull();
+    expect(fileRows()).toHaveLength(0);
+    expect(m.getCacheStats().itemCount).toBe(0);
+  });
+
+  it('a NON-quota write failure still degrades to null — the detector is not a catch-all', () => {
+    // Guards the blast radius of isQuotaExceeded. Only a capacity signal may take
+    // the evict-and-retry path; every other write failure keeps the original
+    // "degrade to null, caller streams the network URL" contract.
+    expect(isQuotaExceeded(new Error('QuotaExceededError'))).toBe(true);
+    expect(isQuotaExceeded(Object.assign(new Error('x'), { name: 'QuotaExceededError' }))).toBe(true);
+    expect(isQuotaExceeded(new Error('AbortError: transaction aborted'))).toBe(false);
+    expect(isQuotaExceeded(new Error('ConstraintError'))).toBe(false);
+    expect(isQuotaExceeded(null)).toBe(false);
   });
 
   it('a failing read request degrades to null instead of rejecting', async () => {
