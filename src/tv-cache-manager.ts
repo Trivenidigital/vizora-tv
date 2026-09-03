@@ -33,6 +33,27 @@ interface TvCacheMeta {
  * is the production path; tests inject an in-memory implementation so the
  * eviction/tenant/dedup logic is exercised without an IDB shim.
  */
+import { reportEvent } from './crash-reporting';
+
+/**
+ * Did this rejection mean "the engine is out of room"?
+ *
+ * Matched broadly on purpose. Chromium surfaces exhaustion as a
+ * `QuotaExceededError` DOMException, but TV engines are frozen at old Chromium
+ * versions and some report it as an aborted transaction whose only
+ * distinguishing feature is the message text. Over-matching costs one
+ * unnecessary eviction pass; under-matching costs a cache that never recovers.
+ */
+export function isQuotaExceeded(err: unknown): boolean {
+  const name = (err as { name?: string } | null)?.name ?? '';
+  const message = String((err as { message?: string } | null)?.message ?? err ?? '');
+  return (
+    name === 'QuotaExceededError' ||
+    name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+    /quota|exceeded the quota|out of memory|disk is full/i.test(message)
+  );
+}
+
 export interface TvCacheStore {
   getEntry(id: string): Promise<TvCacheEntry | null>;
   putEntry(entry: TvCacheEntry): Promise<void>;
@@ -301,18 +322,27 @@ export class TvCacheManager {
       if (this.expectedTenant) {
         await this.store.putMeta({ tenantId: this.expectedTenant });
       }
-      await this.store.putEntry(entry);
-      this.statsItemCount += 1;
-      this.statsTotalBytes += entry.size;
-      this.lastAccessOverlay.set(id, entry.lastAccessed);
-      await this.enforceMaxCacheSize();
+      const stored = await this.persistUnderQuota(entry);
+      if (stored) {
+        this.statsItemCount += 1;
+        this.statsTotalBytes += entry.size;
+        this.lastAccessOverlay.set(id, entry.lastAccessed);
+        await this.enforceMaxCacheSize();
+      }
       // Re-check after the persist awaits: IDB transaction ordering means a
       // concurrent clear wipes the rows we just wrote, but we must not hand
       // out a live URL for purged content either.
       if (gen !== this.clearGeneration) return null;
 
+      // Whether or not the entry reached IDB, the bytes are in hand — play them.
+      // Failing playback because storage is full would turn a capacity problem
+      // into a black screen, which is the opposite of what the cache is for.
       const objectUrl = this.trackObjectUrl(id, blob);
-      console.log(`[TvCache] Cached: ${id} (${blob.size} bytes)`);
+      console.log(
+        stored
+          ? `[TvCache] Cached: ${id} (${blob.size} bytes)`
+          : `[TvCache] Serving ${id} uncached (${blob.size} bytes) — storage full`,
+      );
       return objectUrl;
     } catch (err) {
       console.error(`[TvCache] Failed to cache ${id}:`, err);
@@ -341,7 +371,23 @@ export class TvCacheManager {
       // the in-memory overlay, so freshness is never lost, only deferred.
       if (Date.now() - entry.lastAccessed > TvCacheManager.ACCESS_WRITE_INTERVAL_MS) {
         entry.lastAccessed = Date.now();
-        await this.store.putEntry(entry);
+        // BEST-EFFORT, and it must stay that way. This write is a durability
+        // nicety: the overlay set above already carries lastAccessed, and
+        // eviction reads the overlay, so a failure here loses nothing that
+        // matters. Letting it propagate turned a valid cache HIT into a MISS —
+        // the blob was already in hand and the row was still in IDB, but the
+        // rejection reached the catch below and the caller streamed from the
+        // network instead. On a quota-full TV that silently disabled the offline
+        // cache for every asset older than the write interval, which is exactly
+        // the condition (full storage, probably offline) the cache exists for.
+        try {
+          await this.store.putEntry(entry);
+        } catch (err) {
+          console.warn(
+            `[TvCache] lastAccessed refresh failed for ${id} (serving cached blob anyway):`,
+            err,
+          );
+        }
         if (gen !== this.clearGeneration) return null; // purged during the write
       }
       return this.trackObjectUrl(id, entry.blob);
@@ -349,6 +395,94 @@ export class TvCacheManager {
       console.warn(`[TvCache] getCachedUri(${id}) failed:`, err);
       return null;
     }
+  }
+
+  /**
+   * Persist a freshly downloaded entry, making room if the engine says there is none.
+   *
+   * `enforceMaxCacheSize` is a CAPACITY POLICY — stay under the configured ceiling.
+   * This is a different thing: the engine has told us it is out of room, and that can
+   * happen far below the ceiling, because real TV IndexedDB quotas are frequently
+   * smaller than the 200 MB default. Waiting for the high-water mark on such a device
+   * means never evicting at all, so the cache fills once and is then permanently
+   * useless — it cannot evict its way out. A genuine quota rejection is therefore
+   * allowed to trigger eviction below the ceiling.
+   *
+   * Bounded on purpose: evict oldest-first until there is room for this entry, retry
+   * the write exactly once, then stop. No retry loop — a device with no room for a
+   * single asset must not spin trying to make it fit.
+   *
+   * Returns whether the entry is now cached. `false` is not a caller failure: the blob
+   * is still playable, just not stored.
+   */
+  private async persistUnderQuota(entry: TvCacheEntry): Promise<boolean> {
+    try {
+      await this.store.putEntry(entry);
+      return true;
+    } catch (err) {
+      if (!isQuotaExceeded(err)) {
+        throw err; // not a capacity problem — the caller's catch still owns it
+      }
+      console.warn(`[TvCache] quota hit storing ${entry.contentId} — evicting to make room`);
+      const freed = await this.evictForQuota(entry.size, entry.contentId);
+      try {
+        await this.store.putEntry(entry);
+        console.log(`[TvCache] stored ${entry.contentId} after freeing ${freed} bytes`);
+        return true;
+      } catch (retryErr) {
+        // Degraded, not broken: playback continues from the downloaded blob.
+        // Reported because a fleet quietly running with no offline cache looks
+        // identical to a healthy one right up until the network drops.
+        console.warn(
+          `[TvCache] still out of room for ${entry.contentId} after eviction:`,
+          retryErr,
+        );
+        reportEvent('tv_cache_quota_degraded', {
+          contentId: entry.contentId,
+          entryBytes: entry.size,
+          freedBytes: freed,
+          itemCount: this.statsItemCount,
+        });
+        return false;
+      }
+    }
+  }
+
+  /**
+   * Evict least-recently-used entries until `needBytes` have been freed.
+   *
+   * Never evicts `protectId` — that is the entry being stored, and evicting it would
+   * make the retry pointless. Uses the same effective-access ordering as
+   * enforceMaxCacheSize (stored timestamp vs in-memory overlay), so whatever is
+   * playing right now is the last thing considered.
+   *
+   * Returns bytes actually freed, which may be less than requested if the cache ran
+   * out of eligible entries.
+   */
+  private async evictForQuota(needBytes: number, protectId: string): Promise<number> {
+    let freed = 0;
+    try {
+      const entries = await this.store.listEntries();
+      const effectiveAccess = (e: { contentId: string; lastAccessed: number }) =>
+        Math.max(e.lastAccessed, this.lastAccessOverlay.get(e.contentId) ?? 0);
+      const byOldest = entries
+        .filter((e) => e.contentId !== protectId)
+        .sort((a, b) => effectiveAccess(a) - effectiveAccess(b));
+
+      for (const victim of byOldest) {
+        if (freed >= needBytes) break;
+        await this.store.deleteEntry(victim.contentId);
+        this.revokeObjectUrl(victim.contentId);
+        this.lastAccessOverlay.delete(victim.contentId);
+        freed += victim.size;
+        this.statsItemCount = Math.max(0, this.statsItemCount - 1);
+        this.statsTotalBytes = Math.max(0, this.statsTotalBytes - victim.size);
+        console.log(`[TvCache] Evicted ${victim.contentId} (quota pressure)`);
+      }
+    } catch (err) {
+      console.warn('[TvCache] quota eviction failed:', err);
+    }
+    return freed;
   }
 
   async enforceMaxCacheSize(): Promise<void> {
