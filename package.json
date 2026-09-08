@@ -21,6 +21,8 @@
     "build:tv": "vite build --mode tv",
     "tizen:build": "npm run build:tv && node scripts/package-tv.mjs tizen",
     "webos:build": "npm run build:tv && node scripts/package-tv.mjs webos",
+    "tizen:duid": "node scripts/install-tizen.mjs --duid-only",
+    "tizen:install": "node scripts/install-tizen.mjs",
     "tv:build": "npm run build:tv && node scripts/package-tv.mjs all",
     "tv:icons": "node scripts/generate-tv-icons.mjs",
     "test": "vitest run",

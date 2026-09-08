@@ -65,6 +65,19 @@ CORS mode on `file://`.
    tizen install -n <generated>.wgt -t <tv-id>
    ```
 
+`scripts/install-tizen.mjs` automates steps 2–3 above (connect → read DUID →
+build → sign → install → launch → verify), finding the Tizen Studio CLIs even
+when they are not on `PATH`:
+
+```bash
+npm run tizen:duid -- --ip <tv-ip>                        # DUID for the certificate profile
+npm run tizen:install -- --ip <tv-ip> --profile <profile> # everything else
+```
+
+Run the DUID step first: the certificate profile has to contain the TV's DUID
+before a signed `.wgt` will install on it. One profile holds ~10 DUIDs added by
+hand (up to 50 from a list file), so one signed package covers a batch of TVs.
+
 The manifest is `tizen/config.xml` (app id `VizoraDsp0.VizoraDisplay`,
 privileges: `internet`, `power`; `<access origin="*">` for cross-origin API
 calls from the packaged origin).
