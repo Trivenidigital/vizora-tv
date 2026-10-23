@@ -39,6 +39,7 @@ Devices report `platform: tizen_tv | webos_tv` in pairing metadata and generate
 npm run build:tv      # Vite build with @vitejs/plugin-legacy -> dist-tv/
 npm run tizen:build   # build:tv + assemble build/tizen/
 npm run webos:build   # build:tv + assemble build/webos/
+npm run webos:package # webos:build + ares-package -> build/com.vizora.display_<version>_all.ipk
 npm run tv:build      # both
 ```
 
@@ -69,20 +70,105 @@ The manifest is `tizen/config.xml` (app id `VizoraDsp0.VizoraDisplay`,
 privileges: `internet`, `power`; `<access origin="*">` for cross-origin API
 calls from the packaged origin).
 
-### Packaging for LG (webOS TV SDK required)
+### Packaging for LG
 
-1. Install the [webOS TV SDK / CLI](https://webostv.developer.lge.com/develop/tools/cli-installation)
-   (`ares-*` tools).
-2. Enable **Developer Mode** on the TV via the Developer Mode app
-   (LG developer account required), then `ares-setup-device`.
-3. ```bash
-   npm run webos:build
-   ares-package build/webos -o build
-   ares-install --device <tv> build/com.vizora.display_1.0.1_all.ipk
+Packaging needs **no TV, Developer Mode or LG account**. LG's official CLI
+(`@webos-tools/cli`, which provides `ares-package`) is an exact-pinned
+devDependency, so `npm ci` installs it:
+
+```bash
+npm run webos:package
+# = npm run webos:build && ares-package --no-minify build/webos -o build
+# -> build/com.vizora.display_<version>_all.ipk   (<version> = package.json "version")
+```
+
+`--no-minify` matters. By default `ares-package` runs terser over every `.js`
+file again, so the shipped bundle would not be the one Vite emitted and the
+artifact assertions in `vite.config.ts` checked. With the flag the packaged
+payload is byte-identical to `build/webos/`.
+
+`ares-package` warns that `requiredACG` is not defined. That warning is
+deliberately left in place for now: see "Known limitations".
+
+Installing onto a TV is the only step that needs hardware:
+
+1. Enable **Developer Mode** on the TV via the Developer Mode app
+   (LG developer account required), then `npx ares-setup-device`.
+2. ```bash
+   npx ares-install --device <tv> build/com.vizora.display_<version>_all.ipk
    ```
 
 The manifest is `webos/appinfo.json` (app id `com.vizora.display`,
-`disableBackHistoryAPI: true` so the remote's Back key never navigates history).
+`disableBackHistoryAPI: true` so the app receives the remote's Back key itself
+and swallows it, instead of the platform navigating history). `version` is
+stamped from `package.json` at assembly time. `splashBackground` is absent on
+purpose: LG defines it as the path to a 1920x1080 PNG, not a colour, and
+`ares-package` rejects a colour value there.
+
+### file:// origin check (no TV needed)
+
+```bash
+npm run webos:package          # or webos:build
+npx playwright-core install chromium-headless-shell   # once per machine
+node scripts/webos-file-origin-check.mjs [--app-dir build/webos]
+```
+
+The check opens the packaged `index.html` from `file://` in headless Chromium.
+It points the app at a loopback stub API and a real socket.io server, using the
+app's `?api_url=` / `?realtime_url=` overrides, so the artifact under test is
+the real release build. The socket.io server is the same 4.x major as the
+gateway and is configured like it: `cors: { origin: ['https://vizora.cloud'],
+credentials: true }`, `transports: ['websocket','polling']`, no `allowRequest`.
+
+The app is driven through pairing, then the paired poll and the realtime
+connection. After that come `GET /devices/me/content` (pull-on-connect) and
+`GET /devices/auth/check`; the stub triggers the latter by emitting
+`device:revoked`, which the client answers with auth/check. Three API modes:
+
+| Mode | Stub API answers | Must |
+|---|---|---|
+| A | every preflight 204 with no `Access-Control-Allow-Origin` (prod today) | fail to pair |
+| A' | `ACAO: null` for pairing; nothing for `Authorization` requests | pair and connect, but both authorized GETs blocked |
+| B | `ACAO: null` everywhere, no credentials, `Allow-Headers: Authorization, Content-Type` | complete the whole lifecycle |
+
+Separately, a minimal `file://` page loads the same socket.io-client build the
+app bundles and forces one transport against the prod-configured server. The
+app itself never falls back to polling, since `tryAllTransports` is off. A
+positive control that also allows origin `null` shows the polling block is CORS
+and nothing else. The script exits non-zero unless every expectation holds.
+
+**What it showed** (Chromium 145, 2026-10-23):
+
+- Every API request carries `Origin: null`, including the paired-status GET.
+  That GET is a simple request with no preflight, but its response still needs
+  ACAO.
+- Each `Authorization` GET is preceded by a preflight with
+  `Access-Control-Request-Headers: authorization`.
+- **The websocket transport connects from `Origin: null` under the prod realtime
+  config.** The upgrade carries `Origin: null` and the server accepts it, because
+  socket.io's `cors` option governs only HTTP polling responses.
+- **Polling is CORS-blocked under the prod config** ("No
+  'Access-Control-Allow-Origin' header is present"), even though the request
+  reaches the server. It connects once `null` is an allowed origin.
+
+So a TV whose network passes websockets needs only the API-side change. A
+network that forces polling, such as a proxy that strips `Upgrade`, also needs
+the realtime CORS change, and the app would additionally have to be allowed to
+fall back to polling.
+
+**Boot controls:** the legacy SystemJS bundle boots from `file://` with relative
+asset paths. Pointed at an unstripped `dist-tv/` it fails to boot, because the
+`crossorigin` script fetch is blocked on `file://`. That is the defect
+`package-tv.mjs` strips the attribute for.
+
+**What it does not prove:** anything about the webOS runtime.
+- The engine is not webOS's Chromium 53–120.
+- `PalmSystem` is an empty stub. There are no Luna services, no LG app security
+  policy and no TV TLS trust store.
+- The stub is loopback HTTP/WS, not TLS through nginx.
+- The stub runs engine.io 6.6.9, while the gateway's lockfile resolves 6.6.5.
+
+Every item in the on-device checklist below still stands.
 
 Icons for both platforms are committed (`tizen/icon.png`, `webos/icon.png`,
 `webos/largeIcon.png`) and regenerated from `store-listing/icons/app-icon.svg`
@@ -132,6 +218,21 @@ storage. Revocation (contract §3.4) behaves identically on all platforms.
   asset to direct streaming.
 - **Heartbeat memory metrics** (`performance.memory`) are Chrome-only and
   report the default value on some TV engines.
+- **`requiredACG` is not declared** in `webos/appinfo.json`. LG's
+  [ACG guide](https://webostv.developer.lge.com/develop/guides/acg-guide)
+  makes it mandatory from webOS TV 27, and enforceable but optional on 26. It
+  is unsupported on 25 and lower. The app calls one Luna API
+  (`luna://com.webos.service.tvpower/power/setScreenSaverOff`). An empty array
+  would therefore likely deny that call where ACG is enforced. LG's guide does
+  not list the group name for `tvpower`, so the field stays out until the right
+  group is confirmed. Older TVs are unaffected.
+- **Keep-awake on new webOS models is probably unavailable.** The ACG guide's API
+  list has **no ACG group for `com.webos.service.tvpower`**, so
+  `setScreenSaverOff` is probably not a public API. It will likely be denied
+  wherever ACG is enforced: optional on webOS TV 26, mandatory on 27+. On those
+  models keep-awake needs hardware testing. Failing that, it has to rely on
+  video playback inhibiting the screensaver, which an image-only playlist does
+  not do. Recorded, not fixed.
 - The Tizen/webOS **emulators/simulators** don't implement every TV API
   (`webapis`, some Luna services); on-device testing is authoritative.
 
