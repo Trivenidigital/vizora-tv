@@ -113,26 +113,62 @@ npx playwright-core install chromium-headless-shell   # once per machine
 node scripts/webos-file-origin-check.mjs [--app-dir build/webos]
 ```
 
-The check opens the packaged `index.html` from `file://` in headless Chromium,
-points the app at a loopback stub API through the app's `?api_url=` override
-(so the artifact under test is the real release build), and runs pairing twice.
-In MODE A the preflight answers like prod does today (204 with no
-`Access-Control-Allow-Origin`). In MODE B it answers `Access-Control-Allow-Origin: null`
-with no credentials. It fails unless A is blocked **and** B pairs.
+The check opens the packaged `index.html` from `file://` in headless Chromium.
+It points the app at a loopback stub API and a real socket.io server, using the
+app's `?api_url=` / `?realtime_url=` overrides, so the artifact under test is
+the real release build. The socket.io server is the same 4.x major as the
+gateway and is configured like it: `cors: { origin: ['https://vizora.cloud'],
+credentials: true }`, `transports: ['websocket','polling']`, no `allowRequest`.
 
-**What it proves, on a modern desktop Chromium:** the legacy SystemJS bundle
-boots from `file://` with relative asset paths; a packaged page sends the
-literal `Origin: null`; the pairing POST is CORS-preflighted and blocked by
-prod's current preflight answer; `ACAO: null` without credentials is enough to
-unblock it. Pointed at an unstripped `dist-tv/` it fails to boot, because the
+The app is driven through pairing, then the paired poll and the realtime
+connection. After that come `GET /devices/me/content` (pull-on-connect) and
+`GET /devices/auth/check`; the stub triggers the latter by emitting
+`device:revoked`, which the client answers with auth/check. Three API modes:
+
+| Mode | Stub API answers | Must |
+|---|---|---|
+| A | every preflight 204 with no `Access-Control-Allow-Origin` (prod today) | fail to pair |
+| A' | `ACAO: null` for pairing; nothing for `Authorization` requests | pair and connect, but both authorized GETs blocked |
+| B | `ACAO: null` everywhere, no credentials, `Allow-Headers: Authorization, Content-Type` | complete the whole lifecycle |
+
+Separately, a minimal `file://` page loads the same socket.io-client build the
+app bundles and forces one transport against the prod-configured server. The
+app itself never falls back to polling, since `tryAllTransports` is off. A
+positive control that also allows origin `null` shows the polling block is CORS
+and nothing else. The script exits non-zero unless every expectation holds.
+
+**What it showed** (Chromium 145, 2026-10-23):
+
+- Every API request carries `Origin: null`, including the paired-status GET.
+  That GET is a simple request with no preflight, but its response still needs
+  ACAO.
+- Each `Authorization` GET is preceded by a preflight with
+  `Access-Control-Request-Headers: authorization`.
+- **The websocket transport connects from `Origin: null` under the prod realtime
+  config.** The upgrade carries `Origin: null` and the server accepts it, because
+  socket.io's `cors` option governs only HTTP polling responses.
+- **Polling is CORS-blocked under the prod config** ("No
+  'Access-Control-Allow-Origin' header is present"), even though the request
+  reaches the server. It connects once `null` is an allowed origin.
+
+So a TV whose network passes websockets needs only the API-side change. A
+network that forces polling, such as a proxy that strips `Upgrade`, also needs
+the realtime CORS change, and the app would additionally have to be allowed to
+fall back to polling.
+
+**Boot controls:** the legacy SystemJS bundle boots from `file://` with relative
+asset paths. Pointed at an unstripped `dist-tv/` it fails to boot, because the
 `crossorigin` script fetch is blocked on `file://`. That is the defect
 `package-tv.mjs` strips the attribute for.
 
-**What it does not prove:** anything about the webOS runtime. The engine is
-not webOS's Chromium 53–120. `PalmSystem` is an empty stub, and there are no
-Luna services, no LG app security policy and no TV TLS trust store. It does not
-cover the `Authorization`-header requests after pairing, or Socket.IO. Every
-item in the on-device checklist below still stands.
+**What it does not prove:** anything about the webOS runtime.
+- The engine is not webOS's Chromium 53–120.
+- `PalmSystem` is an empty stub. There are no Luna services, no LG app security
+  policy and no TV TLS trust store.
+- The stub is loopback HTTP/WS, not TLS through nginx.
+- The stub runs engine.io 6.6.9, while the gateway's lockfile resolves 6.6.5.
+
+Every item in the on-device checklist below still stands.
 
 Icons for both platforms are committed (`tizen/icon.png`, `webos/icon.png`,
 `webos/largeIcon.png`) and regenerated from `store-listing/icons/app-icon.svg`
@@ -190,6 +226,13 @@ storage. Revocation (contract §3.4) behaves identically on all platforms.
   would therefore likely deny that call where ACG is enforced. LG's guide does
   not list the group name for `tvpower`, so the field stays out until the right
   group is confirmed. Older TVs are unaffected.
+- **Keep-awake on new webOS models is probably unavailable.** The ACG guide's API
+  list has **no ACG group for `com.webos.service.tvpower`**, so
+  `setScreenSaverOff` is probably not a public API. It will likely be denied
+  wherever ACG is enforced: optional on webOS TV 26, mandatory on 27+. On those
+  models keep-awake needs hardware testing. Failing that, it has to rely on
+  video playback inhibiting the screensaver, which an image-only playlist does
+  not do. Recorded, not fixed.
 - The Tizen/webOS **emulators/simulators** don't implement every TV API
   (`webapis`, some Luna services); on-device testing is authoritative.
 
