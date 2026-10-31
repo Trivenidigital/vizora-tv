@@ -7,10 +7,11 @@
  *   node scripts/package-tv.mjs webos   -> build/webos/  (package with `ares-package`)
  *   node scripts/package-tv.mjs all     -> both
  *
- * The actual .wgt / .ipk packaging requires the vendor SDK toolchains
- * (Tizen Studio, webOS TV SDK) and signing certificates, which live on the
- * release machine — this script stops at the assembled directory and prints
- * the exact command to run next. See docs/SAMSUNG_LG_TV.md.
+ * This script stops at the assembled directory and prints the exact command to
+ * run next. The .wgt needs Tizen Studio and a Samsung certificate profile, which
+ * live on the release machine. The .ipk does not: `npm run webos:package` runs
+ * LG's ares-package from the pinned @webos-tools/cli devDependency, with no
+ * certificate or TV involved. See docs/SAMSUNG_LG_TV.md.
  */
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -99,8 +100,9 @@ if (target === 'tizen' || target === 'all') {
 if (target === 'webos' || target === 'all') {
   assemble('webos');
   console.log(
-    '\nNext (requires webOS TV SDK / ares CLI):\n' +
-    '  ares-package build/webos -o build\n' +
+    '\nNext — packaging needs no TV or Developer Mode (`npm run webos:package` does both steps):\n' +
+    '  npx ares-package --no-minify build/webos -o build\n' +
+    'Install (requires a Developer Mode TV registered with ares-setup-device):\n' +
     `  ares-install --device <tv> build/com.vizora.display_${appVersion}_all.ipk\n`,
   );
 }
